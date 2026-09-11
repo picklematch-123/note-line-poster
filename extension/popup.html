@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>note連携ツール</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <h1>note連携ツール</h1>
+    <p class="lead">LINE で受け取ったコードを貼るだけで連携できます。</p>
+  </header>
+
+  <!-- note のログイン状態 -->
+  <div id="login-state" class="state state--checking">
+    <span class="state__dot"></span>
+    <span id="login-text">note のログイン状態を確認しています…</span>
+  </div>
+  <button id="open-note" class="btn btn--ghost" hidden>note.com を開いてログインする</button>
+
+  <!-- このパソコンとサーバーの連携状態 -->
+  <div id="link-state" class="state" hidden>
+    <span class="state__dot"></span>
+    <span id="link-text"></span>
+  </div>
+
+  <label class="field">
+    <span class="field__label">連携コード</span>
+    <input id="code" type="text" inputmode="latin" autocomplete="off" spellcheck="false"
+           placeholder="ABCD-1234" maxlength="12">
+  </label>
+
+  <button id="connect" class="btn btn--primary">note と連携する</button>
+
+  <p id="result" class="result" hidden></p>
+
+  <details class="advanced">
+    <summary>接続先の設定</summary>
+    <label class="field">
+      <span class="field__label">サーバーのURL</span>
+      <input id="endpoint" type="url" autocomplete="off" spellcheck="false">
+    </label>
+    <button id="save-endpoint" class="btn btn--ghost">保存する</button>
+    <p class="note">提供元から指示があったときだけ変更してください。</p>
+  </details>
+
+  <footer>
+    <p id="footer-note">このツールは note のログイン情報だけを読み取ります。
+       パスワードは読み取りません。</p>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

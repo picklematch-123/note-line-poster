@@ -1,0 +1,20 @@
+# 機密（絶対にコミットしない）
+*.local.json
+.session*.json
+.dev.vars
+.env
+.env.*
+*.key
+*.pem
+
+# ビルド・依存
+node_modules/
+dist/
+.wrangler/
+
+# OS
+.DS_Store
+**/.DS_Store
+
+# Phase 0 の生ログ（Cookie がマスクされていても外に出さない）
+scripts/phase0/raw/

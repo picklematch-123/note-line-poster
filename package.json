@@ -1,0 +1,44 @@
+{
+  "name": "note-line-poster",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "LINE にネタを送ると AI が SEO 記事にして note へ投稿するシステム",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "setup": "node scripts/setup.mjs",
+    "setup:line": "node scripts/setup-line.mjs",
+    "ext:package": "node scripts/package-extension.mjs",
+    "ext:icons": "node scripts/make-icons.mjs",
+    "predeploy": "wrangler d1 migrations apply DB --remote",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20260826.1",
+    "drizzle-kit": "^0.31.10",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.45.2",
+    "hono": "^4.13.5",
+    "zod": "^4.4.3"
+  },
+  "cloudflare": {
+    "label": "note-line-poster",
+    "products": [
+      "Workers",
+      "D1",
+      "KV",
+      "Workflows"
+    ],
+    "categories": [
+      "starter"
+    ],
+    "docs_url": "https://github.com/e-pei/note-line-poster-template",
+    "publish": true
+  }
+}

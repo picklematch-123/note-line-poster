@@ -1,0 +1,13 @@
+# 配備するときに、この3つを入力します。
+# ここに書いた項目が、そのまま入力欄になります。
+
+# LINE Developers →「チャネル基本設定」タブの下のほう（32文字くらい）
+LINE_CHANNEL_SECRET=
+
+# LINE Developers →「Messaging API設定」タブの一番下
+#   →「チャネルアクセストークン（長期）」の発行ボタンで出る値（200文字くらい）
+LINE_CHANNEL_ACCESS_TOKEN=
+
+# console.anthropic.com で発行するキー（sk-ant- で始まる）
+#   ※Pro / Max の個人プランは規約上使えません
+ANTHROPIC_API_KEY=

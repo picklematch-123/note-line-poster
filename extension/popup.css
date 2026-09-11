@@ -1,0 +1,177 @@
+/* note連携ツール — 迷いどころを作らないことだけを目的にした画面 */
+:root {
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --muted: #6b7280;
+  --line: #e5e7eb;
+  --accent: #2cb696;
+  --accent-dark: #24967c;
+  --ok: #15803d;
+  --ng: #b91c1c;
+  --field-bg: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1d20;
+    --fg: #f3f4f6;
+    --muted: #9ca3af;
+    --line: #35373c;
+    --field-bg: #26282c;
+    --ok: #4ade80;
+    --ng: #f87171;
+  }
+}
+
+* { box-sizing: border-box; }
+
+/* ★hidden 属性を確実に効かせる。
+   .btn の display:block がブラウザ既定の [hidden] を上書きしてしまうため、
+   これが無いと「ログイン済みなのにログインボタンが出たまま」になる。 */
+[hidden] { display: none !important; }
+
+body {
+  width: 320px;
+  margin: 0;
+  padding: 16px;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic UI",
+               "Noto Sans JP", Meiryo, sans-serif;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.lead {
+  margin: 4px 0 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* ── ログイン状態 ───────────────────────────── */
+.state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 12px;
+  margin-bottom: 10px;
+}
+
+.state__dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.state--ok .state__dot { background: var(--ok); }
+.state--ng .state__dot { background: var(--ng); }
+.state--ok { border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+.state--ng { border-color: color-mix(in srgb, var(--ng) 40%, var(--line)); }
+
+/* ── 入力 ──────────────────────────────────── */
+.field { display: block; margin: 14px 0 10px; }
+
+.field__label {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--field-bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 15px;
+  letter-spacing: 0.08em;
+}
+
+#code {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  text-transform: uppercase;
+}
+
+#endpoint { font-size: 11px; letter-spacing: 0; text-align: left; }
+
+input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: var(--accent);
+}
+
+/* ── ボタン ────────────────────────────────── */
+.btn {
+  display: block;
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.btn--primary { background: var(--accent); color: #fff; }
+.btn--primary:hover:not(:disabled) { background: var(--accent-dark); }
+.btn--primary:disabled { opacity: 0.5; cursor: default; }
+
+.btn--ghost {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--fg);
+  font-weight: 500;
+  font-size: 12px;
+  margin-bottom: 10px;
+}
+
+.btn--ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ── 結果 ──────────────────────────────────── */
+.result {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.result--ok { background: color-mix(in srgb, var(--ok) 12%, transparent); color: var(--ok); }
+.result--ng { background: color-mix(in srgb, var(--ng) 12%, transparent); color: var(--ng); }
+
+/* ── 詳細設定 ──────────────────────────────── */
+.advanced {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.advanced summary { cursor: pointer; color: var(--muted); }
+.note { color: var(--muted); font-size: 11px; margin: 6px 0 0; }
+
+footer {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+footer p { margin: 0; }

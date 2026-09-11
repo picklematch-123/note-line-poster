@@ -1,0 +1,21 @@
+{
+  "_comment": "配布する全員で共通のリッチメニュー。画像 assets/richmenu.png の並びと必ず揃える。scripts/setup-line.mjs と test/unit/richmenu.test.ts がここを読む。",
+  "size": { "width": 2500, "height": 843 },
+  "selected": true,
+  "name": "note-line-poster",
+  "chatBarText": "メニュー",
+  "areas": [
+    {
+      "bounds": { "x": 0, "y": 0, "width": 833, "height": 843 },
+      "action": { "type": "message", "text": "記事を作成する" }
+    },
+    {
+      "bounds": { "x": 833, "y": 0, "width": 834, "height": 843 },
+      "action": { "type": "message", "text": "プロフィールを登録する" }
+    },
+    {
+      "bounds": { "x": 1667, "y": 0, "width": 833, "height": 843 },
+      "action": { "type": "message", "text": "過去記事一覧・修正" }
+    }
+  ]
+}

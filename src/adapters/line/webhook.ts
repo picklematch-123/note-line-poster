@@ -1,0 +1,1184 @@
+/**
+ * LINE Webhook ハンドラ。
+ *
+ * ★このファイルの責務は3つだけ:
+ *   1. 署名を検証して送信者を確定する
+ *   2. LINE のイベントをドメインの操作に変換する
+ *   3. 結果を LINE の表現に整形して返す
+ * ドメイン層（core/）は LINE を知らない。
+ */
+import type { Env } from '../../env';
+import { Db, DEFAULT_TENANT_ID } from '../../ports/storage/db';
+import { verifyLineSignature } from './signature';
+import { LineClient, text, textWithActions, type LineMessage } from './client';
+import {
+  submitIdea, approve, publishArticle, checkPolicy, reviseImagePosition, requestRewrite,
+  reopenPublished, setEyecatch, clearEyecatch, saveArticleAsDraft, PolicyBlockedError, type ServiceDeps,
+} from '../../core/article/service';
+import { NoteApiError } from '../../ports/publisher/note/client';
+import { AnthropicLlm, LlmError } from '../../ports/llm/anthropic';
+import { RevisionIntent } from '../../core/generation/schema';
+import { analyzeContext } from '../../core/generation/pipeline';
+import { buildContextSnippet, listEntries, removeEntry } from '../../core/generation/context';
+import { classifyRevision } from '../../core/generation/prompts';
+import { parseHeadings, parse as parsePlaceholders } from '../../core/article/placeholders';
+import { buildPreview } from './messages/preview';
+import { buildFullText } from './messages/fulltext';
+import { buildMenu, buildArticleList, buildArticleActions } from './messages/menu';
+import { setMode, getMode, clearMode, parseIndex, normalizeCommand } from './mode';
+import { COMMANDS } from './commands';
+import { resolveNoteSession, persistRefreshedCookie } from '../../core/session/resolve';
+import { issuePairingCode } from '../../core/session/pairing';
+import { loadNoteSession, disconnectNoteSession } from '../../core/session/store';
+import { buildConnectGuide, buildConnectStatus } from './messages/connect';
+import { dispatchPublish, withdrawJobs } from '../../core/agent/dispatch';
+import { reconcilePublished } from '../../core/article/reconcile';
+import { isAgentOnline, hasDevice, revokeDevices } from '../../core/agent/jobs';
+import {
+  buildSettings, buildDailyLimitChoices, buildIntervalChoices, buildModeChoices,
+  buildSettingsSaved, type SettingsView,
+} from './messages/settings';
+import { parseDailyLimit, parseIntervalSec } from '../../core/policy/options';
+import { KvImageStore } from '../../ports/storage/images';
+import { newId } from '../../lib/id';
+import { log } from '../../lib/mask';
+import { canUse, NOT_OWNER_MESSAGE } from '../../core/line/access';
+import { issueSetupCode } from '../../core/setup/state';
+import { resolveMasterKey } from '../../core/setup/masterkey';
+
+/** ネタとして受け付ける最短の長さ。これ未満は雑談として扱う。 */
+const MIN_IDEA_LENGTH = 10;
+/** 画像の到着を待つ秒数 */
+const DEBOUNCE_SEC = 60;
+/**
+ * サムネイル指定の言い回し。
+ * よくある言い方は LLM を通さずここで拾う（即時・API費用ゼロ）。
+ */
+const EYECATCH_RE = /(サムネ|さむね|アイキャッチ|見出し画像|トップ画像|ヘッダー画像|カバー画像)/;
+
+interface LineEvent {
+  type: string;
+  replyToken?: string;
+  source?: { userId?: string };
+  message?: { id: string; type: string; text?: string };
+  postback?: { data: string };
+}
+
+/**
+ * ★note セッションは必ず resolveNoteSession を通す。
+ *   拡張機能で連携されていれば D1（暗号化）から、無ければ環境変数から取る。
+ */
+async function deps(env: Env): Promise<ServiceDeps> {
+  const { session, origin } = await resolveNoteSession(env);
+  return {
+    db: new Db(env.DB),
+    llmApiKey: env.ANTHROPIC_API_KEY,
+    llmWorkspaceId: env.ANTHROPIC_WORKSPACE_ID ?? null,
+    noteSession: session,
+    ownerLineUserId: env.LINE_OWNER_USER_ID || null,
+    images: new KvImageStore(env.KV),
+    onCookieRefresh: (cookieHeader) => persistRefreshedCookie(env, origin, cookieHeader),
+  };
+}
+
+/** ctx は waitUntil さえ持っていればよい（Hono と Workers の ExecutionContext 型差を吸収する）。 */
+export async function handleLineWebhook(
+  req: Request, env: Env, ctx: { waitUntil(p: Promise<unknown>): void },
+): Promise<Response> {
+  const body = await req.text();
+
+  // ★署名検証を通らないリクエストは一切処理しない
+  const ok = await verifyLineSignature(body, req.headers.get('x-line-signature'), env.LINE_CHANNEL_SECRET);
+  if (!ok) {
+    log.warn('LINE 署名検証に失敗');
+    return new Response('invalid signature', { status: 401 });
+  }
+
+  let events: LineEvent[] = [];
+  try {
+    events = (JSON.parse(body).events ?? []) as LineEvent[];
+  } catch {
+    return new Response('bad request', { status: 400 });
+  }
+
+  // LINE は 200 を速く返さないと再送してくるので、処理は待たない
+  ctx.waitUntil(
+    Promise.all(events.map((e) => handleEvent(e, env).catch((err) => {
+      log.error('イベント処理でエラー', String(err));
+    }))),
+  );
+  return new Response('ok');
+}
+
+async function handleEvent(event: LineEvent, env: Env): Promise<void> {
+  const userId = event.source?.userId;
+  if (!userId) return;
+
+  const line = new LineClient(env.LINE_CHANNEL_ACCESS_TOKEN, env.KV);
+  const d = await deps(env);
+
+  // ★オーナー（承認できる唯一の人）を決める。
+  // env に設定があればそれを使い、無ければ「最初に話しかけた人」を登録する。
+  // ユーザーIDを手で転記させないための仕組み。
+  await d.db.ensureTenant(DEFAULT_TENANT_ID);
+  const { ownerId, justRegistered } = env.LINE_OWNER_USER_ID
+    ? { ownerId: env.LINE_OWNER_USER_ID, justRegistered: false }
+    : await d.db.resolveOwnerLineUserId(DEFAULT_TENANT_ID, userId);
+  d.ownerLineUserId = ownerId;
+
+  if (justRegistered) {
+    log.info('オーナーを登録しました');
+    await line.push(userId, [text(
+      'このアカウントの持ち主として登録しました。\n' +
+      'これ以降、記事を公開できるのはあなただけになります。'
+    )]);
+  }
+
+  // ★持ち主以外は、ここから先へ通さない（2026-08-31 源蔵レビュー指摘）。
+  //   公開だけを守っていたが、記事生成は毎回 Claude を呼ぶ＝顧客の残高が減る。
+  //   ナレッジを書き換えられると、以後の記事すべてに影響が残る。
+  //   友だち追加さえすれば誰でもできる状態だった。
+  if (!canUse(d.ownerLineUserId, userId)) {
+    log.warn('持ち主以外からの操作を断りました');
+    const token = event.replyToken;
+    if (token && (event.type === 'message' || event.type === 'postback')) {
+      await line.reply(token, [text(NOT_OWNER_MESSAGE)]);
+    }
+    return;
+  }
+
+  switch (event.type) {
+    case 'follow':
+      await line.reply(event.replyToken!, [
+        text(
+          'はじめまして。ネタを送るだけで、note の記事にして投稿します。\n\n' +
+          '最初に「ナレッジ」で、お店や事業のことを覚えさせておくのがおすすめです。\n' +
+          '同じネタでも、記事の中身がまるごと変わります。あとからいくらでも足せます。'
+        ),
+        buildMenu(),
+      ]);
+      return;
+
+    case 'message':
+      if (event.message?.type === 'text') return guard(event, line, () => handleText(event, env, line, d, userId));
+      if (event.message?.type === 'image') return guard(event, line, () => handleImage(event, env, line, d, userId));
+      return;
+
+    case 'postback':
+      return guard(event, line, () => handlePostback(event, env, line, d, userId));
+  }
+}
+
+/**
+ * 処理中に例外が出ても、必ず何か返す。
+ *
+ * ★無言で落ちるのが一番たちが悪い。
+ *   ボタンを押しても無反応で、しかも状態が変わらないので操作が詰まる
+ *   （2026-08-28 の不具合はこれで発覚が遅れた）。
+ */
+async function guard(
+  event: LineEvent, line: LineClient, fn: () => Promise<void>,
+): Promise<void> {
+  try {
+    await fn();
+  } catch (e) {
+    log.error('イベント処理で例外', String(e));
+    if (event.replyToken) {
+      await line.reply(event.replyToken, [text(
+        'うまく処理できませんでした。\n' +
+        'お手数ですが、もう一度お試しください。\n\n' +
+        '操作が詰まってしまった場合は「メニュー」と送ってください。'
+      )]).catch(() => { /* 返信も失敗したら諦める */ });
+    }
+  }
+}
+
+// ── テキスト ────────────────────────────────────────────
+async function handleText(
+  event: LineEvent, env: Env, line: LineClient, d: ServiceDeps, userId: string,
+): Promise<void> {
+  const body = (event.message?.text ?? '').trim();
+  const replyToken = event.replyToken!;
+
+  // ── 1. コマンド（いつでも受け付ける。モードより優先）──────
+  // ★リッチメニューは GUI でも作れるので、文字コードの揺れを吸収してから判定する
+  const cmd = normalizeCommand(body);
+
+  if (COMMANDS.menu.test(cmd)) {
+    await clearMode(env.KV, DEFAULT_TENANT_ID);
+    await line.reply(replyToken, [buildMenu()]);
+    return;
+  }
+  // ★リッチメニューのボタンが送る文言。ここを変えるときは
+  //   scripts/setup-richmenu.mjs のラベルも合わせること。
+  // ★呼び名は「ナレッジ」に寄せたが、リッチメニューの文言も引き続き受ける
+  if (COMMANDS.knowledge.test(cmd)) {
+    return showContext(env, line, d, replyToken);
+  }
+  if (COMMANDS.newArticle.test(cmd)) {
+    return startArticleInput(env, line, replyToken);
+  }
+  if (COMMANDS.articleList.test(cmd)) {
+    return showArticleList(env, line, d, replyToken);
+  }
+
+  // ── note 連携（Chrome 拡張）────────────────────────────
+  // ★これが無いと、顧客に DevTools を開かせることになる。
+  if (COMMANDS.connect.test(cmd)) {
+    return startNoteConnect(env, line, d, replyToken, userId);
+  }
+  if (COMMANDS.connectStatus.test(cmd)) {
+    return showConnectStatus(env, line, replyToken);
+  }
+  if (COMMANDS.disconnect.test(cmd)) {
+    return doDisconnect(env, line, d, replyToken, userId);
+  }
+  if (COMMANDS.setupCode.test(cmd)) {
+    return sendSetupCode(env, line, replyToken);
+  }
+  if (COMMANDS.ownerReset.test(cmd)) {
+    return resetOwner(env, line, d, replyToken, userId);
+  }
+  if (COMMANDS.settings.test(cmd)) {
+    return showSettings(env, line, d, replyToken);
+  }
+
+  // ── 2. いま何を待っているか（モード）─────────────────────
+  const mode = await getMode(env.KV, DEFAULT_TENANT_ID);
+
+  if (mode?.kind === 'ctx_delete') {
+    await clearMode(env.KV, DEFAULT_TENANT_ID);
+    if (/^(やめ|キャンセル|中止)/.test(body)) {
+      await line.reply(replyToken, [text('消すのをやめました。')]);
+      return;
+    }
+    const n = parseIndex(body);
+    if (!n) {
+      await line.reply(replyToken, [text('番号を送ってください。')]);
+      return;
+    }
+    return deleteContextEntry(n, env, line, d, replyToken, userId);
+  }
+
+  if (mode?.kind === 'ctx_new' || mode?.kind === 'ctx_append') {
+    await clearMode(env.KV, DEFAULT_TENANT_ID);
+    if (/^(やめ|キャンセル|中止)/.test(body)) {
+      await line.reply(replyToken, [text('登録をやめました。')]);
+      return;
+    }
+    return saveContext(body, mode.kind === 'ctx_append', env, line, d, replyToken, userId);
+  }
+
+  if (mode?.kind === 'article_select') {
+    const n = parseIndex(body);
+    if (n && mode.ids && n <= mode.ids.length) {
+      await clearMode(env.KV, DEFAULT_TENANT_ID);
+      const a = await d.db.getArticle(mode.ids[n - 1]);
+      if (!a) {
+        await line.reply(replyToken, [text('その記事が見つかりませんでした。')]);
+        return;
+      }
+      await line.reply(replyToken, [buildArticleActions(a)]);
+      return;
+    }
+    if (/^(やめ|キャンセル|中止)/.test(body)) {
+      await clearMode(env.KV, DEFAULT_TENANT_ID);
+      await line.reply(replyToken, [text('一覧を閉じました。')]);
+      return;
+    }
+    // 番号でなければ、そのまま新しいネタとして扱う
+    await clearMode(env.KV, DEFAULT_TENANT_ID);
+  }
+
+  if (mode?.kind === 'article_new') {
+    await clearMode(env.KV, DEFAULT_TENANT_ID);
+    if (/^(やめ|キャンセル|中止)/.test(body)) {
+      await line.reply(replyToken, [text('作成をやめました。')]);
+      return;
+    }
+    // 前の記事が片付いていなければ、そちらを先に終わらせてもらう
+    const pending = await d.db.findArticleAwaitingDecision(DEFAULT_TENANT_ID);
+    if (pending) {
+      await line.reply(replyToken, [buildPendingNotice(pending)]);
+      return;
+    }
+    if (body.length < MIN_IDEA_LENGTH) {
+      await setMode(env.KV, DEFAULT_TENANT_ID, { kind: 'article_new' });
+      await line.reply(replyToken, [text(
+        'もう少し詳しく教えてください。\n' +
+        '何について書きたいか、誰に向けてか、狙いたいキーワードがあると記事が良くなります。'
+      )]);
+      return;
+    }
+    return startGeneration(body, env, line, d, replyToken, userId);
+  }
+
+  // ── 3. いま判断待ちの記事があるか ───────────────────────
+  // ★これがある間は新しい記事を作らない（運用側の判断 2026-08-28）。
+  //   記事を書いている途中に別の記事を書くことは実際には無く、
+  //   誤って別記事が生まれるほうが害が大きい。
+  const active = await d.db.findArticleAwaitingDecision(DEFAULT_TENANT_ID);
+
+  // 生成に失敗した記事があるなら、この発言は「やり直しの指示」
+  if (active && active.state === 'failed') {
+    if (/^(やめ|キャンセル|中止|いいえ|新し)/.test(body)) {
+      await withdrawJobs(d, active.id);
+      await d.db.setState(active.id, 'failed', 'cancelled', `line:${userId}`);
+      await line.reply(replyToken, [text('前の記事は取りやめました。新しいネタを送ってください。')]);
+      return;
+    }
+    await requestRewrite(d, active.id, body);
+    await env.GENERATE.create({ params: { articleId: active.id, lineUserId: userId, debounceSec: 0 } });
+    await line.reply(replyToken, [text('前回は失敗したので、その内容で作り直します。1〜3分お待ちください。')]);
+    return;
+  }
+
+  // 記事の作成中に来た指示も拾う。
+  // ここを素通りさせると「新しいネタ」と誤解して別の記事を作ってしまう。
+  if (active && (active.state === 'received' || active.state === 'generating' || active.state === 'preview_ready')) {
+    if (EYECATCH_RE.test(body)) {
+      try {
+        const { message } = await setEyecatch(d, active.id, null);
+        await line.reply(replyToken, [text(message)]);
+      } catch (e) {
+        await line.reply(replyToken, [text(e instanceof Error ? e.message : 'サムネイルを設定できませんでした。')]);
+      }
+      return;
+    }
+    if (/サムネ.*(外|消|やめ)|見出し画像.*(外|消)/.test(body)) {
+      await clearEyecatch(d, active.id);
+      await line.reply(replyToken, [text('サムネイルの指定を外しました。')]);
+      return;
+    }
+    if (/^(やめ|キャンセル|中止)/.test(body)) {
+      await withdrawJobs(d, active.id);
+      await d.db.setState(active.id, active.state, 'cancelled', `line:${userId}`);
+      await line.reply(replyToken, [text('作成中の記事を取りやめました。新しいネタを送ってください。')]);
+      return;
+    }
+    // ★新しいネタとして扱わない。いま作っている記事の続きを待たせる
+    await line.reply(replyToken, [textWithActions(
+      'いま記事を作っています。もう少しお待ちください。\n\n' +
+      '画像を追加したい場合はこのまま送れます。\n' +
+      'この記事をやめる場合は下のボタンを押してください。',
+      [{ label: 'この記事をやめる', data: `action=cancel&id=${active.id}` }],
+    )]);
+    return;
+  }
+
+  // 承認待ちの記事があるなら、この発言は「承認」か「修正指示」
+  if (active && (active.state === 'awaiting_approval' || active.state === 'editing')) {
+    if (/^(公開|OK|ok|はい|投稿)/.test(body)) {
+      return doPublish(active.id, env, line, d, userId, replyToken);
+    }
+    if (/^(下書き|したがき)/.test(body)) {
+      return doSaveDraft(active.id, line, d, userId, replyToken);
+    }
+    if (/^(全文|本文|ぜんぶん|読みたい|見せて)/.test(body)) {
+      await line.reply(replyToken, buildFullText({
+        articleId: active.id,
+        title: active.title ?? '無題',
+        markdown: active.body_md ?? '',
+        metaDescription: active.meta_description ?? '',
+        hashtags: active.hashtags_json ? JSON.parse(active.hashtags_json) : [],
+        imageCount: parsePlaceholders(active.body_md ?? '').length,
+      }));
+      return;
+    }
+    if (/^(やめ|キャンセル|中止|いいえ)/.test(body)) {
+      await d.db.setState(active.id, active.state, 'cancelled', `line:${userId}`);
+      await line.reply(replyToken, [text('この記事は取りやめました。')]);
+      return;
+    }
+    return handleRevision(active.id, body, env, line, d, replyToken, userId);
+  }
+
+  // ── 4. どれにも当てはまらない ───────────────────────────
+  // ★判断待ちの記事が残っていれば、新しい記事は作らない
+  if (active) {
+    await line.reply(replyToken, [buildPendingNotice(active)]);
+    return;
+  }
+  // 短ければメニューを出す。十分な長さがあれば、そのままネタとして受け付ける。
+  if (body.length < MIN_IDEA_LENGTH) {
+    await line.reply(replyToken, [buildMenu()]);
+    return;
+  }
+  return startGeneration(body, env, line, d, replyToken, userId);
+}
+
+/** 前の記事が片付いていないことを伝える。 */
+function buildPendingNotice(a: { id: string; title: string | null; state: string }): LineMessage {
+  return textWithActions(
+    `先に「${a.title ?? '作成中の記事'}」を片付けてください。\n\n` +
+    '「公開する」「下書きに保存する」「やめる」のどれかを選ぶと、次の記事を作れます。',
+    [
+      { label: '公開する', data: `action=publish&id=${a.id}` },
+      { label: '下書きに保存する', data: `action=savedraft&id=${a.id}` },
+      { label: '全文を読む', data: `action=fulltext&id=${a.id}` },
+      { label: 'やめる', data: `action=cancel&id=${a.id}` },
+    ],
+  );
+}
+
+/** 記事のネタ入力を待つ状態にする。 */
+async function startArticleInput(env: Env, line: LineClient, replyToken: string): Promise<void> {
+  await setMode(env.KV, DEFAULT_TENANT_ID, { kind: 'article_new' });
+  await line.reply(replyToken, [text(
+    '記事にしたいネタを送ってください。\n\n' +
+    '画像は、ネタを送ったあとに続けて送ってください。'
+  )]);
+}
+
+/** ネタを受け付けて生成を始める。 */
+async function startGeneration(
+  body: string, env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
+): Promise<void> {
+  const article = await submitIdea(d, body);
+  await env.GENERATE.create({
+    params: { articleId: article.id, lineUserId: userId, debounceSec: DEBOUNCE_SEC },
+  });
+  await line.reply(replyToken, [text(
+    '受け付けました。\n' +
+    '画像があれば続けて送ってください。\n\n' +
+    `最後のメッセージから約${DEBOUNCE_SEC}秒後に書き始めて、1〜3分でお送りします。`
+  )]);
+}
+
+/** 過去の記事を連番つきで一覧表示し、番号待ちにする。 */
+async function showArticleList(
+  env: Env, line: LineClient, d: ServiceDeps, replyToken: string,
+): Promise<void> {
+  // ★note の画面から消された記事を、先に一覧から外す。
+  //   ここを飛ばすと、開いても 404 になる記事が並ぶ。
+  //   note に問い合わせできなければ何も変えない（失敗を「消えた」と取り違えない）。
+  await reconcilePublished(d.db, DEFAULT_TENANT_ID, d.noteSession.urlname);
+
+  const articles = await d.db.listRecentArticles(DEFAULT_TENANT_ID, 10);
+  if (articles.length > 0) {
+    await setMode(env.KV, DEFAULT_TENANT_ID, {
+      kind: 'article_select',
+      ids: articles.map((a) => a.id),
+    });
+  }
+  await line.reply(replyToken, [buildArticleList(articles)]);
+}
+
+// ── 画像 ────────────────────────────────────────────────
+async function handleImage(
+  event: LineEvent, env: Env, line: LineClient, d: ServiceDeps, userId: string,
+): Promise<void> {
+  const messageId = event.message!.id;
+  const active = await d.db.findActiveArticle(DEFAULT_TENANT_ID);
+
+  if (!active || !['received', 'generating'].includes(active.state)) {
+    await line.reply(event.replyToken!, [text(
+      '先に記事のネタを送ってください。そのあとで画像を送ると記事に入れられます。'
+    )]);
+    return;
+  }
+
+  const { bytes, contentType } = await line.getContent(messageId);
+  const key = `${active.tenant_id}/${active.id}/${newId()}`;
+  await d.images.put(key, bytes, contentType);
+  await d.db.addImage(active.tenant_id, {
+    articleId: active.id,
+    r2Key: key,
+    mimeType: contentType,
+    sizeBytes: bytes.byteLength,
+    lineMessageId: messageId,
+  });
+
+  const all = await d.db.listAllImages(active.id);
+  const count = all.length;
+  await line.reply(event.replyToken!, [textWithActions(
+    `画像を受け取りました（${count}枚目）\n\n` +
+    'このまま続けて画像を送れます。\n' +
+    'サムネイル（見出し画像）にしたい場合は下のボタンを押してください。',
+    [
+      { label: 'この画像をサムネに', data: `action=eyecatch&id=${active.id}&slot=${count}` },
+      ...(count > 1 ? [{ label: 'サムネを外す', data: `action=eyecatch_clear&id=${active.id}` }] : []),
+    ],
+  )]);
+}
+
+// ── ボタン ──────────────────────────────────────────────
+async function handlePostback(
+  event: LineEvent, env: Env, line: LineClient, d: ServiceDeps, userId: string,
+): Promise<void> {
+  const params = new URLSearchParams(event.postback?.data ?? '');
+  const action = params.get('action');
+  const replyToken = event.replyToken!;
+
+  // 記事に紐づかない操作（メニュー・ナレッジ）はここで処理する
+  switch (action) {
+    case 'menu_new':
+      return startArticleInput(env, line, replyToken);
+
+
+    case 'menu_list':
+      return showArticleList(env, line, d, replyToken);
+
+    case 'menu_profile':
+      return showContext(env, line, d, replyToken);
+
+    case 'menu_cancel':
+      await clearMode(env.KV, DEFAULT_TENANT_ID);
+      await line.reply(replyToken, [text('閉じました。「メニュー」と送ると、いつでも操作を出せます。')]);
+      return;
+
+    case 'ctx_append':
+      await setMode(env.KV, DEFAULT_TENANT_ID, { kind: 'ctx_append' });
+      await line.reply(replyToken, [textWithActions(
+        '書き足したい内容を送ってください。いまの内容は残ります。\n\n' +
+        '例:\n' +
+        '・新しく始めたメニューのこと\n' +
+        '・お客さんからよく聞かれること\n' +
+        '・記事で触れてほしくないこと',
+        [{ label: 'やめる', data: 'action=ctx_cancel' }],
+      )]);
+      return;
+
+    case 'ctx_replace':
+      await setMode(env.KV, DEFAULT_TENANT_ID, { kind: 'ctx_new' });
+      await line.reply(replyToken, [textWithActions(
+        '新しい内容を送ってください。いまの設定は置き換わります。',
+        [{ label: 'やめる', data: 'action=ctx_cancel' }],
+      )]);
+      return;
+
+    case 'ctx_cancel':
+      await clearMode(env.KV, DEFAULT_TENANT_ID);
+      await line.reply(replyToken, [text('登録をやめました。')]);
+      return;
+
+    case 'ctx_clear':
+      await clearMode(env.KV, DEFAULT_TENANT_ID);
+      await d.db.clearContext(DEFAULT_TENANT_ID);
+      await line.reply(replyToken, [text('設定を消しました。今後は前提なしで記事を書きます。')]);
+      return;
+
+    case 'ctx_delete': {
+      const current = await d.db.getActiveContext(DEFAULT_TENANT_ID);
+      const entries = current ? listEntries(current.raw_text) : [];
+      if (entries.length === 0) {
+        await line.reply(replyToken, [text('まだ何も覚えていません。')]);
+        return;
+      }
+      await setMode(env.KV, DEFAULT_TENANT_ID, { kind: 'ctx_delete' });
+      await line.reply(replyToken, [{
+        type: 'text',
+        text: '消したいものの番号を送ってください。\n（一覧は「ナレッジ」で見られます）',
+        quickReply: {
+          items: [
+            ...entries.slice(0, 12).map((_, i) => ({
+              type: 'action' as const,
+              action: { type: 'message' as const, label: String(i + 1), text: String(i + 1) },
+            })),
+            { type: 'action' as const, action: { type: 'postback' as const, label: 'やめる', data: 'action=ctx_cancel', displayText: 'やめる' } },
+          ],
+        },
+      }]);
+      return;
+    }
+
+    case 'ctx_full': {
+      const current = await d.db.getActiveContext(DEFAULT_TENANT_ID);
+      if (!current) {
+        await line.reply(replyToken, [text('まだ何も覚えていません。')]);
+        return;
+      }
+      // LINE の1通の上限に収まるよう、必要なら分けて送る
+      const chunks = splitForLine(current.raw_text);
+      await line.reply(replyToken, chunks.slice(0, 5).map((c) => text(c)));
+      return;
+    }
+
+    case 'ctx_edit':
+      return showContext(env, line, d, replyToken);
+
+    case 'cfg_daily':
+      return line.reply(replyToken, [buildDailyLimitChoices((await d.db.getTenant(DEFAULT_TENANT_ID)).daily_post_limit)]);
+
+    case 'cfg_interval':
+      return line.reply(replyToken, [buildIntervalChoices((await d.db.getTenant(DEFAULT_TENANT_ID)).min_interval_sec)]);
+
+    case 'cfg_mode':
+      return line.reply(replyToken, [buildModeChoices(await settingsView(env, d))]);
+
+    // ★読めない値のときは何も変えない。
+    //   丸めて 0 にすると「無制限・間隔なし」＝いちばん危ない側に倒れてしまう
+    case 'cfg_daily_set': {
+      const v = parseDailyLimit(params.get('v'));
+      if (v === null) return;
+      return saveSetting(env, line, d, replyToken, userId, 'daily', { daily_post_limit: v });
+    }
+
+    case 'cfg_interval_set': {
+      const v = parseIntervalSec(params.get('v'));
+      if (v === null) return;
+      return saveSetting(env, line, d, replyToken, userId, 'interval', { min_interval_sec: v });
+    }
+
+    case 'cfg_mode_set':
+      return saveSetting(env, line, d, replyToken, userId, 'mode',
+        { execution_mode: params.get('v') === 'server' ? 'server' : 'agent' });
+  }
+
+  const articleId = params.get('id');
+  if (!articleId) return;
+
+  switch (action) {
+    case 'publish':
+      return doPublish(articleId, env, line, d, userId, replyToken);
+
+    case 'cancel': {
+      const a = await d.db.getArticle(articleId);
+      // ★拡張に渡した仕事も引き上げる。放っておくと後から勝手に投稿される
+      await withdrawJobs(d, articleId);
+      if (a) await d.db.setState(articleId, a.state, 'cancelled', `line:${userId}`);
+      await line.reply(replyToken, [text('この記事は取りやめました。')]);
+      return;
+    }
+
+    case 'fulltext': {
+      const a = await d.db.getArticle(articleId);
+      if (!a?.body_md) {
+        await line.reply(replyToken, [text('記事が見つかりませんでした。')]);
+        return;
+      }
+      // ★Reply で返すので追加の課金は発生しない
+      await line.reply(replyToken, buildFullText({
+        articleId,
+        title: a.title ?? '無題',
+        markdown: a.body_md,
+        metaDescription: a.meta_description ?? '',
+        hashtags: a.hashtags_json ? JSON.parse(a.hashtags_json) : [],
+        imageCount: parsePlaceholders(a.body_md).length,
+      }));
+      return;
+    }
+
+    case 'reopen': {
+      // 公開済みの記事を修正モードに戻す。再公開すると同じURLのまま更新される。
+      await reopenPublished(d, articleId);
+      await line.reply(replyToken, [text(
+        'この記事を修正します。どこを直しますか。文章で送ってください。\n\n' +
+        '例:\n・■2をもっと具体的に書き直して\n・タイトルを別の案にして\n・文章量を3分の2に減らして\n\n' +
+        '書き直したあと「公開する」を押すと、note の同じ記事が更新されます（URLは変わりません）。'
+      )]);
+      return;
+    }
+
+    case 'savedraft':
+      return doSaveDraft(articleId, line, d, userId, replyToken);
+
+    case 'eyecatch': {
+      const slot = Number(params.get('slot')) || null;
+      try {
+        const { message } = await setEyecatch(d, articleId, slot);
+        await line.reply(replyToken, [text(message)]);
+      } catch (e) {
+        await line.reply(replyToken, [text(e instanceof Error ? e.message : 'サムネイルを設定できませんでした。')]);
+      }
+      return;
+    }
+
+    case 'eyecatch_clear':
+      await clearEyecatch(d, articleId);
+      await line.reply(replyToken, [text('サムネイルの指定を外しました。')]);
+      return;
+
+    case 'retry': {
+      const a = await d.db.getArticle(articleId);
+      if (!a) return;
+      await requestRewrite(d, articleId, a.revision_instruction ?? a.source_text);
+      await env.GENERATE.create({ params: { articleId, lineUserId: userId, debounceSec: 0 } });
+      await line.reply(replyToken, [text('もう一度作ります。1〜3分お待ちください。')]);
+      return;
+    }
+
+    case 'revise':
+      await line.reply(replyToken, [text(
+        'どこを直しますか。文章で送ってください。\n\n' +
+        '例:\n・画像2を■3の下に移して\n・画像1と画像2を入れ替えて\n・■2をもっと具体的に書き直して\n・タイトルを別の案にして\n\n' +
+        '本文を確認したいときは「全文」と送ってください。'
+      )]);
+      return;
+  }
+}
+
+// ── 公開 ────────────────────────────────────────────────
+async function doPublish(
+  articleId: string, env: Env, line: LineClient, d: ServiceDeps, userId: string, replyToken: string,
+): Promise<void> {
+  // ★承認できるのはオーナーだけ
+  const approval = await approve(d, articleId, userId);
+  if (!approval.allowed) {
+    await line.reply(replyToken, [text(approval.userMessage!)]);
+    return;
+  }
+
+  const decision = await checkPolicy(d, articleId);
+  if (!decision.allowed) {
+    const a = await d.db.getArticle(articleId);
+    if (decision.retryable && a) {
+      // 顧客の作業を無駄にしない。条件が回復したら Cron が自動で投稿する
+      await d.db.setState(articleId, a.state, 'blocked', `line:${userId}`, { reason: decision.reason });
+    }
+    await line.reply(replyToken, [text(decision.userMessage!)]);
+    return;
+  }
+
+  // ★実行先を決める。agent なら note を叩くのは顧客のブラウザ
+  const dispatch = await dispatchPublish(d, articleId, 'publish');
+
+  if (dispatch.mode === 'no_device') {
+    await line.reply(replyToken, [text(buildNoDeviceMessage())]);
+    return;
+  }
+
+  if (dispatch.mode === 'agent') {
+    await line.reply(replyToken, [text(
+      dispatch.online
+        ? 'お使いのパソコンの Chrome から投稿します。少しお待ちください。'
+        : 'パソコンの Chrome が起動したら投稿します。\n\n' +
+          'いま投稿したい場合は、パソコンで Chrome を開いてください。\n' +
+          '記事は預かっているので、そのままで大丈夫です。',
+    )]);
+    return;  // 完了通知は拡張から結果が返ったときに Push する
+  }
+
+  await line.reply(replyToken, [text('note に投稿します。少しお待ちください。')]);
+
+  try {
+    const { url } = await publishArticle(d, articleId);
+    await line.push(userId, [text(`公開しました。\n${url}`)]);
+  } catch (e) {
+    const message = e instanceof PolicyBlockedError ? e.decision.userMessage
+      : e instanceof NoteApiError ? e.userMessage
+      : '投稿に失敗しました。しばらくしてからもう一度お試しください。';
+    await line.push(userId, [text(message!)]);
+  }
+}
+
+/** 拡張がまだ繋がっていないとき。 */
+function buildNoDeviceMessage(): string {
+  return (
+    'note への投稿は、お使いのパソコンの Chrome から行う設定になっています。\n' +
+    'まだ連携ツールがつながっていないため、投稿できません。\n\n' +
+    '「note連携」と送って、連携をお願いします。\n' +
+    '記事は預かっているので、連携後にそのまま投稿できます。'
+  );
+}
+
+/**
+ * 下書き保存。公開と同じく、実行先（サーバー / 顧客のブラウザ）を通す。
+ * ★下書きは公開ではないので、承認ゲートとレート制限は課さない（緊急停止だけ効く）。
+ */
+async function doSaveDraft(
+  articleId: string, line: LineClient, d: ServiceDeps, userId: string, replyToken: string,
+): Promise<void> {
+  const dispatch = await dispatchPublish(d, articleId, 'draft');
+
+  if (dispatch.mode === 'no_device') {
+    await line.reply(replyToken, [text(buildNoDeviceMessage())]);
+    return;
+  }
+
+  if (dispatch.mode === 'agent') {
+    await line.reply(replyToken, [text(
+      dispatch.online
+        ? 'お使いのパソコンの Chrome から、note に下書きとして保存します。'
+        : 'パソコンの Chrome が起動したら、note に下書きとして保存します。',
+    )]);
+    return;
+  }
+
+  await line.reply(replyToken, [text('note に下書きとして保存します。少しお待ちください。')]);
+  try {
+    const { editUrl } = await saveArticleAsDraft(d, articleId);
+    await line.push(userId, [text(
+      'note に下書きとして保存しました。公開はされていません。\n\n' +
+      `${editUrl}\n\n` +
+      '新しい記事を作れる状態になりました。'
+    )]);
+  } catch (e) {
+    const message = e instanceof PolicyBlockedError ? e.decision.userMessage
+      : e instanceof NoteApiError ? e.userMessage
+      : '下書きの保存に失敗しました。';
+    await line.push(userId, [text(message!)]);
+  }
+}
+
+// ── 修正指示 ────────────────────────────────────────────
+async function handleRevision(
+  articleId: string, instruction: string, env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
+): Promise<void> {
+  const a = await d.db.getArticle(articleId);
+  if (!a?.body_md) return;
+
+  const headings = parseHeadings(a.body_md).map((h) => h.text);
+  const imageCount = parsePlaceholders(a.body_md).length;
+
+  // 意図分類だけは軽いモデル（Haiku）で。1円未満で済む
+  const llm = new AnthropicLlm(d.llmApiKey, d.llmWorkspaceId);
+  const { data: intent } = await llm.structured({
+    tier: 'light',
+    label: '修正指示の分類',
+    schema: RevisionIntent,
+    maxTokens: 500,
+    system: classifyRevision.system,
+    user: classifyRevision.user(instruction, headings, imageCount),
+  });
+
+  // 画像の位置操作は LLM を使わず純関数で即処理する（数秒・API費用ゼロ）
+  try {
+    let result: { markdown: string; message: string } | null = null;
+
+    if (intent.action === 'move_image' && intent.imageIndex && intent.headingIndex !== null) {
+      result = await reviseImagePosition(d, articleId,
+        { action: 'move', index: intent.imageIndex, headingIndex: intent.headingIndex });
+    } else if (intent.action === 'swap_image' && intent.imageIndex && intent.secondImageIndex) {
+      result = await reviseImagePosition(d, articleId,
+        { action: 'swap', a: intent.imageIndex, b: intent.secondImageIndex });
+    } else if (intent.action === 'remove_image' && intent.imageIndex) {
+      result = await reviseImagePosition(d, articleId, { action: 'remove', index: intent.imageIndex });
+    } else if (intent.action === 'set_eyecatch') {
+      // サムネ指定は本文を作り直さないので、そのまま返す
+      const { message } = await setEyecatch(d, articleId, intent.imageIndex);
+      await line.reply(replyToken, [text(message)]);
+      return;
+    } else if (intent.action === 'clear_eyecatch') {
+      await clearEyecatch(d, articleId);
+      await line.reply(replyToken, [text('サムネイルの指定を外しました。')]);
+      return;
+    }
+
+    if (result) {
+      const updated = (await d.db.getArticle(articleId))!;
+      await line.reply(replyToken, [
+        text(result.message),
+        buildPreview({
+          articleId,
+          title: updated.title ?? '無題',
+          markdown: result.markdown,
+          metaDescription: updated.meta_description ?? '',
+          hashtags: updated.hashtags_json ? JSON.parse(updated.hashtags_json) : [],
+          charCount: result.markdown.replace(/\[画像\d+\]/g, '').length,
+          hasEyecatch: Boolean(await d.db.getEyecatch(articleId)),
+        }),
+      ]);
+      return;
+    }
+  } catch (e) {
+    await line.reply(replyToken, [text(e instanceof Error ? e.message : '修正できませんでした。')]);
+    return;
+  }
+
+  // 本文の書き直しが必要なものは再生成に回す
+  if (intent.action === 'regenerate_all' || intent.action === 'rewrite_section' || intent.action === 'change_title') {
+    // ★状態は awaiting_approval → editing を通す（generating へ直接飛ばすと遷移表に弾かれる）
+    await requestRewrite(d, articleId, instruction);
+    await env.GENERATE.create({
+      params: { articleId, lineUserId: userId, debounceSec: 0 },
+    });
+    await line.reply(replyToken, [text('書き直します。1〜3分お待ちください。')]);
+    return;
+  }
+
+  await line.reply(replyToken, [textWithActions(
+    '指示の内容が分かりませんでした。もう少し具体的に教えてください。',
+    [{ label: 'このまま公開する', data: `action=publish&id=${articleId}` }],
+  )]);
+}
+
+
+// ── 事業コンテキスト ────────────────────────────────────
+/** 現在の設定を見せる。追記・書き換え・削除を選ばせる。 */
+async function showContext(env: Env, line: LineClient, d: ServiceDeps, replyToken: string): Promise<void> {
+  const current = await d.db.getActiveContext(DEFAULT_TENANT_ID);
+
+  if (!current) {
+    await setMode(env.KV, DEFAULT_TENANT_ID, { kind: 'ctx_append' });
+    await line.reply(replyToken, [textWithActions(
+      'ここに書いたことは、これから作る記事すべての前提になります。\n' +
+      '思いついたものから、どんどん送ってください。あとから足していけます。\n\n' +
+      'たとえば こんなこと:\n' +
+      '・何をやっているか、どんなお客さんが来るか\n' +
+      '・使っている材料、こだわり、店の決まりごと\n' +
+      '・「文末に https://... のリンクを貼る」のような毎回のルール\n' +
+      '・「店主は大将と書く」のような呼び方の指定\n\n' +
+      '次に送るメッセージをそのまま覚えます。',
+      [{ label: 'やめる', data: 'action=ctx_cancel' }],
+    )]);
+    return;
+  }
+
+  await line.reply(replyToken, [buildKnowledgeList(current.raw_text)]);
+}
+
+/** LINE の1通の上限に収まるよう、長い文章を切り分ける。 */
+function splitForLine(textBody: string, size = 1800): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < textBody.length; i += size) out.push(textBody.slice(i, i + size));
+  return out.length > 0 ? out : [''];
+}
+
+/**
+ * 覚えているメモを1件だけ消して、残りで整理し直す。
+ * ★消したあとに分析をかけ直さないと、消したはずの内容が記事に残る。
+ */
+async function deleteContextEntry(
+  index: number, env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
+): Promise<void> {
+  const current = await d.db.getActiveContext(DEFAULT_TENANT_ID);
+  if (!current) {
+    await line.reply(replyToken, [text('まだ何も覚えていません。')]);
+    return;
+  }
+
+  const entries = listEntries(current.raw_text);
+  if (index > entries.length) {
+    await line.reply(replyToken, [text(`${index}番はありません。いまは ${entries.length} 件です。`)]);
+    return;
+  }
+
+  const removed = entries[index - 1];
+  const rest = removeEntry(current.raw_text, index);
+
+  if (rest.trim() === '') {
+    await d.db.clearContext(DEFAULT_TENANT_ID);
+    await line.reply(replyToken, [text('最後の1件を消しました。今後は前提なしで記事を書きます。')]);
+    return;
+  }
+
+  await line.reply(replyToken, [text('消しています。少しお待ちください。')]);
+  try {
+    const llm = new AnthropicLlm(d.llmApiKey, d.llmWorkspaceId);
+    const { data } = await analyzeContext(llm, rest);
+    await d.db.saveContext(DEFAULT_TENANT_ID, rest, data, buildContextSnippet(rest, data));
+    await line.push(userId, [textWithActions(
+      `消しました。（残り${listEntries(rest).length}件）\n\n` +
+      `消したもの: ${removed.length > 40 ? `${removed.slice(0, 40)}…` : removed}`,
+      [{ label: '一覧を見る', data: 'action=ctx_edit' }],
+    )]);
+  } catch (e) {
+    const message = e instanceof LlmError ? e.userMessage : '消せませんでした。もう一度お試しください。';
+    await line.push(userId, [text(message)]);
+  }
+}
+
+/** 溜まっているメモを連番で見せる。長いものは折りたたむ。 */
+function buildKnowledgeList(rawText: string): LineMessage {
+  const entries = listEntries(rawText);
+  const shown = entries.slice(0, 20);
+  const lines = shown.map((e, i) => {
+    const body = e.replace(/\n/g, ' ');
+    const clipped = body.length > 64 ? `${body.slice(0, 64)}…` : body;
+    return `${String(i + 1).padStart(2, ' ')}. ${clipped}`;
+  });
+
+  return {
+    type: 'text',
+    text:
+      `【覚えていること】${entries.length}件\n\n` +
+      lines.join('\n') +
+      (entries.length > shown.length ? `\n\n（ほか ${entries.length - shown.length} 件）` : '') +
+      '\n\n────────\n' +
+      'そのまま送ると書き足します。',
+    quickReply: {
+      items: [
+        { type: 'action', action: { type: 'postback', label: '書き足す', data: 'action=ctx_append', displayText: '書き足す' } },
+        { type: 'action', action: { type: 'postback', label: '1件消す', data: 'action=ctx_delete', displayText: '1件消す' } },
+        { type: 'action', action: { type: 'postback', label: '全文を見る', data: 'action=ctx_full', displayText: '全文を見る' } },
+        { type: 'action', action: { type: 'postback', label: '入れ替える', data: 'action=ctx_replace', displayText: '入れ替える' } },
+        { type: 'action', action: { type: 'postback', label: '全部消す', data: 'action=ctx_clear', displayText: '全部消す' } },
+      ],
+    },
+  };
+}
+
+/**
+ * 本人が書いた文章を保存し、記事の前提として構造化する。
+ * @param append true なら既存の内容に書き足す（上書きしない）
+ */
+async function saveContext(
+  rawText: string, append: boolean,
+  env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
+): Promise<void> {
+  if (rawText.length < 10) {
+    await setMode(env.KV, DEFAULT_TENANT_ID, { kind: append ? 'ctx_append' : 'ctx_new' });
+    await line.reply(replyToken, [text(
+      'もう少しだけ詳しく書いてください。短すぎると記事に反映できません。'
+    )]);
+    return;
+  }
+
+  await line.reply(replyToken, [text('覚えています。少しお待ちください。')]);
+
+  try {
+    // 書き足しの場合は、これまでの内容と合わせて分析し直す
+    const merged = append
+      ? await d.db.appendContextText(DEFAULT_TENANT_ID, rawText)
+      : rawText;
+
+    const llm = new AnthropicLlm(d.llmApiKey, d.llmWorkspaceId);
+    const { data } = await analyzeContext(llm, merged);
+    // ★要約（LLM）だけに頼らない。原文の指示とURLを機械的に付け直す
+    await d.db.saveContext(DEFAULT_TENANT_ID, merged, data, buildContextSnippet(merged, data));
+
+    const count = listEntries(merged).length;
+    await line.push(userId, [textWithActions(
+      (append ? `覚えました。（全${count}件）` : `入れ替えました。（全${count}件）`) + '\n\n' +
+      `【立場】${data.standpoint}\n` +
+      (data.facts.length ? `【記事に使えること】${data.facts.length}件\n` : '') +
+      (data.rules.length ? `【毎回のルール】\n${data.rules.map((r) => `・${r}`).join('\n')}\n` : '') +
+      (data.wording.length ? `【言い方の指定】${data.wording.join('、')}\n` : '') +
+      (data.avoid.length ? `【書かないこと】${data.avoid.join('、')}\n` : '') +
+      '\nこの前提で記事を書きます。',
+      [
+        { label: 'さらに書き足す', data: 'action=ctx_append' },
+        { label: '記事を作る', data: 'action=menu_new' },
+      ],
+    )]);
+  } catch (e) {
+    const message = e instanceof LlmError ? e.userMessage : '登録に失敗しました。もう一度お試しください。';
+    await line.push(userId, [text(message)]);
+  }
+}
+
+// ── note 連携（Chrome 拡張）─────────────────────────────
+/**
+ * 連携コードを発行して LINE に返す。
+ *
+ * ★コードを出せるのはオーナーだけ。
+ *   ここを緩めると、公式アカウントを友だち追加した誰でも
+ *   note の Cookie を差し替えられることになる。
+ */
+async function startNoteConnect(
+  env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
+): Promise<void> {
+  if (d.ownerLineUserId && userId !== d.ownerLineUserId) {
+    await line.reply(replyToken, [text('この操作はアカウントの持ち主だけが行えます。')]);
+    return;
+  }
+
+  const existing = await loadNoteSession(env.DB, DEFAULT_TENANT_ID, (await resolveMasterKey(env)).key);
+  const { display } = await issuePairingCode(env.KV, DEFAULT_TENANT_ID, userId);
+  await d.db.audit(DEFAULT_TENANT_ID, 'session.code_issued', `line:${userId}`, null, 'ok');
+
+  await line.reply(replyToken, [buildConnectGuide(display, existing === null)]);
+}
+
+/** いまの連携状況を見せる。 */
+async function showConnectStatus(env: Env, line: LineClient, replyToken: string): Promise<void> {
+  const stored = await loadNoteSession(env.DB, DEFAULT_TENANT_ID, (await resolveMasterKey(env)).key);
+  await line.reply(replyToken, [buildConnectStatus({
+    connected: stored !== null,
+    urlname: stored?.urlname ?? env.NOTE_URLNAME ?? '',
+    status: stored?.status ?? 'active',
+    lastVerifiedAt: stored?.lastVerifiedAt ?? null,
+    expiresAt: stored?.expiresAt ?? null,
+    viaEnv: Boolean(env.NOTE_COOKIE),
+  })]);
+}
+
+/** 連携を解除して Cookie を捨てる。 */
+async function doDisconnect(
+  env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
+): Promise<void> {
+  if (d.ownerLineUserId && userId !== d.ownerLineUserId) {
+    await line.reply(replyToken, [text('この操作はアカウントの持ち主だけが行えます。')]);
+    return;
+  }
+  const removed = await disconnectNoteSession(env.DB, DEFAULT_TENANT_ID);
+  // ★端末も無効にする。ここを忘れると、解除したはずの拡張が仕事を取りに来られる
+  const devices = await revokeDevices(env.DB, DEFAULT_TENANT_ID);
+  await d.db.audit(DEFAULT_TENANT_ID, 'session.disconnected', `line:${userId}`, null,
+    removed || devices > 0 ? 'ok' : 'denied', { devices });
+  await line.reply(replyToken, [text(
+    removed || devices > 0
+      ? 'note の連携を解除しました。\n' +
+        (removed ? 'お預かりしていたログイン情報も削除しました。\n' : '') +
+        (devices > 0 ? `連携ツール ${devices} 台を無効にしました。\n` : '') +
+        '\nまた使うときは「note連携」と送ってください。'
+      : '連携中の note はありませんでした。'
+  )]);
+}
+
+// ── 投稿の設定 ──────────────────────────────────────────
+async function settingsView(env: Env, d: ServiceDeps): Promise<SettingsView> {
+  const tenant = await d.db.getTenant(DEFAULT_TENANT_ID);
+  const agentConnected = await hasDevice(env.DB, DEFAULT_TENANT_ID);
+  return {
+    tenant,
+    agentConnected,
+    agentOnline: agentConnected && (await isAgentOnline(env.DB, DEFAULT_TENANT_ID)),
+  };
+}
+
+async function showSettings(env: Env, line: LineClient, d: ServiceDeps, replyToken: string): Promise<void> {
+  await line.reply(replyToken, [buildSettings(await settingsView(env, d))]);
+}
+
+/**
+ * 設定を保存する。
+ * ★変えられるのはオーナーだけ。上限や投稿方法は、note アカウントの安全に直結する。
+ */
+async function saveSetting(
+  env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
+  kind: 'daily' | 'interval' | 'mode',
+  patch: Parameters<ServiceDeps['db']['updateTenantSettings']>[1],
+): Promise<void> {
+  if (d.ownerLineUserId && userId !== d.ownerLineUserId) {
+    await line.reply(replyToken, [text('この操作はアカウントの持ち主だけが行えます。')]);
+    return;
+  }
+  await d.db.updateTenantSettings(DEFAULT_TENANT_ID, patch, `line:${userId}`);
+  await line.reply(replyToken, [buildSettingsSaved(kind, await settingsView(env, d))]);
+}
+
+
+/**
+ * セットアップ画面用の使い捨てコードを出す。
+ * ★ここに来る時点で持ち主チェックは済んでいる（handleEvent の入口で弾いている）。
+ */
+async function sendSetupCode(env: Env, line: LineClient, replyToken: string): Promise<void> {
+  const { display, expiresAt } = await issueSetupCode(env.KV);
+  await line.reply(replyToken, [text(
+    'セットアップ画面で使うコードです。\n\n' +
+    `　${display}\n\n` +
+    '10分で使えなくなります。1回だけ使えます。\n' +
+    'システムのURLの末尾に /setup を付けて開き、この番号を貼ってください。'
+  )]);
+  log.info('セットアップ用コードを発行しました', { expiresAt });
+}
+
+
+/**
+ * 持ち主の登録をやめる。次に話しかけた人が新しい持ち主になる。
+ *
+ * ★ここに来る時点で「いまの持ち主」であることは確認済み（入口で弾いている）。
+ * ★環境変数で持ち主を固定している場合は効かない。黙って成功と言わない。
+ */
+async function resetOwner(
+  env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
+): Promise<void> {
+  if (env.LINE_OWNER_USER_ID) {
+    await line.reply(replyToken, [text(
+      '持ち主が固定されているため、ここからは変更できません。\n' +
+      'Cloudflare の画面 → お使いの Worker → 設定 → 変数とシークレット で\n' +
+      'LINE_OWNER_USER_ID を消してから、もう一度お試しください。'
+    )]);
+    return;
+  }
+
+  const cleared = await d.db.clearOwnerLineUserId(DEFAULT_TENANT_ID, `line:${userId}`);
+  await line.reply(replyToken, [text(cleared
+    ? '持ち主の登録をやめました。\n\n' +
+      '★次にこのトークへ話しかけた人が、新しい持ち主になります。\n' +
+      '引き継ぐ相手に、先に話しかけてもらってください。'
+    : '持ち主はもともと登録されていませんでした。')]);
+  log.info('持ち主の登録をやめました', { cleared });
+}
