@@ -23,6 +23,8 @@ export interface ServiceDeps {
   llmWorkspaceId?: string | null;
   noteSession: NoteSession;
   ownerLineUserId: string | null;
+  /** 投稿者（持ち主と同じく承認できる）。渡さなければ持ち主だけ */
+  staffLineUserIds?: readonly string[];
   images: ImageStore;
   /**
    * note が振り直した Cookie を保存し直すための口。
@@ -38,9 +40,11 @@ export interface GenerateResult {
 }
 
 /** ネタを受け付けて記事レコードを作る。 */
-export async function submitIdea(deps: ServiceDeps, sourceText: string, tenantId = DEFAULT_TENANT_ID) {
+export async function submitIdea(
+  deps: ServiceDeps, sourceText: string, tenantId = DEFAULT_TENANT_ID, requestedBy: string | null = null,
+) {
   await deps.db.ensureTenant(tenantId);
-  return deps.db.createArticle(tenantId, sourceText);
+  return deps.db.createArticle(tenantId, sourceText, requestedBy);
 }
 
 /**
@@ -222,15 +226,16 @@ export async function markAwaitingApproval(deps: ServiceDeps, articleId: string)
   await deps.db.setState(articleId, a.state, 'awaiting_approval', 'system');
 }
 
-/** 承認する。★承認できるのはオーナーだけ。 */
+/** 承認する。★承認できるのは持ち主と投稿者だけ。 */
 export async function approve(deps: ServiceDeps, articleId: string, byLineUserId: string): Promise<PolicyDecision> {
   const a = await deps.db.getArticle(articleId);
   if (!a) throw new Error('記事が見つかりません');
 
-  if (deps.ownerLineUserId && byLineUserId !== deps.ownerLineUserId) {
+  const isStaff = (deps.staffLineUserIds ?? []).includes(byLineUserId);
+  if (deps.ownerLineUserId && byLineUserId !== deps.ownerLineUserId && !isStaff) {
     await deps.db.audit(a.tenant_id, 'publish.denied', `line:${byLineUserId}`, articleId, 'denied', { reason: 'wrong_approver' });
     return { allowed: false, reason: 'wrong_approver', retryable: false,
-      userMessage: 'この記事を公開できるのはアカウントの持ち主だけです。' };
+      userMessage: 'この記事を公開できるのは、アカウントの持ち主と投稿者だけです。' };
   }
 
   await deps.db.updateArticle(articleId, { approved_at: nowIso(), approved_by: byLineUserId });
@@ -254,6 +259,7 @@ export async function checkPolicy(deps: ServiceDeps, articleId: string): Promise
     },
     article: { state: a.state, approvedAt: a.approved_at, approvedBy: a.approved_by },
     ownerLineUserId: deps.ownerLineUserId,
+    staffLineUserIds: deps.staffLineUserIds,
     todayPublishCount: await deps.db.todayPublishCount(a.tenant_id),
     lastPublishedAt: await deps.db.lastPublishedAt(a.tenant_id),
     globalRecentCount: await deps.db.globalRecentCount(),

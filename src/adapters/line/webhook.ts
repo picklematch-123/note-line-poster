@@ -42,7 +42,14 @@ import { parseDailyLimit, parseIntervalSec } from '../../core/policy/options';
 import { KvImageStore } from '../../ports/storage/images';
 import { newId } from '../../lib/id';
 import { log } from '../../lib/mask';
-import { canUse, NOT_OWNER_MESSAGE } from '../../core/line/access';
+import { canUse, isOwner, roleOf, NOT_OWNER_MESSAGE, OWNER_ONLY_MESSAGE } from '../../core/line/access';
+import {
+  openInvite, peekInvite, closeInvite, MAX_STAFF,
+  savePending, getPending, deletePending,
+  buildInviteOpened, buildWelcomeStaff, buildStaffAddedNotice,
+  buildApprovalRequest, buildWaitingForApproval,
+} from '../../core/line/members';
+import { otherWorkInProgress } from '../../core/article/ownership';
 import { issueSetupCode } from '../../core/setup/state';
 import { resolveMasterKey } from '../../core/setup/masterkey';
 
@@ -138,7 +145,40 @@ async function handleEvent(event: LineEvent, env: Env): Promise<void> {
   //   公開だけを守っていたが、記事生成は毎回 Claude を呼ぶ＝顧客の残高が減る。
   //   ナレッジを書き換えられると、以後の記事すべてに影響が残る。
   //   友だち追加さえすれば誰でもできる状態だった。
-  if (!canUse(d.ownerLineUserId, userId)) {
+  d.staffLineUserIds = await d.db.listStaffIds(DEFAULT_TENANT_ID);
+
+  // ★投稿者の受付（持ち主が「投稿者を追加」と送ってから10分間だけ開く）。
+  //   持ち主でも投稿者でもない人が話しかけてきたら、窓口を閉じて**持ち主に確認を送る**。
+  //   話しかけただけでは投稿者にしない（源蔵レビュー条件2: メニューを1回押しただけで登録される事故を防ぐ）。
+  //   友だち追加（follow）だけでは受け付けない。本人が話しかけたときに限る。
+  if (roleOf(d.ownerLineUserId, userId, d.staffLineUserIds) === 'guest'
+      && (event.type === 'message' || event.type === 'postback')) {
+    if (await getPending(env.KV, DEFAULT_TENANT_ID, userId)) {
+      if (event.replyToken) await line.reply(event.replyToken, [text(buildWaitingForApproval())]);
+      return;
+    }
+    const invite = await peekInvite(env.KV, DEFAULT_TENANT_ID);
+    if (invite) {
+      await closeInvite(env.KV, DEFAULT_TENANT_ID);
+      // ★窓口を開けた人が、いまも持ち主であること（その後に持ち主が変わっていたら無効）
+      if (invite.by === d.ownerLineUserId) {
+        const profile = await line.getProfile(userId);
+        const name = profile?.displayName ?? null;
+        await savePending(env.KV, DEFAULT_TENANT_ID, {
+          userId, displayName: name, invitedBy: invite.by, requestedAt: new Date().toISOString(),
+        });
+        await d.db.audit(DEFAULT_TENANT_ID, 'member.requested', `line:${userId}`, null, 'ok', { displayName: name });
+        if (event.replyToken) await line.reply(event.replyToken, [text(buildWaitingForApproval())]);
+        await line.push(invite.by, [textWithActions(buildApprovalRequest(name), [
+          { label: '投稿者にする', data: `action=member_approve&uid=${userId}` },
+          { label: '断る', data: `action=member_reject&uid=${userId}` },
+        ])]);
+        return;
+      }
+    }
+  }
+
+  if (!canUse(d.ownerLineUserId, userId, d.staffLineUserIds)) {
     log.warn('持ち主以外からの操作を断りました');
     const token = event.replyToken;
     if (token && (event.type === 'message' || event.type === 'postback')) {
@@ -193,6 +233,55 @@ async function guard(
   }
 }
 
+/** 「自分の作業中の記事」を探すときの指定。担当者が空の古い記事は持ち主のもの */
+function me(d: ServiceDeps, userId: string) {
+  return { userId, isOwner: isOwner(d.ownerLineUserId, userId) };
+}
+
+/**
+ * その人が「別の記事」を作業中なら、その記事を返す（担当を引き受けさせない）。
+ * ★作業中の記事を1人2本にすると、次の指示や「OK」が開いたつもりの記事ではない方に届く。
+ */
+async function busyWithOther(d: ServiceDeps, userId: string, articleId: string) {
+  return otherWorkInProgress(await d.db.findArticleAwaitingDecision(DEFAULT_TENANT_ID, me(d, userId)), articleId);
+}
+
+/** 投稿者が、持ち主だけの操作をしようとしたとき */
+async function ownerOnly(line: LineClient, replyToken: string): Promise<void> {
+  await line.reply(replyToken, [text(OWNER_ONLY_MESSAGE)]);
+}
+
+/** 投稿者の受付を開く（持ち主だけ） */
+async function startMemberInvite(
+  env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
+): Promise<void> {
+  if ((d.staffLineUserIds ?? []).length >= MAX_STAFF) {
+    await line.reply(replyToken, [text(
+      `投稿者は${MAX_STAFF}人までです。\n「投稿者一覧」から誰かを外してから、もう一度お試しください。`,
+    )]);
+    return;
+  }
+  await openInvite(env.KV, DEFAULT_TENANT_ID, userId);
+  await line.reply(replyToken, [text(buildInviteOpened())]);
+}
+
+/** 投稿者の一覧と、外すボタン（持ち主だけ） */
+async function showMembers(line: LineClient, d: ServiceDeps, replyToken: string): Promise<void> {
+  const staff = await d.db.listStaff(DEFAULT_TENANT_ID);
+  if (staff.length === 0) {
+    await line.reply(replyToken, [text(
+      '投稿者はまだいません。\n\n「投稿者を追加」と送ると、追加の受付を始めます。',
+    )]);
+    return;
+  }
+  await line.reply(replyToken, [textWithActions(
+    `【投稿者】${staff.length}人\n\n` +
+    staff.map((m, i) => `${i + 1}. ${m.display_name ?? '（名前なし）'}`).join('\n') +
+    '\n\n外したい人の番号を押してください。',
+    staff.slice(0, 12).map((m, i) => ({ label: `${i + 1}を外す`, data: `action=member_remove&uid=${m.line_user_id}` })),
+  )]);
+}
+
 // ── テキスト ────────────────────────────────────────────
 async function handleText(
   event: LineEvent, env: Env, line: LineClient, d: ServiceDeps, userId: string,
@@ -205,7 +294,7 @@ async function handleText(
   const cmd = normalizeCommand(body);
 
   if (COMMANDS.menu.test(cmd)) {
-    await clearMode(env.KV, DEFAULT_TENANT_ID);
+    await clearMode(env.KV, DEFAULT_TENANT_ID, userId);
     await line.reply(replyToken, [buildMenu()]);
     return;
   }
@@ -213,13 +302,13 @@ async function handleText(
   //   scripts/setup-richmenu.mjs のラベルも合わせること。
   // ★呼び名は「ナレッジ」に寄せたが、リッチメニューの文言も引き続き受ける
   if (COMMANDS.knowledge.test(cmd)) {
-    return showContext(env, line, d, replyToken);
+    return showContext(env, line, d, replyToken, userId);
   }
   if (COMMANDS.newArticle.test(cmd)) {
-    return startArticleInput(env, line, replyToken);
+    return startArticleInput(env, line, replyToken, userId);
   }
   if (COMMANDS.articleList.test(cmd)) {
-    return showArticleList(env, line, d, replyToken);
+    return showArticleList(env, line, d, replyToken, userId);
   }
 
   // ── note 連携（Chrome 拡張）────────────────────────────
@@ -233,21 +322,32 @@ async function handleText(
   if (COMMANDS.disconnect.test(cmd)) {
     return doDisconnect(env, line, d, replyToken, userId);
   }
+  // ★ここから下の3つは持ち主だけ（投稿者を足したので、入口の判定だけでは足りない）
   if (COMMANDS.setupCode.test(cmd)) {
+    if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
     return sendSetupCode(env, line, replyToken);
   }
   if (COMMANDS.ownerReset.test(cmd)) {
+    if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
     return resetOwner(env, line, d, replyToken, userId);
+  }
+  if (COMMANDS.memberAdd.test(cmd)) {
+    if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+    return startMemberInvite(env, line, d, replyToken, userId);
+  }
+  if (COMMANDS.memberList.test(cmd)) {
+    if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+    return showMembers(line, d, replyToken);
   }
   if (COMMANDS.settings.test(cmd)) {
     return showSettings(env, line, d, replyToken);
   }
 
   // ── 2. いま何を待っているか（モード）─────────────────────
-  const mode = await getMode(env.KV, DEFAULT_TENANT_ID);
+  const mode = await getMode(env.KV, DEFAULT_TENANT_ID, userId);
 
   if (mode?.kind === 'ctx_delete') {
-    await clearMode(env.KV, DEFAULT_TENANT_ID);
+    await clearMode(env.KV, DEFAULT_TENANT_ID, userId);
     if (/^(やめ|キャンセル|中止)/.test(body)) {
       await line.reply(replyToken, [text('消すのをやめました。')]);
       return;
@@ -261,7 +361,7 @@ async function handleText(
   }
 
   if (mode?.kind === 'ctx_new' || mode?.kind === 'ctx_append') {
-    await clearMode(env.KV, DEFAULT_TENANT_ID);
+    await clearMode(env.KV, DEFAULT_TENANT_ID, userId);
     if (/^(やめ|キャンセル|中止)/.test(body)) {
       await line.reply(replyToken, [text('登録をやめました。')]);
       return;
@@ -272,7 +372,7 @@ async function handleText(
   if (mode?.kind === 'article_select') {
     const n = parseIndex(body);
     if (n && mode.ids && n <= mode.ids.length) {
-      await clearMode(env.KV, DEFAULT_TENANT_ID);
+      await clearMode(env.KV, DEFAULT_TENANT_ID, userId);
       const a = await d.db.getArticle(mode.ids[n - 1]);
       if (!a) {
         await line.reply(replyToken, [text('その記事が見つかりませんでした。')]);
@@ -282,28 +382,28 @@ async function handleText(
       return;
     }
     if (/^(やめ|キャンセル|中止)/.test(body)) {
-      await clearMode(env.KV, DEFAULT_TENANT_ID);
+      await clearMode(env.KV, DEFAULT_TENANT_ID, userId);
       await line.reply(replyToken, [text('一覧を閉じました。')]);
       return;
     }
     // 番号でなければ、そのまま新しいネタとして扱う
-    await clearMode(env.KV, DEFAULT_TENANT_ID);
+    await clearMode(env.KV, DEFAULT_TENANT_ID, userId);
   }
 
   if (mode?.kind === 'article_new') {
-    await clearMode(env.KV, DEFAULT_TENANT_ID);
+    await clearMode(env.KV, DEFAULT_TENANT_ID, userId);
     if (/^(やめ|キャンセル|中止)/.test(body)) {
       await line.reply(replyToken, [text('作成をやめました。')]);
       return;
     }
     // 前の記事が片付いていなければ、そちらを先に終わらせてもらう
-    const pending = await d.db.findArticleAwaitingDecision(DEFAULT_TENANT_ID);
+    const pending = await d.db.findArticleAwaitingDecision(DEFAULT_TENANT_ID, me(d, userId));
     if (pending) {
       await line.reply(replyToken, [buildPendingNotice(pending)]);
       return;
     }
     if (body.length < MIN_IDEA_LENGTH) {
-      await setMode(env.KV, DEFAULT_TENANT_ID, { kind: 'article_new' });
+      await setMode(env.KV, DEFAULT_TENANT_ID, userId, { kind: 'article_new' });
       await line.reply(replyToken, [text(
         'もう少し詳しく教えてください。\n' +
         '何について書きたいか、誰に向けてか、狙いたいキーワードがあると記事が良くなります。'
@@ -317,7 +417,7 @@ async function handleText(
   // ★これがある間は新しい記事を作らない（運用側の判断 2026-08-28）。
   //   記事を書いている途中に別の記事を書くことは実際には無く、
   //   誤って別記事が生まれるほうが害が大きい。
-  const active = await d.db.findArticleAwaitingDecision(DEFAULT_TENANT_ID);
+  const active = await d.db.findArticleAwaitingDecision(DEFAULT_TENANT_ID, me(d, userId));
 
   // 生成に失敗した記事があるなら、この発言は「やり直しの指示」
   if (active && active.state === 'failed') {
@@ -422,8 +522,8 @@ function buildPendingNotice(a: { id: string; title: string | null; state: string
 }
 
 /** 記事のネタ入力を待つ状態にする。 */
-async function startArticleInput(env: Env, line: LineClient, replyToken: string): Promise<void> {
-  await setMode(env.KV, DEFAULT_TENANT_ID, { kind: 'article_new' });
+async function startArticleInput(env: Env, line: LineClient, replyToken: string, userId: string): Promise<void> {
+  await setMode(env.KV, DEFAULT_TENANT_ID, userId, { kind: 'article_new' });
   await line.reply(replyToken, [text(
     '記事にしたいネタを送ってください。\n\n' +
     '画像は、ネタを送ったあとに続けて送ってください。'
@@ -434,7 +534,7 @@ async function startArticleInput(env: Env, line: LineClient, replyToken: string)
 async function startGeneration(
   body: string, env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
 ): Promise<void> {
-  const article = await submitIdea(d, body);
+  const article = await submitIdea(d, body, DEFAULT_TENANT_ID, userId);
   await env.GENERATE.create({
     params: { articleId: article.id, lineUserId: userId, debounceSec: DEBOUNCE_SEC },
   });
@@ -447,7 +547,7 @@ async function startGeneration(
 
 /** 過去の記事を連番つきで一覧表示し、番号待ちにする。 */
 async function showArticleList(
-  env: Env, line: LineClient, d: ServiceDeps, replyToken: string,
+  env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
 ): Promise<void> {
   // ★note の画面から消された記事を、先に一覧から外す。
   //   ここを飛ばすと、開いても 404 になる記事が並ぶ。
@@ -456,7 +556,7 @@ async function showArticleList(
 
   const articles = await d.db.listRecentArticles(DEFAULT_TENANT_ID, 10);
   if (articles.length > 0) {
-    await setMode(env.KV, DEFAULT_TENANT_ID, {
+    await setMode(env.KV, DEFAULT_TENANT_ID, userId, {
       kind: 'article_select',
       ids: articles.map((a) => a.id),
     });
@@ -469,7 +569,7 @@ async function handleImage(
   event: LineEvent, env: Env, line: LineClient, d: ServiceDeps, userId: string,
 ): Promise<void> {
   const messageId = event.message!.id;
-  const active = await d.db.findActiveArticle(DEFAULT_TENANT_ID);
+  const active = await d.db.findActiveArticle(DEFAULT_TENANT_ID, me(d, userId));
 
   if (!active || !['received', 'generating'].includes(active.state)) {
     await line.reply(event.replyToken!, [text(
@@ -513,22 +613,76 @@ async function handlePostback(
   // 記事に紐づかない操作（メニュー・ナレッジ）はここで処理する
   switch (action) {
     case 'menu_new':
-      return startArticleInput(env, line, replyToken);
+      return startArticleInput(env, line, replyToken, userId);
 
 
     case 'menu_list':
-      return showArticleList(env, line, d, replyToken);
+      return showArticleList(env, line, d, replyToken, userId);
 
     case 'menu_profile':
-      return showContext(env, line, d, replyToken);
+      return showContext(env, line, d, replyToken, userId);
+
+    case 'member_approve': {
+      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      const uid = params.get('uid') ?? '';
+      // ★確認待ちの記録がある人にしか効かない（ボタンの中身を書き換えて別人を登録させない）
+      const pending = await getPending(env.KV, DEFAULT_TENANT_ID, uid);
+      if (!pending) {
+        await line.reply(replyToken, [text(
+          'この確認は、期限が切れたか、すでに済んでいます。\n' +
+          '追加する場合は、もう一度「投稿者を追加」と送ってください。',
+        )]);
+        return;
+      }
+      const result = await d.db.addStaff(DEFAULT_TENANT_ID, uid, pending.displayName, userId, MAX_STAFF);
+      if (result === 'full') {
+        await line.reply(replyToken, [text(
+          `投稿者は${MAX_STAFF}人までです。\n「投稿者一覧」から誰かを外してから、もう一度「投稿者にする」を押してください。`,
+        )]);
+        return;
+      }
+      await deletePending(env.KV, DEFAULT_TENANT_ID, uid);
+      if (result === 'exists') {
+        // ★すでに投稿者。案内は送らないので「送りました」と言わない
+        await line.reply(replyToken, [text('この方は、すでに投稿者です。')]);
+        return;
+      }
+      await line.reply(replyToken, [text(buildStaffAddedNotice(pending.displayName))]);
+      await line.push(uid, [text(buildWelcomeStaff())]);
+      return;
+    }
+
+    case 'member_reject': {
+      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      const uid = params.get('uid') ?? '';
+      const pending = await getPending(env.KV, DEFAULT_TENANT_ID, uid);
+      await deletePending(env.KV, DEFAULT_TENANT_ID, uid);
+      if (pending) {
+        await d.db.audit(DEFAULT_TENANT_ID, 'member.rejected', `line:${userId}`, null, 'ok', { userId: uid });
+      }
+      // ★断られた本人には知らせない（何が動いているかを教えない）
+      await line.reply(replyToken, [text(pending ? '登録しませんでした。' : 'この確認は、すでに済んでいます。')]);
+      return;
+    }
+
+    case 'member_remove': {
+      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      const uid = params.get('uid') ?? '';
+      const removed = uid ? await d.db.removeStaff(DEFAULT_TENANT_ID, uid, `line:${userId}`) : false;
+      await line.reply(replyToken, [text(removed
+        ? '投稿者から外しました。\nこの人は、このアカウントで記事を作ったり公開したりできなくなります。\n' +
+          '作りかけの記事があれば、「過去記事一覧」から続きを操作できます。'
+        : 'その人は、すでに投稿者ではありません。')]);
+      return;
+    }
 
     case 'menu_cancel':
-      await clearMode(env.KV, DEFAULT_TENANT_ID);
+      await clearMode(env.KV, DEFAULT_TENANT_ID, userId);
       await line.reply(replyToken, [text('閉じました。「メニュー」と送ると、いつでも操作を出せます。')]);
       return;
 
     case 'ctx_append':
-      await setMode(env.KV, DEFAULT_TENANT_ID, { kind: 'ctx_append' });
+      await setMode(env.KV, DEFAULT_TENANT_ID, userId, { kind: 'ctx_append' });
       await line.reply(replyToken, [textWithActions(
         '書き足したい内容を送ってください。いまの内容は残ります。\n\n' +
         '例:\n' +
@@ -540,7 +694,8 @@ async function handlePostback(
       return;
 
     case 'ctx_replace':
-      await setMode(env.KV, DEFAULT_TENANT_ID, { kind: 'ctx_new' });
+      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      await setMode(env.KV, DEFAULT_TENANT_ID, userId, { kind: 'ctx_new' });
       await line.reply(replyToken, [textWithActions(
         '新しい内容を送ってください。いまの設定は置き換わります。',
         [{ label: 'やめる', data: 'action=ctx_cancel' }],
@@ -548,24 +703,26 @@ async function handlePostback(
       return;
 
     case 'ctx_cancel':
-      await clearMode(env.KV, DEFAULT_TENANT_ID);
+      await clearMode(env.KV, DEFAULT_TENANT_ID, userId);
       await line.reply(replyToken, [text('登録をやめました。')]);
       return;
 
     case 'ctx_clear':
-      await clearMode(env.KV, DEFAULT_TENANT_ID);
+      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      await clearMode(env.KV, DEFAULT_TENANT_ID, userId);
       await d.db.clearContext(DEFAULT_TENANT_ID);
       await line.reply(replyToken, [text('設定を消しました。今後は前提なしで記事を書きます。')]);
       return;
 
     case 'ctx_delete': {
+      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
       const current = await d.db.getActiveContext(DEFAULT_TENANT_ID);
       const entries = current ? listEntries(current.raw_text) : [];
       if (entries.length === 0) {
         await line.reply(replyToken, [text('まだ何も覚えていません。')]);
         return;
       }
-      await setMode(env.KV, DEFAULT_TENANT_ID, { kind: 'ctx_delete' });
+      await setMode(env.KV, DEFAULT_TENANT_ID, userId, { kind: 'ctx_delete' });
       await line.reply(replyToken, [{
         type: 'text',
         text: '消したいものの番号を送ってください。\n（一覧は「ナレッジ」で見られます）',
@@ -595,7 +752,7 @@ async function handlePostback(
     }
 
     case 'ctx_edit':
-      return showContext(env, line, d, replyToken);
+      return showContext(env, line, d, replyToken, userId);
 
     case 'cfg_daily':
       return line.reply(replyToken, [buildDailyLimitChoices((await d.db.getTenant(DEFAULT_TENANT_ID)).daily_post_limit)]);
@@ -661,6 +818,12 @@ async function handlePostback(
 
     case 'reopen': {
       // 公開済みの記事を修正モードに戻す。再公開すると同じURLのまま更新される。
+      {
+        const busy = await busyWithOther(d, userId, articleId);
+        if (busy) return line.reply(replyToken, [buildPendingNotice(busy)]);
+      }
+      // ★押した人に担当を移す（続きの指示とプレビューがその人に届くように）
+      await d.db.setRequestedBy(articleId, userId);
       await reopenPublished(d, articleId);
       await line.reply(replyToken, [text(
         'この記事を修正します。どこを直しますか。文章で送ってください。\n\n' +
@@ -692,19 +855,26 @@ async function handlePostback(
     case 'retry': {
       const a = await d.db.getArticle(articleId);
       if (!a) return;
+      const busy = await busyWithOther(d, userId, articleId);
+      if (busy) return line.reply(replyToken, [buildPendingNotice(busy)]);
+      await d.db.setRequestedBy(articleId, userId);
       await requestRewrite(d, articleId, a.revision_instruction ?? a.source_text);
       await env.GENERATE.create({ params: { articleId, lineUserId: userId, debounceSec: 0 } });
       await line.reply(replyToken, [text('もう一度作ります。1〜3分お待ちください。')]);
       return;
     }
 
-    case 'revise':
+    case 'revise': {
+      const busy = await busyWithOther(d, userId, articleId);
+      if (busy) return line.reply(replyToken, [buildPendingNotice(busy)]);
+      await d.db.setRequestedBy(articleId, userId);
       await line.reply(replyToken, [text(
         'どこを直しますか。文章で送ってください。\n\n' +
         '例:\n・画像2を■3の下に移して\n・画像1と画像2を入れ替えて\n・■2をもっと具体的に書き直して\n・タイトルを別の案にして\n\n' +
         '本文を確認したいときは「全文」と送ってください。'
       )]);
       return;
+    }
   }
 }
 
@@ -896,11 +1066,11 @@ async function handleRevision(
 
 // ── 事業コンテキスト ────────────────────────────────────
 /** 現在の設定を見せる。追記・書き換え・削除を選ばせる。 */
-async function showContext(env: Env, line: LineClient, d: ServiceDeps, replyToken: string): Promise<void> {
+async function showContext(env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string): Promise<void> {
   const current = await d.db.getActiveContext(DEFAULT_TENANT_ID);
 
   if (!current) {
-    await setMode(env.KV, DEFAULT_TENANT_ID, { kind: 'ctx_append' });
+    await setMode(env.KV, DEFAULT_TENANT_ID, userId, { kind: 'ctx_append' });
     await line.reply(replyToken, [textWithActions(
       'ここに書いたことは、これから作る記事すべての前提になります。\n' +
       '思いついたものから、どんどん送ってください。あとから足していけます。\n\n' +
@@ -915,7 +1085,7 @@ async function showContext(env: Env, line: LineClient, d: ServiceDeps, replyToke
     return;
   }
 
-  await line.reply(replyToken, [buildKnowledgeList(current.raw_text)]);
+  await line.reply(replyToken, [buildKnowledgeList(current.raw_text, isOwner(d.ownerLineUserId, userId))]);
 }
 
 /** LINE の1通の上限に収まるよう、長い文章を切り分ける。 */
@@ -970,7 +1140,8 @@ async function deleteContextEntry(
 }
 
 /** 溜まっているメモを連番で見せる。長いものは折りたたむ。 */
-function buildKnowledgeList(rawText: string): LineMessage {
+/** @param canEdit 消す・入れ替えるを出すか（持ち主だけ） */
+function buildKnowledgeList(rawText: string, canEdit = true): LineMessage {
   const entries = listEntries(rawText);
   const shown = entries.slice(0, 20);
   const lines = shown.map((e, i) => {
@@ -990,10 +1161,12 @@ function buildKnowledgeList(rawText: string): LineMessage {
     quickReply: {
       items: [
         { type: 'action', action: { type: 'postback', label: '書き足す', data: 'action=ctx_append', displayText: '書き足す' } },
-        { type: 'action', action: { type: 'postback', label: '1件消す', data: 'action=ctx_delete', displayText: '1件消す' } },
+        ...(canEdit ? [{ type: 'action', action: { type: 'postback', label: '1件消す', data: 'action=ctx_delete', displayText: '1件消す' } }] : []),
         { type: 'action', action: { type: 'postback', label: '全文を見る', data: 'action=ctx_full', displayText: '全文を見る' } },
-        { type: 'action', action: { type: 'postback', label: '入れ替える', data: 'action=ctx_replace', displayText: '入れ替える' } },
-        { type: 'action', action: { type: 'postback', label: '全部消す', data: 'action=ctx_clear', displayText: '全部消す' } },
+        ...(canEdit ? [
+          { type: 'action', action: { type: 'postback', label: '入れ替える', data: 'action=ctx_replace', displayText: '入れ替える' } },
+          { type: 'action', action: { type: 'postback', label: '全部消す', data: 'action=ctx_clear', displayText: '全部消す' } },
+        ] : []),
       ],
     },
   };
@@ -1008,7 +1181,7 @@ async function saveContext(
   env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
 ): Promise<void> {
   if (rawText.length < 10) {
-    await setMode(env.KV, DEFAULT_TENANT_ID, { kind: append ? 'ctx_append' : 'ctx_new' });
+    await setMode(env.KV, DEFAULT_TENANT_ID, userId, { kind: append ? 'ctx_append' : 'ctx_new' });
     await line.reply(replyToken, [text(
       'もう少しだけ詳しく書いてください。短すぎると記事に反映できません。'
     )]);
@@ -1175,10 +1348,15 @@ async function resetOwner(
   }
 
   const cleared = await d.db.clearOwnerLineUserId(DEFAULT_TENANT_ID, `line:${userId}`);
+  const hasStaff = (d.staffLineUserIds ?? []).length > 0;
   await line.reply(replyToken, [text(cleared
     ? '持ち主の登録をやめました。\n\n' +
       '★次にこのトークへ話しかけた人が、新しい持ち主になります。\n' +
-      '引き継ぐ相手に、先に話しかけてもらってください。'
+      '引き継ぐ相手に、先に話しかけてもらってください。' +
+      (hasStaff
+        ? '\n\n★投稿者がいます。投稿者が先に話しかけると、その人が持ち主になります。\n' +
+          '引き継ぐ相手に、すぐ話しかけてもらってください。'
+        : '')
     : '持ち主はもともと登録されていませんでした。')]);
   log.info('持ち主の登録をやめました', { cleared });
 }

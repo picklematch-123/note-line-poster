@@ -45,7 +45,7 @@ app.get('/health', async (c) => {
 
   // コードが依存している列。増やしたらここにも足す
   const required: Record<string, string[]> = {
-    articles: ['revision_instruction', 'revision_count', 'image_alts_json', 'note_id', 'note_key', 'removed_at'],
+    articles: ['revision_instruction', 'revision_count', 'image_alts_json', 'note_id', 'note_key', 'removed_at', 'requested_by'],
     images: ['is_eyecatch', 'slot_index', 'note_image_url'],
     tenant_context: ['prompt_snippet'],
     style_profiles: ['prompt_snippet'],
@@ -54,6 +54,7 @@ app.get('/health', async (c) => {
     agent_devices: ['token_hash', 'last_seen_at', 'revoked_at'],
     agent_jobs: ['plan_json', 'state', 'lease_until'],
     tenant_secrets: ['ciphertext', 'iv', 'wrapped_dek', 'dek_iv', 'key_version'],
+    line_members: ['line_user_id', 'role', 'display_name'],
   };
 
   for (const [table, columns] of Object.entries(required)) {

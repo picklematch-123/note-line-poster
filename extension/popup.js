@@ -123,7 +123,8 @@ async function connect() {
         (data.executesLocally
           ? 'note への投稿は、このパソコンから行います。\n' +
             'Chrome を開いていれば、あとは LINE だけで完結します。'
-          : 'LINE に戻って、そのまま記事を作れます。'));
+          : 'note への投稿は、あなた専用のサーバーが行います。\n'
+            + 'このパソコンを閉じていても投稿されます。'));
       el.code.value = '';
       await showLinkState();
       // 待っている記事があればすぐ拾いに行く
@@ -185,17 +186,70 @@ el.saveEndpoint.addEventListener('click', async () => {
 });
 
 // ── このパソコンとサーバーの連携状態 ─────────────────
+/**
+ * 投稿をどこが実行しているかを、サーバーに聞く。
+ *
+ * ★覚えている値だけで表示しないこと。
+ *   投稿する場所は LINE の「投稿設定」からいつでも変えられるので、
+ *   連携したときの値はすぐ古くなる。
+ *
+ * ★聞けなかったときは null を返す（＝分からない）。
+ *   分からないのに断定すると、**事実と逆のことを書いてしまう**。
+ *   実際、以前はここで「このパソコンから投稿します」と決め打ちしていて、
+ *   サーバー投稿の人にも同じ文言が出ていた。
+ *
+ * @returns 'agent' | 'server' | null
+ */
+async function fetchExecutionMode() {
+  try {
+    const endpoint = await getEndpoint();
+    if (!endpoint) return null;
+    // /health は不調のとき 500 を返すが、中身は読める。状態で弾かない
+    const data = await (await fetch(`${endpoint}/health`)).json();
+    const mode = data && data.checks && data.checks.execution_mode;
+    return mode === 'agent' || mode === 'server' ? mode : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function showLinkState() {
   const { deviceToken, urlname } = await chrome.storage.local.get(['deviceToken', 'urlname']);
   const linked = Boolean(deviceToken);
   el.linkState.hidden = false;
   el.linkState.className = `state state--${linked ? 'ok' : 'ng'}`;
-  el.linkText.textContent = linked
-    ? `連携済み${urlname ? `（@${urlname}）` : ''}・このパソコンから投稿します`
-    : '未連携です。LINE で「note連携」と送ってください';
-  el.footer.textContent = linked
-    ? 'note への投稿は、このパソコンの Chrome から行われます。ログイン情報はサーバーに保存されません。'
-    : 'このツールは note のログイン情報だけを読み取ります。パスワードは読み取りません。';
+
+  if (!linked) {
+    el.linkText.textContent = '未連携です。LINE で「note連携」と送ってください';
+    el.footer.textContent =
+      'このツールは note のログイン情報だけを読み取ります。パスワードは読み取りません。';
+    return;
+  }
+
+  const name = urlname ? `（@${urlname}）` : '';
+  // 先に「連携済み」だけ出しておく（サーバーの返事を待たせない）
+  el.linkText.textContent = `連携済み${name}`;
+  el.footer.textContent = '投稿する場所を確認しています…';
+
+  const mode = await fetchExecutionMode();
+
+  if (mode === 'agent') {
+    el.linkText.textContent = `連携済み${name}・このパソコンから投稿します`;
+    el.footer.textContent =
+      'note への投稿は、このパソコンの Chrome から行われます。'
+      + 'ログイン情報はサーバーに保存されません。';
+  } else if (mode === 'server') {
+    el.linkText.textContent = `連携済み${name}・サーバーから投稿します`;
+    el.footer.textContent =
+      'note への投稿は、あなた専用のサーバーが行います。'
+      + 'このパソコンを閉じていても投稿されます。'
+      + 'ログイン情報は暗号化して、そのサーバーの中に保存されています。';
+  } else {
+    // ★分からないときは、どちらとも書かない
+    el.linkText.textContent = `連携済み${name}`;
+    el.footer.textContent =
+      '投稿する場所は、LINE で「投稿設定」と送ると確認・変更できます。';
+  }
 }
 
 // ── 起動時 ───────────────────────────────────────────

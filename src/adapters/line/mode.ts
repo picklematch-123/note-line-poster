@@ -22,14 +22,19 @@ export interface Mode {
 /** 放置されたモードは10分で消える。 */
 const TTL = 600;
 
-const key = (tenantId: string) => `mode:${tenantId}`;
+/**
+ * ★人ごとに分ける（2026-09-13）。
+ *   テナントで1つだと、持ち主が「記事作成」を押した直後に投稿者が送った文章が、
+ *   持ち主の記事のネタとして取り込まれてしまう。
+ */
+const key = (tenantId: string, userId: string) => `mode:${tenantId}:${userId}`;
 
-export async function setMode(kv: KVNamespace, tenantId: string, mode: Mode): Promise<void> {
-  await kv.put(key(tenantId), JSON.stringify(mode), { expirationTtl: TTL });
+export async function setMode(kv: KVNamespace, tenantId: string, userId: string, mode: Mode): Promise<void> {
+  await kv.put(key(tenantId, userId), JSON.stringify(mode), { expirationTtl: TTL });
 }
 
-export async function getMode(kv: KVNamespace, tenantId: string): Promise<Mode | null> {
-  const raw = await kv.get(key(tenantId));
+export async function getMode(kv: KVNamespace, tenantId: string, userId: string): Promise<Mode | null> {
+  const raw = await kv.get(key(tenantId, userId));
   if (!raw) return null;
   try {
     return JSON.parse(raw) as Mode;
@@ -38,8 +43,8 @@ export async function getMode(kv: KVNamespace, tenantId: string): Promise<Mode |
   }
 }
 
-export async function clearMode(kv: KVNamespace, tenantId: string): Promise<void> {
-  await kv.delete(key(tenantId));
+export async function clearMode(kv: KVNamespace, tenantId: string, userId: string): Promise<void> {
+  await kv.delete(key(tenantId, userId));
 }
 
 /** 「1」「1番」「２」などから連番を取り出す。全角数字にも対応する。 */

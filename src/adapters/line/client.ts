@@ -110,6 +110,23 @@ export class LineClient {
     });
   }
 
+  /**
+   * 表示名を取る（友だちになっている人だけ取れる）。
+   * ★取れなくても処理は止めない。持ち主への「誰を登録したか」の知らせに使うだけ。
+   */
+  async getProfile(userId: string): Promise<{ displayName: string } | null> {
+    try {
+      const res = await fetch(`${API}/profile/${encodeURIComponent(userId)}`, {
+        headers: { Authorization: `Bearer ${this.accessToken}` },
+      });
+      if (!res.ok) return null;
+      const body = await res.json() as { displayName?: string };
+      return body.displayName ? { displayName: body.displayName } : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** 送られてきた画像の実体を取得する。 */
   async getContent(messageId: string): Promise<{ bytes: ArrayBuffer; contentType: string }> {
     const res = await fetch(`${CONTENT_API}/message/${encodeURIComponent(messageId)}/content`, {

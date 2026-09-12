@@ -53,8 +53,13 @@ export interface PolicyContext {
     approvedAt: string | null;
     approvedBy: string | null;
   };
-  /** line_channels.owner_line_user_id。承認できる唯一の userId */
+  /** line_channels.owner_line_user_id。承認できる人（持ち主） */
   ownerLineUserId: string | null;
+  /**
+   * 投稿者（line_members）。持ち主と同じく承認できる。
+   * ★外された投稿者の承認は、そこで無効になる（待機中の記事も自動では出ない）。
+   */
+  staffLineUserIds?: readonly string[];
   /** 今日すでに投稿した本数（JST基準） */
   todayPublishCount: number;
   /** 直近の投稿時刻（ISO8601、無ければ null） */
@@ -132,10 +137,11 @@ export function canPublish(ctx: PolicyContext): PolicyDecision {
       userMessage: '公開の承認がされていません。',
     };
   }
-  if (ctx.ownerLineUserId && ctx.article.approvedBy !== ctx.ownerLineUserId) {
+  if (ctx.ownerLineUserId && ctx.article.approvedBy !== ctx.ownerLineUserId
+      && !(ctx.article.approvedBy && (ctx.staffLineUserIds ?? []).includes(ctx.article.approvedBy))) {
     return {
       allowed: false, reason: 'wrong_approver', retryable: false,
-      userMessage: 'この記事を公開できるのはアカウントの持ち主だけです。',
+      userMessage: 'この記事を公開できるのは、アカウントの持ち主と投稿者だけです。',
     };
   }
   if (secondsBetween(ctx.article.approvedAt, now) > APPROVAL_TTL_SEC) {

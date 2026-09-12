@@ -23,17 +23,19 @@ export async function retryBlocked(env: Env): Promise<void> {
     llmWorkspaceId: env.ANTHROPIC_WORKSPACE_ID ?? null,
     noteSession: session,
     ownerLineUserId: ownerId,
+    // ★投稿者が承認した記事も、条件が戻れば自動で出す（外された人の承認は通らない）
+    staffLineUserIds: await db.listStaffIds(DEFAULT_TENANT_ID),
     images: new KvImageStore(env.KV),
     onCookieRefresh: (cookieHeader) => persistRefreshedCookie(env, origin, cookieHeader),
   };
 
   const waiting = await env.DB
-    .prepare(`SELECT id FROM articles
+    .prepare(`SELECT id, approved_by FROM articles
               WHERE tenant_id = ? AND state IN ('blocked','awaiting_session')
                 -- awaiting_agent は拡張が取りに来るのを待っている状態なので触らない
               ORDER BY approved_at ASC LIMIT 5`)
     .bind(DEFAULT_TENANT_ID)
-    .all<{ id: string }>();
+    .all<{ id: string; approved_by: string | null }>();
 
   const line = new LineClient(env.LINE_CHANNEL_ACCESS_TOKEN, env.KV);
 
@@ -52,8 +54,10 @@ export async function retryBlocked(env: Env): Promise<void> {
 
       const { url } = await publishArticle(deps, row.id);
       log.info('待機中の記事を自動投稿しました', { articleId: row.id });
-      if (ownerId) {
-        await line.push(ownerId, [text(`お待たせしました。公開しました。\n${url}`)]);
+      // ★「公開する」を押した人に知らせる（投稿者が出した記事なら投稿者へ）
+      const notify = row.approved_by ?? ownerId;
+      if (notify) {
+        await line.push(notify, [text(`お待たせしました。公開しました。\n${url}`)]);
       }
     } catch (e) {
       log.warn('自動投稿に失敗', String(e));

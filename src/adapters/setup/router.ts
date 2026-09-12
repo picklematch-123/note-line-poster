@@ -97,6 +97,22 @@ function options(list: readonly number[], current: number, label: (n: number) =>
  * ★LINE からも同じことができる（「投稿設定」）。どちらで変えても同じ値を書く。
  * ★★出している本数は note の基準ではない。RATE_RISK_NOTE をここから外さないこと。
  */
+/**
+ * コードの入力欄。
+ *
+ * ★**入手方法を必ず一緒に出すこと。**
+ *   「LINE で受け取ったコード」とだけ書いていた時期があり、
+ *   **何を送ればコードが来るのか分からず設定できない**という詰まり方をした
+ *   （2026-09-12 運用側の判断）。欄だけ置いて説明を書かない、を繰り返さないために
+ *   1か所にまとめてある。
+ */
+function codeField(id: string): string {
+  return `<label for="${id}">確認コード</label>
+ <p class="d" style="margin-left:0">LINE で <b>「セットアップ」</b> と送ると届きます。
+ <b>10分間・1回かぎり</b>なので、使ったら次はまた送ってください。</p>
+ <input id="${id}" name="code" placeholder="ABCD-2345" autocomplete="off" required>`;
+}
+
 function rateSection(status: Status): string {
   if (!status.rate) {
     return `<h2>投稿の設定</h2>
@@ -104,6 +120,11 @@ function rateSection(status: Status): string {
   }
 
   return `<h2>投稿の設定</h2>
+${status.requiresCode ? `<div class="note">
+ <b>LINE から変えるのがいちばん簡単です。</b><br>
+ LINE で <b>「投稿設定」</b> と送ると、ボタンを押すだけで変えられます（<b>コードは要りません</b>）。<br>
+ この画面から変えるときだけ、下の確認コードが必要になります。
+</div>` : ''}
 <div class="note">${esc(RATE_RISK_NOTE).replace(/\n/g, '<br>')}</div>
 <p class="lead">迷ったときは <b>${esc(limitLabel(SUGGESTED_DAILY_LIMIT))}</b>・
 <b>${esc(intervalLabel(SUGGESTED_INTERVAL_SEC))}</b> あたりから始めて、
@@ -113,11 +134,10 @@ function rateSection(status: Status): string {
  <select id="daily" name="daily">${options(DAILY_LIMIT_OPTIONS, status.rate.daily, limitLabel)}</select>
  <label for="interval" style="margin-top:1rem">前の投稿からあける時間</label>
  <select id="interval" name="interval">${options(INTERVAL_OPTIONS, status.rate.interval, intervalLabel)}</select>
- ${status.requiresCode ? `<label for="code3" style="margin-top:1rem">LINE で受け取ったコード</label>
- <input id="code3" name="code" placeholder="ABCD-2345" autocomplete="off" required>` : ''}
+ ${status.requiresCode ? `<div style="margin-top:1rem">${codeField('code3')}</div>` : ''}
  <button type="submit">この内容で保存する</button>
 </form>
-<p class="d" style="margin-left:0">LINE で「投稿設定」と送っても、同じことができます。</p>`;
+`;
 }
 
 function page(status: Status, steps: Step[] = [], message = ''): string {
@@ -170,8 +190,7 @@ ${status.requiresCode ? `
 <div class="note">一度セットアップが終わっているため、実行にはコードが要ります。
 LINE で <b>「セットアップ」</b> と送ると、10分間だけ使えるコードが届きます。</div>
 <form method="post" action="/setup/run">
- <label for="code">LINE で受け取ったコード</label>
- <input id="code" name="code" placeholder="ABCD-2345" autocomplete="off" required>
+ ${codeField('code')}
  <button type="submit">実行する</button>
 </form>` : `
 <div class="note">押すと、次のことをまとめて行います。<br>
@@ -187,8 +206,7 @@ ${rateSection(status)}
  やめたあと、<b>次に話しかけた人</b>が新しい持ち主になります。
 </div>
 <form method="post" action="/setup/reset-owner">
- ${status.requiresCode ? `<label for="code2">LINE で受け取ったコード</label>
- <input id="code2" name="code" placeholder="ABCD-2345" autocomplete="off" required>` : ''}
+ ${status.requiresCode ? codeField('code2') : ''}
  <button type="submit">持ち主の登録をやめる</button>
 </form>
 

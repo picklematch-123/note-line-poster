@@ -103,6 +103,8 @@ export async function handleAgentResult(req: Request, env: Env): Promise<Respons
     llmWorkspaceId: env.ANTHROPIC_WORKSPACE_ID ?? null,
     noteSession: { cookieHeader: '', userAgent: '', urlname: device.noteUrlname ?? '' },
     ownerLineUserId: env.LINE_OWNER_USER_ID || (await db.getOwnerLineUserId(device.tenantId)),
+    // ★投稿者が承認した記事も、拡張経由で出せるようにする
+    staffLineUserIds: await db.listStaffIds(device.tenantId),
     images: new KvImageStore(env.KV),
   } satisfies ServiceDeps;
 

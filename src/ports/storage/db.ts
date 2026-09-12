@@ -8,6 +8,18 @@ import { newId } from '../../lib/id';
 import { nowIso, jstDate } from '../../lib/time';
 import { assertTransition, type ArticleState } from '../../core/article/state';
 
+/**
+ * 「誰の作業中の記事か」を探すときの指定。
+ * ★担当者が入っていない記事（この仕組みより前に作られたもの）は、持ち主のものとして扱う。
+ */
+export interface ArticleOwner {
+  userId: string;
+  isOwner: boolean;
+}
+
+/** requested_by = ?userId、または（担当者なし かつ 探しているのが持ち主） */
+const MINE = '(requested_by = ? OR (requested_by IS NULL AND ? = 1))';
+
 export const DEFAULT_TENANT_ID = 'tenant_default';
 
 /**
@@ -53,6 +65,7 @@ export interface ArticleRow {
   revision_count: number;
   approved_at: string | null;
   approved_by: string | null;
+  requested_by?: string | null;
   published_at: string | null;
   /** note 上から消えたと分かった時刻。入っていれば一覧に出さない */
   removed_at: string | null;
@@ -201,14 +214,73 @@ export class Db {
     return row?.owner_line_user_id ?? null;
   }
 
+  // ── 投稿者（スタッフ）─────────────────────────────────
+  /**
+   * 投稿者の userId 一覧。
+   * ★表がまだ無い（マイグレーション前）ときは空で返す。
+   *   ここで例外にすると、持ち主まで一切操作できなくなる。
+   */
+  async listStaffIds(tenantId: string): Promise<string[]> {
+    try {
+      const r = await this.d1
+        .prepare('SELECT line_user_id FROM line_members WHERE tenant_id = ? ORDER BY created_at')
+        .bind(tenantId)
+        .all<{ line_user_id: string }>();
+      return (r.results ?? []).map((row) => row.line_user_id);
+    } catch (e) {
+      // ★空にしてよいのは「表がまだ無い」ときだけ（2026-09-13 源蔵レビュー）。
+      //   一時的な失敗まで空扱いにすると、投稿者が締め出され、人数の上限もすり抜ける
+      if (/no such table/i.test(String(e))) return [];
+      throw e;
+    }
+  }
+
+  async listStaff(tenantId: string): Promise<Array<{ line_user_id: string; display_name: string | null; created_at: string }>> {
+    const r = await this.d1
+      .prepare('SELECT line_user_id, display_name, created_at FROM line_members WHERE tenant_id = ? ORDER BY created_at')
+      .bind(tenantId)
+      .all<{ line_user_id: string; display_name: string | null; created_at: string }>();
+    return r.results ?? [];
+  }
+
+  /**
+   * 投稿者を登録する。
+   * @returns added=登録した / exists=すでにいる / full=上限に達している
+   */
+  async addStaff(
+    tenantId: string, userId: string, displayName: string | null, addedBy: string, max: number,
+  ): Promise<'added' | 'exists' | 'full'> {
+    const current = await this.listStaffIds(tenantId);
+    if (current.includes(userId)) return 'exists';
+    if (current.length >= max) return 'full';
+    await this.d1
+      .prepare(`INSERT OR IGNORE INTO line_members (tenant_id, line_user_id, role, display_name, added_by, created_at)
+                VALUES (?, ?, 'staff', ?, ?, ?)`)
+      .bind(tenantId, userId, displayName, addedBy, nowIso())
+      .run();
+    await this.audit(tenantId, 'member.added', `line:${addedBy}`, null, 'ok', { userId, displayName });
+    return 'added';
+  }
+
+  async removeStaff(tenantId: string, userId: string, actor: string): Promise<boolean> {
+    const res = await this.d1
+      .prepare('DELETE FROM line_members WHERE tenant_id = ? AND line_user_id = ?')
+      .bind(tenantId, userId)
+      .run();
+    const removed = (res.meta?.changes ?? 0) > 0;
+    if (removed) await this.audit(tenantId, 'member.removed', actor, null, 'ok', { userId });
+    return removed;
+  }
+
   // ── 記事 ─────────────────────────────────────────────
-  async createArticle(tenantId: string, sourceText: string): Promise<ArticleRow> {
+  /** @param requestedBy ネタを送った人。2人以上で使うときに入力が混ざらないよう記事に持たせる */
+  async createArticle(tenantId: string, sourceText: string, requestedBy: string | null = null): Promise<ArticleRow> {
     const id = newId();
     const now = nowIso();
     await this.d1
-      .prepare(`INSERT INTO articles (id, tenant_id, state, source_text, created_at, updated_at)
-                VALUES (?, ?, 'received', ?, ?, ?)`)
-      .bind(id, tenantId, sourceText, now, now)
+      .prepare(`INSERT INTO articles (id, tenant_id, state, source_text, requested_by, created_at, updated_at)
+                VALUES (?, ?, 'received', ?, ?, ?, ?)`)
+      .bind(id, tenantId, sourceText, requestedBy, now, now)
       .run();
     await this.logEvent(id, null, 'received', 'system');
     return (await this.getArticle(id))!;
@@ -222,25 +294,38 @@ export class Db {
    * 本人の判断を待っている記事を1件返す。
    * ★これがある間は新しい記事を作らせない（誤って別記事が生まれるのを防ぐ）。
    */
-  async findArticleAwaitingDecision(tenantId: string): Promise<ArticleRow | null> {
+  async findArticleAwaitingDecision(tenantId: string, who: ArticleOwner): Promise<ArticleRow | null> {
     return this.d1
       .prepare(`SELECT * FROM articles
                 WHERE tenant_id = ? AND state IN
                   ('received','generating','preview_ready','awaiting_approval','editing','failed')
+                  AND ${MINE}
                 ORDER BY created_at DESC LIMIT 1`)
-      .bind(tenantId)
+      .bind(tenantId, who.userId, who.isOwner ? 1 : 0)
       .first<ArticleRow>();
   }
 
   /** 何らかの続きがある記事（投稿待ち・連携切れも含む）。 */
-  async findActiveArticle(tenantId: string): Promise<ArticleRow | null> {
+  async findActiveArticle(tenantId: string, who: ArticleOwner): Promise<ArticleRow | null> {
     return this.d1
       .prepare(`SELECT * FROM articles
                 WHERE tenant_id = ? AND state IN
                   ('received','generating','preview_ready','awaiting_approval','editing','blocked','awaiting_session','failed')
+                  AND ${MINE}
                 ORDER BY created_at DESC LIMIT 1`)
-      .bind(tenantId)
+      .bind(tenantId, who.userId, who.isOwner ? 1 : 0)
       .first<ArticleRow>();
+  }
+
+  /**
+   * この記事の担当を、いま手を動かした人に移す。
+   * ★「修正する」「作り直す」を押した人のところに、続きの指示とプレビューが届くようにする。
+   */
+  async setRequestedBy(articleId: string, userId: string): Promise<void> {
+    await this.d1
+      .prepare('UPDATE articles SET requested_by = ?, updated_at = ? WHERE id = ?')
+      .bind(userId, nowIso(), articleId)
+      .run();
   }
 
   /** 直近の記事を一覧する（LINE で連番指定して呼び出すため）。 */

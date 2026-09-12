@@ -54,3 +54,89 @@ describe('拡張機能の配布物', () => {
     expect(packager).toContain("--url は使わなくなりました");
   });
 });
+
+// ── 投稿する場所の表示 ────────────────────────────────
+/**
+ * ★2026-09-12 に見つかった不具合:
+ *   拡張は「連携済みかどうか」だけを見て、
+ *   **いつでも「このパソコンから投稿します」「ログイン情報はサーバーに保存されません」**
+ *   と表示していた。既定がサーバー投稿に変わった（2026-08-29）あとも直していなかった。
+ *
+ *   ★とくに後者は**事実と逆**だった。サーバー投稿ではログイン情報を
+ *   （暗号化して）保存している。顧客に嘘の説明を見せていたことになる。
+ *
+ *   投稿する場所は LINE の「投稿設定」でいつでも変わるので、
+ *   **覚えている値ではなくサーバーに聞く**。聞けなければ、どちらとも書かない。
+ */
+describe('投稿する場所の表示', () => {
+  /** popup.js を隔離して動かし、画面に出た文字を読む */
+  async function render({ mode, linked = true, offline = false }:
+    { mode?: string; linked?: boolean; offline?: boolean }) {
+    const vm = await import('node:vm');
+    const els: Record<string, any> = {};
+    const mk = () => ({
+      textContent: '', className: '', value: '', hidden: true,
+      addEventListener() {}, focus() {},
+    });
+
+    const ctx: any = {
+      document: { getElementById: (id: string) => (els[id] ??= mk()) },
+      chrome: {
+        storage: { local: {
+          get: async () => linked
+            ? { deviceToken: 't', urlname: 'someone', endpoint: 'https://w.example.workers.dev' }
+            : { endpoint: 'https://w.example.workers.dev' },
+          set: async () => {},
+        } },
+        runtime: { sendMessage: async () => {} },
+        cookies: { getAll: async () => [] },
+        permissions: { request: async () => true },
+        tabs: { create() {} },
+      },
+      fetch: async () => {
+        if (offline) throw new Error('つながらない');
+        return { ok: true, json: async () => ({ ok: true, checks: { execution_mode: mode } }) };
+      },
+      navigator: { userAgent: 'test' },
+      console: { error() {}, warn() {}, log() {} },
+      setTimeout, URL,
+    };
+    ctx.globalThis = ctx;
+    vm.createContext(ctx);
+    vm.runInContext(popup, ctx);
+
+    await ctx.showLinkState();
+    return { text: els['link-text'].textContent as string,
+             footer: els['footer-note'].textContent as string };
+  }
+
+  it('★サーバー投稿のときは、パソコン依存だと書かない', async () => {
+    const { text, footer } = await render({ mode: 'server' });
+    expect(text).toContain('サーバーから投稿します');
+    expect(text).not.toContain('このパソコンから投稿します');
+    expect(footer).toContain('閉じていても投稿されます');
+    // ★ここがいちばん大事。保存しているのに「保存されません」と書かないこと
+    expect(footer).not.toContain('保存されません');
+  });
+
+  it('パソコン投稿のときだけ、そう書く', async () => {
+    const { text, footer } = await render({ mode: 'agent' });
+    expect(text).toContain('このパソコンから投稿します');
+    expect(footer).toContain('保存されません');
+  });
+
+  it('★サーバーに聞けないときは、どちらとも書かない', async () => {
+    const { text, footer } = await render({ offline: true });
+    expect(text).toContain('連携済み');
+    expect(text).not.toContain('このパソコンから投稿します');
+    expect(text).not.toContain('サーバーから投稿します');
+    expect(footer).not.toContain('保存されません');
+    expect(footer).toContain('投稿設定');
+  });
+
+  it('未連携のときの案内は変えていない', async () => {
+    const { text, footer } = await render({ linked: false });
+    expect(text).toContain('未連携');
+    expect(footer).toContain('パスワードは読み取りません');
+  });
+});

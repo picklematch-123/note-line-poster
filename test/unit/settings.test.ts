@@ -184,6 +184,27 @@ describe('/setup の投稿設定', () => {
     expect(html).toContain('公開していません');
   });
 
+  it('★コード欄を出すなら、必ず「どう受け取るか」も書く', async () => {
+    // 2026-09-12: 欄だけあって入手方法が無く、設定できないという詰まり方をした
+    const { kv, env } = running();
+    await markSetupCompleted(kv);
+    const html = await (await setupRouter.request('/setup', {}, env)).text();
+
+    const fields = html.split('name="code"').length - 1;
+    expect(fields).toBeGreaterThan(0);
+    // 欄の数だけ、入手方法の案内も出ていること
+    expect(html.split('と送ると届きます').length - 1).toBe(fields);
+    expect(html).toContain('10分間・1回かぎり');
+  });
+
+  it('★コードが要るときは、LINE ならコード不要だと案内する', async () => {
+    const { kv, env } = running();
+    await markSetupCompleted(kv);
+    const html = await (await setupRouter.request('/setup', {}, env)).text();
+    expect(html).toContain('コードは要りません');
+    expect(html).toContain('投稿設定');
+  });
+
   it('★セットアップ済みの環境では、コード無しの保存を断る（設定は変わらない）', async () => {
     const { db, kv, env } = running();
     await markSetupCompleted(kv);
