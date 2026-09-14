@@ -18,15 +18,42 @@ import { KvImageStore } from '../ports/storage/images';
 import { resolveNoteSession } from '../core/session/resolve';
 import { log } from '../lib/mask';
 
-export interface GenerateParams {
+import { DEFAULT_TENANT_ID } from '../ports/storage/db';
+import { AnthropicLlm } from '../ports/llm/anthropic';
+import { analyzeContext } from '../core/generation/pipeline';
+import { listEntries } from '../core/generation/context';
+import { applyKnowledgeDigest } from '../core/knowledge/apply';
+import { buildKnowledgeSaved, buildKnowledgeOrganizeFailed } from '../adapters/line/messages/knowledge';
+
+export interface ArticleParams {
+  kind?: 'article';
   articleId: string;
   lineUserId: string;
   /** 画像の到着を待つ秒数 */
   debounceSec: number;
 }
 
+/**
+ * ナレッジの整理（2026-09-14）。
+ *
+ * ★記事生成と同じ Workflow に載せた理由:
+ *   長文の整理は LINE の裏処理（約30秒で打ち切り）に収まらない。Workflow なら時間制限が無い。
+ *   新しい Workflow を足すと、配布済みの環境ごとに設定ファイルの書き換えが要るため、既存のものを使う。
+ */
+export interface KnowledgeParams {
+  kind: 'knowledge';
+  /** 整理の対象として保存した行。整理が終わる前に新しい内容が保存されたら、この結果は使わない */
+  contextId: string;
+  lineUserId: string;
+  /** 終わったことを知らせるか（書き足し・入れ替え＝知らせる／1件消す＝知らせない） */
+  announce: boolean;
+}
+
+export type GenerateParams = ArticleParams | KnowledgeParams;
+
 export class GenerateArticleWorkflow extends WorkflowEntrypoint<Env, GenerateParams> {
   async run(event: WorkflowEvent<GenerateParams>, step: WorkflowStep) {
+    if (event.payload.kind === 'knowledge') return this.organizeKnowledge(event.payload, step);
     const { articleId, lineUserId, debounceSec } = event.payload;
     const db = new Db(this.env.DB);
     const line = new LineClient(this.env.LINE_CHANNEL_ACCESS_TOKEN, this.env.KV);
@@ -101,6 +128,42 @@ export class GenerateArticleWorkflow extends WorkflowEntrypoint<Env, GeneratePar
         ownerLineUserId: this.env.LINE_OWNER_USER_ID,
         images: new KvImageStore(this.env.KV),
       }, articleId);
+    });
+  }
+
+  /** ナレッジを整理して、記事に使う前提を作り直す（時間がかかっても打ち切られない） */
+  private async organizeKnowledge(p: KnowledgeParams, step: WorkflowStep) {
+    const db = new Db(this.env.DB);
+    const line = new LineClient(this.env.LINE_CHANNEL_ACCESS_TOKEN, this.env.KV);
+
+    const result = await step.do('ナレッジを整理する', {
+      retries: { limit: 1, delay: '10 seconds' },
+      timeout: '10 minutes',
+    }, async () => {
+      const current = await db.getActiveContext(DEFAULT_TENANT_ID);
+      if (!current || current.id !== p.contextId) return { status: 'stale' as const };
+      try {
+        const llm = new AnthropicLlm(this.env.ANTHROPIC_API_KEY, this.env.ANTHROPIC_WORKSPACE_ID ?? null);
+        const { data } = await analyzeContext(llm, current.raw_text);
+        const applied = await applyKnowledgeDigest(db, DEFAULT_TENANT_ID, p.contextId, data);
+        if (applied === 'stale') return { status: 'stale' as const };
+        return { status: 'ok' as const, data, count: listEntries(current.raw_text).length };
+      } catch (e) {
+        log.error('ナレッジの整理に失敗', String(e));
+        return { status: 'failed' as const, reason: e instanceof LlmError ? e.userMessage : null };
+      }
+    });
+
+    if (result.status === 'stale') {
+      log.info('新しい内容が保存されたため、前の整理結果は使いません');
+      return;
+    }
+    if (!p.announce) return;
+
+    await step.do('整理の結果を知らせる', async () => {
+      await line.push(p.lineUserId, [result.status === 'ok'
+        ? buildKnowledgeSaved(result.data, result.count)
+        : { type: 'text', text: buildKnowledgeOrganizeFailed(result.reason) }]);
     });
   }
 }

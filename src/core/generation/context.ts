@@ -128,6 +128,31 @@ export function buildContextSnippet(rawText: string, analyzed: AnalyzedContext):
  *   登録し直してもらわなくても効くように、読み出すたびに補う。
  *   すでに入っていれば何もしない（何度通しても結果は同じ）。
  */
+/**
+ * 整理（Claude）が終わるまでの間に、記事の前提として使うもの。
+ *
+ * ★なぜ要るか（2026-09-14）:
+ *   ナレッジは「Claude で整理 → 保存」の順だったため、長文だと整理が LINE の裏処理の
+ *   制限時間（約30秒）に間に合わず打ち切られ、**何も保存されず、返事も届かなかった**。
+ *   先に原文を保存し、整理は時間制限の無い Workflow に回す。その間はこれを使う。
+ *
+ * ★必ず空でない文字列を返す（空だと記事生成がナレッジを読まない）。
+ * ★長すぎるときは**末尾（＝新しく書き足した分）を残す**。書き足しは末尾に付くため。
+ *   URL は切った部分からも拾う（リンクの指示を落とさない）。
+ */
+export const PROVISIONAL_LIMIT = 12000;
+
+export function buildProvisionalSnippet(rawText: string): string {
+  const raw = rawText.trim();
+  const body = raw.length > PROVISIONAL_LIMIT
+    ? `（前半は省略。整理が終わると全体が反映されます）\n${raw.slice(-PROVISIONAL_LIMIT)}`
+    : raw;
+  const parts = [`【本人のメモ（原文・整理前）】\n${body || '（内容なし）'}`];
+  const urls = extractUrls(rawText);
+  if (urls.length > 0) parts.push(urlBlock(urls));
+  return parts.join('\n\n');
+}
+
 export function ensureContextUrls(rawText: string | null, snippet: string | null): string | null {
   if (!snippet) return snippet;
   const urls = extractUrls(rawText ?? '');

@@ -50,6 +50,8 @@ import {
   buildApprovalRequest, buildWaitingForApproval,
 } from '../../core/line/members';
 import { otherWorkInProgress } from '../../core/article/ownership';
+import { buildProvisionalSnippet } from '../../core/generation/context';
+import { buildKnowledgeReceived } from './messages/knowledge';
 import { issueSetupCode } from '../../core/setup/state';
 import { resolveMasterKey } from '../../core/setup/masterkey';
 
@@ -1123,19 +1125,17 @@ async function deleteContextEntry(
     return;
   }
 
-  await line.reply(replyToken, [text('消しています。少しお待ちください。')]);
+  // ★先に保存してすぐ返事をする（書き足しと同じ理由。整理は Workflow で後から）
+  const contextId = await d.db.saveContext(DEFAULT_TENANT_ID, rest, null, buildProvisionalSnippet(rest));
+  await line.reply(replyToken, [textWithActions(
+    `消しました。（残り${listEntries(rest).length}件）\n\n` +
+    `消したもの: ${removed.length > 40 ? `${removed.slice(0, 40)}…` : removed}`,
+    [{ label: '一覧を見る', data: 'action=ctx_edit' }],
+  )]);
   try {
-    const llm = new AnthropicLlm(d.llmApiKey, d.llmWorkspaceId);
-    const { data } = await analyzeContext(llm, rest);
-    await d.db.saveContext(DEFAULT_TENANT_ID, rest, data, buildContextSnippet(rest, data));
-    await line.push(userId, [textWithActions(
-      `消しました。（残り${listEntries(rest).length}件）\n\n` +
-      `消したもの: ${removed.length > 40 ? `${removed.slice(0, 40)}…` : removed}`,
-      [{ label: '一覧を見る', data: 'action=ctx_edit' }],
-    )]);
+    await env.GENERATE.create({ params: { kind: 'knowledge', contextId, lineUserId: userId, announce: false } });
   } catch (e) {
-    const message = e instanceof LlmError ? e.userMessage : '消せませんでした。もう一度お試しください。';
-    await line.push(userId, [text(message)]);
+    log.warn('ナレッジの整理を始められませんでした', String(e));
   }
 }
 
@@ -1188,36 +1188,19 @@ async function saveContext(
     return;
   }
 
-  await line.reply(replyToken, [text('覚えています。少しお待ちください。')]);
+  // ★先に原文を保存し、すぐ返事をする（2026-09-14）。
+  //   以前は「Claude で整理 → 保存 → 返事」の順で、長文だと整理が裏処理の制限時間（約30秒）に
+  //   間に合わずに打ち切られ、**保存もされず返事も届かなかった**（お客さまの環境で2回発生）。
+  //   整理は時間制限の無い Workflow に回し、終わったら知らせる。
+  const merged = append ? await d.db.appendContextText(DEFAULT_TENANT_ID, rawText) : rawText;
+  const contextId = await d.db.saveContext(DEFAULT_TENANT_ID, merged, null, buildProvisionalSnippet(merged));
+  await line.reply(replyToken, [buildKnowledgeReceived(listEntries(merged).length, append ? 'append' : 'replace')]);
 
   try {
-    // 書き足しの場合は、これまでの内容と合わせて分析し直す
-    const merged = append
-      ? await d.db.appendContextText(DEFAULT_TENANT_ID, rawText)
-      : rawText;
-
-    const llm = new AnthropicLlm(d.llmApiKey, d.llmWorkspaceId);
-    const { data } = await analyzeContext(llm, merged);
-    // ★要約（LLM）だけに頼らない。原文の指示とURLを機械的に付け直す
-    await d.db.saveContext(DEFAULT_TENANT_ID, merged, data, buildContextSnippet(merged, data));
-
-    const count = listEntries(merged).length;
-    await line.push(userId, [textWithActions(
-      (append ? `覚えました。（全${count}件）` : `入れ替えました。（全${count}件）`) + '\n\n' +
-      `【立場】${data.standpoint}\n` +
-      (data.facts.length ? `【記事に使えること】${data.facts.length}件\n` : '') +
-      (data.rules.length ? `【毎回のルール】\n${data.rules.map((r) => `・${r}`).join('\n')}\n` : '') +
-      (data.wording.length ? `【言い方の指定】${data.wording.join('、')}\n` : '') +
-      (data.avoid.length ? `【書かないこと】${data.avoid.join('、')}\n` : '') +
-      '\nこの前提で記事を書きます。',
-      [
-        { label: 'さらに書き足す', data: 'action=ctx_append' },
-        { label: '記事を作る', data: 'action=menu_new' },
-      ],
-    )]);
+    await env.GENERATE.create({ params: { kind: 'knowledge', contextId, lineUserId: userId, announce: true } });
   } catch (e) {
-    const message = e instanceof LlmError ? e.userMessage : '登録に失敗しました。もう一度お試しください。';
-    await line.push(userId, [text(message)]);
+    // 整理を始められなくても、原文はもう記事に使われている
+    log.warn('ナレッジの整理を始められませんでした', String(e));
   }
 }
 
