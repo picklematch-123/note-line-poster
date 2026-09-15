@@ -70,6 +70,24 @@ export const PENDING_TTL_SEC = 24 * 60 * 60;
 
 const pendingKey = (tenantId: string, userId: string) => `member:pending:${tenantId}:${userId}`;
 
+/**
+ * 確認待ちの人の userId 一覧。
+ * ★持ち主が「投稿者にする」を**文字で**送ったとき、誰のことかを探すために持つ（2026-09-15）。
+ *   KV の list() は書き込みの反映が遅く、申請の直後に打つと「誰もいない」と答えてしまうため使わない。
+ */
+const pendingIndexKey = (tenantId: string) => `member:pendings:${tenantId}`;
+
+async function readPendingIndex(kv: KVNamespace, tenantId: string): Promise<string[]> {
+  try {
+    const raw = await kv.get(pendingIndexKey(tenantId));
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string' && x !== '') : [];
+  } catch (e) {
+    log.warn('投稿者の確認待ち一覧を読めませんでした', String(e));
+    return [];
+  }
+}
+
 export interface PendingMember {
   userId: string;
   displayName: string | null;
@@ -80,6 +98,20 @@ export interface PendingMember {
 
 export async function savePending(kv: KVNamespace, tenantId: string, pending: PendingMember): Promise<void> {
   await kv.put(pendingKey(tenantId, pending.userId), JSON.stringify(pending), { expirationTtl: PENDING_TTL_SEC });
+  const ids = await readPendingIndex(kv, tenantId);
+  if (!ids.includes(pending.userId)) {
+    await kv.put(pendingIndexKey(tenantId), JSON.stringify([...ids, pending.userId]), { expirationTtl: PENDING_TTL_SEC });
+  }
+}
+
+/**
+ * いま確認待ちの人を、申請の古い順に返す。
+ * ★期限切れで本体が消えた人は含めない（一覧に名前だけ残っていても対象にしない）。
+ */
+export async function listPending(kv: KVNamespace, tenantId: string): Promise<PendingMember[]> {
+  const ids = await readPendingIndex(kv, tenantId);
+  const found = await Promise.all(ids.map((id) => getPending(kv, tenantId, id)));
+  return found.filter((p): p is PendingMember => p !== null);
 }
 
 /**
@@ -101,9 +133,47 @@ export async function getPending(kv: KVNamespace, tenantId: string, userId: stri
   }
 }
 
+export type TypedMemberDecision =
+  | { kind: 'ignore' }
+  | { kind: 'approve'; userId: string }
+  | { kind: 'reject'; userId: string }
+  /** 2人以上。★推測で決めず、いちばん古い1人のお知らせだけを出し直す（ボタンは最後の1通にしか出ないため） */
+  | { kind: 'ask'; pending: PendingMember; total: number }
+  /** 窓口は開いているが、まだ誰からも届いていない */
+  | { kind: 'not_yet' }
+  | { kind: 'gone' };
+
+/**
+ * 持ち主が文字で「投稿者にする」「断る」と送ったときに、どうするかを決める。
+ * ★持ち主以外・確認待ちが無いときの「断る」は `ignore`（ふつうのメッセージとして扱う）。
+ */
+export function decideTypedMemberCommand(input: {
+  isOwner: boolean;
+  approving: boolean;
+  pendings: readonly PendingMember[];
+  inviteOpen: boolean;
+}): TypedMemberDecision {
+  const { isOwner, approving, pendings, inviteOpen } = input;
+  if (!isOwner) return { kind: 'ignore' };
+  if (pendings.length === 1) {
+    const userId = pendings[0].userId;
+    return approving ? { kind: 'approve', userId } : { kind: 'reject', userId };
+  }
+  if (pendings.length > 1) return { kind: 'ask', pending: pendings[0], total: pendings.length };
+  if (!approving) return { kind: 'ignore' };
+  return inviteOpen ? { kind: 'not_yet' } : { kind: 'gone' };
+}
+
 export async function deletePending(kv: KVNamespace, tenantId: string, userId: string): Promise<void> {
   if (!userId) return;
   await kv.delete(pendingKey(tenantId, userId)).catch(() => {});
+  const ids = await readPendingIndex(kv, tenantId);
+  if (!ids.includes(userId)) return;
+  const rest = ids.filter((id) => id !== userId);
+  await (rest.length > 0
+    ? kv.put(pendingIndexKey(tenantId), JSON.stringify(rest), { expirationTtl: PENDING_TTL_SEC })
+    : kv.delete(pendingIndexKey(tenantId))
+  ).catch(() => {});
 }
 
 // ── 文面 ───────────────────────────────────────────────
@@ -136,7 +206,8 @@ export function buildApprovalRequest(displayName: string | null): string {
     '★その人の LINE の名前が、追加したい方の名前と同じか確かめてから押してください。\n' +
     '　（名前は誰でも変えられます。心配なら本人に、いま送ったか聞いてください）\n\n' +
     '追加したかった人なら「投稿者にする」を押してください。\n' +
-    '★心当たりが無ければ「断る」を押してください。押すまで、この人は何もできません。';
+    '★心当たりが無ければ「断る」を押してください。押すまで、この人は何もできません。\n\n' +
+    '※ ボタンが見当たらないときは、「投稿者にする」「断る」と文字で送っても大丈夫です。';
 }
 
 /** 確認を待っている本人へ。★システムの中身は書かない */

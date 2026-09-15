@@ -15,12 +15,13 @@ import { join } from 'node:path';
 import { roleOf, canUse, isOwner, OWNER_ONLY_MESSAGE } from '../../src/core/line/access';
 import {
   openInvite, peekInvite, closeInvite, INVITE_TTL_SEC, MAX_STAFF,
-  savePending, getPending, deletePending, PENDING_TTL_SEC,
+  savePending, getPending, deletePending, listPending, decideTypedMemberCommand, PENDING_TTL_SEC,
   buildInviteOpened, buildWelcomeStaff, buildStaffAddedNotice,
   buildApprovalRequest, buildWaitingForApproval,
 } from '../../src/core/line/members';
 import { otherWorkInProgress } from '../../src/core/article/ownership';
-import { setMode, getMode, clearMode } from '../../src/adapters/line/mode';
+import { setMode, getMode, clearMode, normalizeCommand } from '../../src/adapters/line/mode';
+import { COMMANDS } from '../../src/adapters/line/commands';
 import { Db, DEFAULT_TENANT_ID } from '../../src/ports/storage/db';
 import { canPublish, type PolicyContext } from '../../src/core/policy';
 import { approve, type ServiceDeps } from '../../src/core/article/service';
@@ -342,6 +343,70 @@ describe('話しかけただけでは投稿者にしない', () => {
     expect(await getPending(fakeKv({ 'member:pending:t1:U_new': '{壊れ' }), 't1', 'U_new')).toBeNull();
     const swapped = JSON.stringify({ ...P, userId: 'U_other' });
     expect(await getPending(fakeKv({ 'member:pending:t1:U_new': swapped }), 't1', 'U_new')).toBeNull();
+  });
+
+  it('★確認待ちの一覧: 保存した人が出て、承認・却下したら消える（文字での承認に使う）', async () => {
+    const kv = fakeKv();
+    await savePending(kv, 't1', P);
+    await savePending(kv, 't1', { ...P, userId: 'U_2', displayName: '鈴木' });
+    await savePending(kv, 't1', P); // 同じ人が二重に並ばない
+    expect((await listPending(kv, 't1')).map((p) => p.userId)).toEqual(['U_new', 'U_2']);
+    await deletePending(kv, 't1', 'U_new');
+    expect((await listPending(kv, 't1')).map((p) => p.userId)).toEqual(['U_2']);
+    await deletePending(kv, 't1', 'U_2');
+    expect(await listPending(kv, 't1')).toEqual([]);
+    expect(kv.store['member:pendings:t1']).toBeUndefined();
+    expect(await listPending(kv, 't2')).toEqual([]);
+  });
+
+  it('★期限切れで本体が消えた人は、一覧に名前が残っていても対象にしない', async () => {
+    const kv = fakeKv();
+    await savePending(kv, 't1', P);
+    delete kv.store['member:pending:t1:U_new'];
+    expect(await listPending(kv, 't1')).toEqual([]);
+  });
+
+  it('★一覧が壊れている・読めないときは「確認待ちなし」（誰かを勝手に承認しない）', async () => {
+    expect(await listPending(fakeKv({ 'member:pendings:t1': '{壊れ' }), 't1')).toEqual([]);
+    expect(await listPending(fakeKv({ 'member:pendings:t1': '"U_new"' }), 't1')).toEqual([]);
+    const broken = { get: async () => { throw new Error('down'); } } as unknown as KVNamespace;
+    expect(await listPending(broken, 't1')).toEqual([]);
+  });
+
+  it('「投稿者にする」「断る」は文字でも承認・却下のコマンドになり、ほかの機能と重ならない', () => {
+    for (const [sent, name] of [['投稿者にする', 'memberApprove'], ['断る', 'memberReject']] as const) {
+      const hit = Object.entries(COMMANDS).filter(([, re]) => re.test(normalizeCommand(sent))).map(([n]) => n);
+      expect(hit).toEqual([name]);
+    }
+    expect(buildApprovalRequest('佐藤')).toContain('文字で送っても');
+  });
+
+  describe('★文字で「投稿者にする」「断る」と送られたときの判断', () => {
+    const P2 = { ...P, userId: 'U_2', displayName: '鈴木' };
+    const base = { isOwner: true, approving: true, pendings: [P], inviteOpen: false };
+
+    it('持ち主以外は、確認待ちがいても何もしない', () => {
+      expect(decideTypedMemberCommand({ ...base, isOwner: false })).toEqual({ kind: 'ignore' });
+      expect(decideTypedMemberCommand({ ...base, isOwner: false, approving: false })).toEqual({ kind: 'ignore' });
+    });
+
+    it('確認待ちが1人なら、その人を承認／却下する', () => {
+      expect(decideTypedMemberCommand(base)).toEqual({ kind: 'approve', userId: 'U_new' });
+      expect(decideTypedMemberCommand({ ...base, approving: false })).toEqual({ kind: 'reject', userId: 'U_new' });
+    });
+
+    it('★2人以上なら推測で決めず、いちばん古い1人だけを確認に出す（承認も却下もしない）', () => {
+      for (const approving of [true, false]) {
+        expect(decideTypedMemberCommand({ ...base, approving, pendings: [P, P2] }))
+          .toEqual({ kind: 'ask', pending: P, total: 2 });
+      }
+    });
+
+    it('0人: 「投稿者にする」は案内、「断る」はふつうのメッセージに流す', () => {
+      expect(decideTypedMemberCommand({ ...base, pendings: [] })).toEqual({ kind: 'gone' });
+      expect(decideTypedMemberCommand({ ...base, pendings: [], inviteOpen: true })).toEqual({ kind: 'not_yet' });
+      expect(decideTypedMemberCommand({ ...base, pendings: [], approving: false })).toEqual({ kind: 'ignore' });
+    });
   });
 
   it('持ち主への確認文: 名前と「押すまで何もできない」「断る」を書く', () => {

@@ -45,7 +45,7 @@ import { log } from '../../lib/mask';
 import { canUse, isOwner, roleOf, NOT_OWNER_MESSAGE, OWNER_ONLY_MESSAGE } from '../../core/line/access';
 import {
   openInvite, peekInvite, closeInvite, MAX_STAFF,
-  savePending, getPending, deletePending,
+  savePending, getPending, deletePending, listPending, decideTypedMemberCommand,
   buildInviteOpened, buildWelcomeStaff, buildStaffAddedNotice,
   buildApprovalRequest, buildWaitingForApproval,
 } from '../../core/line/members';
@@ -171,10 +171,7 @@ async function handleEvent(event: LineEvent, env: Env): Promise<void> {
         });
         await d.db.audit(DEFAULT_TENANT_ID, 'member.requested', `line:${userId}`, null, 'ok', { displayName: name });
         if (event.replyToken) await line.reply(event.replyToken, [text(buildWaitingForApproval())]);
-        await line.push(invite.by, [textWithActions(buildApprovalRequest(name), [
-          { label: '投稿者にする', data: `action=member_approve&uid=${userId}` },
-          { label: '断る', data: `action=member_reject&uid=${userId}` },
-        ])]);
+        await line.push(invite.by, [approvalMessage(name, userId)]);
         return;
       }
     }
@@ -284,6 +281,57 @@ async function showMembers(line: LineClient, d: ServiceDeps, replyToken: string)
   )]);
 }
 
+// ── 投稿者の承認（ボタンと文字の両方から呼ぶ）──────────────
+const PENDING_GONE_MESSAGE =
+  'この確認は、期限が切れたか、すでに済んでいます。\n' +
+  '追加する場合は、もう一度「投稿者を追加」と送ってください。';
+
+/** 持ち主への確認のお知らせ（ボタンつき） */
+function approvalMessage(displayName: string | null, uid: string): LineMessage {
+  return textWithActions(buildApprovalRequest(displayName), [
+    { label: '投稿者にする', data: `action=member_approve&uid=${uid}` },
+    { label: '断る', data: `action=member_reject&uid=${uid}` },
+  ]);
+}
+
+async function approveMember(
+  env: Env, line: LineClient, d: ServiceDeps, replyToken: string, ownerId: string, uid: string,
+): Promise<void> {
+  // ★確認待ちの記録がある人にしか効かない（ボタンの中身を書き換えて別人を登録させない）
+  const pending = await getPending(env.KV, DEFAULT_TENANT_ID, uid);
+  if (!pending) {
+    await line.reply(replyToken, [text(PENDING_GONE_MESSAGE)]);
+    return;
+  }
+  const result = await d.db.addStaff(DEFAULT_TENANT_ID, uid, pending.displayName, ownerId, MAX_STAFF);
+  if (result === 'full') {
+    await line.reply(replyToken, [text(
+      `投稿者は${MAX_STAFF}人までです。\n「投稿者一覧」から誰かを外してから、もう一度「投稿者にする」を押してください。`,
+    )]);
+    return;
+  }
+  await deletePending(env.KV, DEFAULT_TENANT_ID, uid);
+  if (result === 'exists') {
+    // ★すでに投稿者。案内は送らないので「送りました」と言わない
+    await line.reply(replyToken, [text('この方は、すでに投稿者です。')]);
+    return;
+  }
+  await line.reply(replyToken, [text(buildStaffAddedNotice(pending.displayName))]);
+  await line.push(uid, [text(buildWelcomeStaff())]);
+}
+
+async function rejectMember(
+  env: Env, line: LineClient, d: ServiceDeps, replyToken: string, ownerId: string, uid: string,
+): Promise<void> {
+  const pending = await getPending(env.KV, DEFAULT_TENANT_ID, uid);
+  await deletePending(env.KV, DEFAULT_TENANT_ID, uid);
+  if (pending) {
+    await d.db.audit(DEFAULT_TENANT_ID, 'member.rejected', `line:${ownerId}`, null, 'ok', { userId: uid });
+  }
+  // ★断られた本人には知らせない（何が動いているかを教えない）
+  await line.reply(replyToken, [text(pending ? '登録しませんでした。' : 'この確認は、すでに済んでいます。')]);
+}
+
 // ── テキスト ────────────────────────────────────────────
 async function handleText(
   event: LineEvent, env: Env, line: LineClient, d: ServiceDeps, userId: string,
@@ -340,6 +388,40 @@ async function handleText(
   if (COMMANDS.memberList.test(cmd)) {
     if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
     return showMembers(line, d, replyToken);
+  }
+  // ★「投稿者にする」「断る」が、ボタンの合図ではなく文字で届くことがある（2026-09-15 実際に発生）。
+  //   確認待ちが1人だけなら、その人のこととして扱う。2人以上なら取り違えないようボタンを出し直す。
+  if (isOwner(d.ownerLineUserId, userId)
+      && (COMMANDS.memberApprove.test(cmd) || COMMANDS.memberReject.test(cmd))) {
+    const decision = decideTypedMemberCommand({
+      isOwner: true,
+      approving: COMMANDS.memberApprove.test(cmd),
+      pendings: await listPending(env.KV, DEFAULT_TENANT_ID),
+      inviteOpen: (await peekInvite(env.KV, DEFAULT_TENANT_ID)) !== null,
+    });
+    switch (decision.kind) {
+      case 'approve':
+        return approveMember(env, line, d, replyToken, userId, decision.userId);
+      case 'reject':
+        return rejectMember(env, line, d, replyToken, userId, decision.userId);
+      case 'ask':
+        // ★ボタンは最後の1通にしか出ないので、1人ずつ出す。片付けたら、もう一度送ると次の人が出る
+        await line.reply(replyToken, [
+          text(`確認待ちの方が${decision.total}人います。人違いを防ぐため、1人ずつ確認します。`),
+          approvalMessage(decision.pending.displayName, decision.pending.userId),
+        ]);
+        return;
+      case 'not_yet':
+        await line.reply(replyToken, [text(
+          'まだ誰からも届いていません。\n追加したい人がこのアカウントへ1通送ると、確認のお知らせが届きます。',
+        )]);
+        return;
+      case 'gone':
+        await line.reply(replyToken, [text(PENDING_GONE_MESSAGE)]);
+        return;
+      case 'ignore':
+        break; // 確認待ちが無いときの「断る」は、ふつうのメッセージとして下へ流す
+    }
   }
   if (COMMANDS.settings.test(cmd)) {
     return showSettings(env, line, d, replyToken);
@@ -624,48 +706,13 @@ async function handlePostback(
     case 'menu_profile':
       return showContext(env, line, d, replyToken, userId);
 
-    case 'member_approve': {
+    case 'member_approve':
       if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
-      const uid = params.get('uid') ?? '';
-      // ★確認待ちの記録がある人にしか効かない（ボタンの中身を書き換えて別人を登録させない）
-      const pending = await getPending(env.KV, DEFAULT_TENANT_ID, uid);
-      if (!pending) {
-        await line.reply(replyToken, [text(
-          'この確認は、期限が切れたか、すでに済んでいます。\n' +
-          '追加する場合は、もう一度「投稿者を追加」と送ってください。',
-        )]);
-        return;
-      }
-      const result = await d.db.addStaff(DEFAULT_TENANT_ID, uid, pending.displayName, userId, MAX_STAFF);
-      if (result === 'full') {
-        await line.reply(replyToken, [text(
-          `投稿者は${MAX_STAFF}人までです。\n「投稿者一覧」から誰かを外してから、もう一度「投稿者にする」を押してください。`,
-        )]);
-        return;
-      }
-      await deletePending(env.KV, DEFAULT_TENANT_ID, uid);
-      if (result === 'exists') {
-        // ★すでに投稿者。案内は送らないので「送りました」と言わない
-        await line.reply(replyToken, [text('この方は、すでに投稿者です。')]);
-        return;
-      }
-      await line.reply(replyToken, [text(buildStaffAddedNotice(pending.displayName))]);
-      await line.push(uid, [text(buildWelcomeStaff())]);
-      return;
-    }
+      return approveMember(env, line, d, replyToken, userId, params.get('uid') ?? '');
 
-    case 'member_reject': {
+    case 'member_reject':
       if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
-      const uid = params.get('uid') ?? '';
-      const pending = await getPending(env.KV, DEFAULT_TENANT_ID, uid);
-      await deletePending(env.KV, DEFAULT_TENANT_ID, uid);
-      if (pending) {
-        await d.db.audit(DEFAULT_TENANT_ID, 'member.rejected', `line:${userId}`, null, 'ok', { userId: uid });
-      }
-      // ★断られた本人には知らせない（何が動いているかを教えない）
-      await line.reply(replyToken, [text(pending ? '登録しませんでした。' : 'この確認は、すでに済んでいます。')]);
-      return;
-    }
+      return rejectMember(env, line, d, replyToken, userId, params.get('uid') ?? '');
 
     case 'member_remove': {
       if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
