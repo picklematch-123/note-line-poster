@@ -10,7 +10,7 @@
  *   3. 緊急停止スイッチ（全テナント一括）
  *   4. 利用規約への同意
  */
-import { jstDate, secondsBetween, nowIso } from '../../lib/time';
+import { jstDate, secondsBetween, nowIso, formatJst } from '../../lib/time';
 import type { ArticleState } from '../article/state';
 
 export type BlockReason =
@@ -75,6 +75,8 @@ export interface PolicyContext {
    *   ただし承認ゲートと緊急停止は更新でも必ず通す。
    */
   isUpdate?: boolean;
+  /** 保存済みの投稿予定。日次カウントが0時に戻っても、この時刻までは待つ。 */
+  publishWait?: { reason: 'daily_limit' | 'too_soon'; retryAfter: string };
   now?: string;
 }
 
@@ -155,6 +157,14 @@ export function canPublish(ctx: PolicyContext): PolicyDecision {
   // 既存記事の上書き更新には課さない。
   if (ctx.isUpdate) return ALLOW;
 
+  if (ctx.publishWait && new Date(now).getTime() < new Date(ctx.publishWait.retryAfter).getTime()) {
+    return {
+      allowed: false, reason: ctx.publishWait.reason, retryable: true,
+      retryAfter: ctx.publishWait.retryAfter,
+      userMessage: `投稿待ちです。日本時間 ${formatJst(ctx.publishWait.retryAfter)}以降に自動で投稿します。`,
+    };
+  }
+
   // 5. 日次上限（0 以下で無制限）
   //
   // ★これは API 費用の制限ではなく、note アカウントを守るためのもの。
@@ -167,7 +177,7 @@ export function canPublish(ctx: PolicyContext): PolicyDecision {
     return {
       allowed: false, reason: 'daily_limit', retryable: true,
       retryAfter: nextJstMorning(now),
-      userMessage: `本日の投稿上限（${ctx.tenant.dailyPostLimit}本）に達しました。明朝9時に自動で投稿します。`,
+      userMessage: `本日の投稿上限（${ctx.tenant.dailyPostLimit}本）に達しました。明朝9時（日本時間）以降に自動で投稿します。`,
     };
   }
 

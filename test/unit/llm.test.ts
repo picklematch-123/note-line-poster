@@ -206,6 +206,20 @@ describe('AnthropicLlm — ★一時エラーの自動再試行', () => {
 });
 
 describe('AnthropicLlm — 出力の検証', () => {
+  it('既定では不正な出力を2回まで作り直し、3回目の成功を返す', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(okResponse({ wrong: 'shape' }))
+      .mockResolvedValueOnce(okResponse({ wrong: 'shape' }))
+      .mockResolvedValueOnce(okResponse({ ok: true }));
+
+    const result = await new AnthropicLlm(KEY).structured({
+      tier: 'light', system: 's', user: 'u', schema: Schema, label: 'テスト',
+    });
+
+    expect(result.data.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it('スキーマに合わない出力は作り直させる', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(okResponse({ wrong: 'shape' }))

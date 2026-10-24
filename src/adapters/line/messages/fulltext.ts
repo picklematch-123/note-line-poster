@@ -44,6 +44,9 @@ export function toLineText(markdown: string): string {
 
       if (/^\s*(-{3,}|\*{3,})\s*$/.test(line)) return '────────';
 
+      // AI が作った文中画像の目印は、写真の [画像N] と見分けられる形にする（プレビューの 🎨 と同じ）
+      if (/^\s*\[AI画像\d+\]\s*$/.test(line)) return line.trim().replace(/^\[AI画像(\d+)\]$/, '🎨 AI画像$1');
+
       return clean(line);
     })
     .join('\n')

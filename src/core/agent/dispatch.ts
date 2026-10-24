@@ -12,6 +12,7 @@
 import type { ServiceDeps } from '../article/service';
 import { NoteApiError } from '../../ports/publisher/note/client';
 import { buildPlan } from './plan';
+import { precheckArticleLinks } from '../article/links';
 import { enqueueJob, isAgentOnline, hasDevice, cancelJobsForArticle, type AgentJob, type JobKind } from './jobs';
 import { nowIso } from '../../lib/time';
 import { log } from '../../lib/mask';
@@ -31,6 +32,10 @@ export async function dispatchPublish(
 ): Promise<Dispatch> {
   const article = await deps.db.getArticle(articleId);
   if (!article) throw new Error('記事が見つかりません');
+
+  // ★最後の関所（★2026-10-24 源蔵 再レビューの条件）。実行先がどちらでも、note に何かを送る前に検査する。
+  //   許可外のリンク先があれば DisallowedLinksError（後始末済み）を投げる。呼び出し側が LINE で知らせる
+  await precheckArticleLinks(deps.db, article, kind);
 
   const tenant = await deps.db.getTenant(article.tenant_id);
   if (tenant.execution_mode !== 'agent') return { mode: 'server' };

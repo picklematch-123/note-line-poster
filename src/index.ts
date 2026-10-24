@@ -4,6 +4,7 @@
  * ★ここは薄く保つ。ルーティングと配線だけで、判断はしない。
  *   入口が増えても（REST は Phase 2、MCP は Phase 3）、ここに数行足すだけで済むようにする。
  */
+import { chooseProvider, describeMissingLlm, llmConfigFromEnv } from './ports/llm';
 import { Hono } from 'hono';
 import type { Env } from './env';
 import { handleLineWebhook } from './adapters/line/webhook';
@@ -45,8 +46,8 @@ app.get('/health', async (c) => {
 
   // コードが依存している列。増やしたらここにも足す
   const required: Record<string, string[]> = {
-    articles: ['revision_instruction', 'revision_count', 'image_alts_json', 'note_id', 'note_key', 'removed_at', 'requested_by'],
-    images: ['is_eyecatch', 'slot_index', 'note_image_url'],
+    articles: ['revision_instruction', 'revision_count', 'image_alts_json', 'note_id', 'note_key', 'removed_at', 'requested_by', 'research_json', 'ai_images_confirmed_at'],
+    images: ['is_eyecatch', 'slot_index', 'note_image_url', 'source', 'gen_prompt', 'gen_slot', 'gen_heading'],
     tenant_context: ['prompt_snippet'],
     style_profiles: ['prompt_snippet'],
     note_sessions: ['cookies_ref', 'user_agent', 'status'],
@@ -104,6 +105,13 @@ app.get('/health', async (c) => {
     checks.note_session = String(e).slice(0, 200);
     ok = false;
   }
+
+  // 文章生成に使う提供元（秘密は出さない）。使えなければ ok を落とす
+  const llmCfg = llmConfigFromEnv(c.env);
+  const provider = chooseProvider(llmCfg);
+  checks.llm = provider ?? describeMissingLlm(llmCfg);
+  if (!provider) ok = false;
+  checks.thumbnail = c.env.OPENAI_API_KEY ? 'enabled' : 'disabled（OPENAI_API_KEY 未登録）';
 
   return c.json({ ok, checks }, ok ? 200 : 500);
 });

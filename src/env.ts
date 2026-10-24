@@ -13,9 +13,22 @@ export interface Env {
   LINE_OWNER_USER_ID: string;
 
   // --- Claude（BYOK。Phase 2 ではテナントごとに D1 から復号して使う）---
-  ANTHROPIC_API_KEY: string;
+  // ★OpenAI 一本化の途中（2026-10）。Claude のキーがある環境は Claude のまま動く。
+  //   新しい環境は OPENAI_API_KEY だけで動く。LLM_PROVIDER で明示もできる（'openai' | 'anthropic'）
+  ANTHROPIC_API_KEY?: string;
   /** ワークスペース紐づけキーを使う場合のみ設定（wrkspc_ で始まるID） */
   ANTHROPIC_WORKSPACE_ID?: string;
+  LLM_PROVIDER?: string;
+  /** 文章モデルの候補（カンマ区切り・先頭ほど優先）。通常は設定しない */
+  OPENAI_MODEL_HEAVY?: string;
+  OPENAI_MODEL_LIGHT?: string;
+  /** Webリサーチ用の候補（カンマ区切り）。通常は設定しない */
+  OPENAI_MODEL_RESEARCH?: string;
+
+  // --- OpenAI（サムネイルの自動生成。BYOK・任意）---
+  // ★未設定でも今までどおり動く（サムネの自動生成だけが行われない）。
+  //   配備後に Cloudflare の画面で「OPENAI_API_KEY」を足せば有効になる。
+  OPENAI_API_KEY?: string;
 
   // --- note セッション ---
   // ★通常は Chrome 拡張で連携され、暗号化して D1 に入る（core/session/）。

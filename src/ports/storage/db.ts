@@ -69,6 +69,10 @@ export interface ArticleRow {
   published_at: string | null;
   /** note 上から消えたと分かった時刻。入っていれば一覧に出さない */
   removed_at: string | null;
+  /** Webリサーチの結果（core/research の ResearchRecord を JSON にしたもの）。無ければ NULL */
+  research_json?: string | null;
+  /** AI の文中画像を公開前に確かめた時刻（「このまま公開する」・0013）。NULL ＝ まだ */
+  ai_images_confirmed_at?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -84,6 +88,13 @@ export interface ImageRow {
   note_image_url: string | null;
   line_message_id: string | null;
   is_eyecatch: number;
+  /** 'user' = LINE で送られた写真 / 'generated' = AI が作った画像（0010） */
+  source?: string;
+  /** AI 文中画像の番号（`[AI画像N]` の N・0012）。写真・サムネは NULL */
+  gen_slot?: number | null;
+  /** AI 文中画像を作ったときの見出し（0012） */
+  gen_heading?: string | null;
+  gen_prompt?: string | null;
 }
 
 export class Db {
@@ -290,6 +301,15 @@ export class Db {
     return this.d1.prepare('SELECT * FROM articles WHERE id = ?').bind(id).first<ArticleRow>();
   }
 
+  /** 投稿の待機予定。別の停止理由で blocked になっても、先に約束した時刻を保つ。 */
+  async getPublishWait(id: string): Promise<{ detail_json: string; created_at: string } | null> {
+    return this.d1.prepare(`SELECT detail_json, created_at FROM article_events
+      WHERE article_id = ? AND to_state = 'blocked' AND json_valid(detail_json)
+        AND json_extract(detail_json, '$.reason') IN ('daily_limit', 'too_soon')
+      ORDER BY created_at DESC, rowid DESC LIMIT 1`)
+      .bind(id).first<{ detail_json: string; created_at: string }>();
+  }
+
   /**
    * 本人の判断を待っている記事を1件返す。
    * ★これがある間は新しい記事を作らせない（誤って別記事が生まれるのを防ぐ）。
@@ -430,10 +450,15 @@ export class Db {
       .run();
   }
 
-  /** 本文に差し込む画像（サムネは含まない）。 */
+  /**
+   * 本文に差し込む写真（サムネは含まない）。
+   * ★LINE で送られた写真（source='user'）だけ。AI が作った画像を混ぜると、写真の枚数に数えられて
+   *   normalize(md, images.length) が余計な `[画像N]` を末尾の見出しに足してしまう（設計書 18-2）。
+   *   AI の文中画像は listGeneratedImages で別に扱う。
+   */
   async listImages(articleId: string): Promise<ImageRow[]> {
     const r = await this.d1
-      .prepare('SELECT * FROM images WHERE article_id = ? AND is_eyecatch = 0 ORDER BY created_at ASC')
+      .prepare("SELECT * FROM images WHERE article_id = ? AND is_eyecatch = 0 AND source = 'user' ORDER BY created_at ASC")
       .bind(articleId)
       .all<ImageRow>();
     return r.results ?? [];
@@ -447,10 +472,26 @@ export class Db {
       .first<ImageRow>();
   }
 
-  /** すべての画像（サムネ含む）。受信順の通し番号を出すときに使う。 */
+  /**
+   * 送られた写真すべて（サムネに指定したものも含む）。受信順の通し番号を出すときに使う。
+   * ★AI が作った画像（サムネ・文中）は数えない。数えると「3枚目をサムネに」の番号が生成の成否でずれる（設計書 18-2）
+   */
   async listAllImages(articleId: string): Promise<ImageRow[]> {
     const r = await this.d1
-      .prepare('SELECT * FROM images WHERE article_id = ? ORDER BY created_at ASC')
+      .prepare("SELECT * FROM images WHERE article_id = ? AND source = 'user' ORDER BY created_at ASC")
+      .bind(articleId)
+      .all<ImageRow>();
+    return r.results ?? [];
+  }
+
+  /**
+   * AI が作った文中画像（`[AI画像N]` に入れるもの）。番号順。
+   * ★gen_slot が無い生成画像（サムネ。写真をサムネにしたとき is_eyecatch が 0 に戻る）は含めない
+   */
+  async listGeneratedImages(articleId: string): Promise<ImageRow[]> {
+    const r = await this.d1
+      .prepare(`SELECT * FROM images WHERE article_id = ? AND source = 'generated' AND is_eyecatch = 0
+                AND gen_slot IS NOT NULL ORDER BY gen_slot ASC, created_at ASC`)
       .bind(articleId)
       .all<ImageRow>();
     return r.results ?? [];
@@ -543,6 +584,29 @@ export class Db {
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, reason=excluded.reason,
                   updated_by=excluded.updated_by, updated_at=excluded.updated_at`)
       .bind(key, String(value), reason, by, nowIso())
+      .run();
+    await this.audit(null, 'flag.set', by, key, 'ok', { value, reason });
+  }
+
+  /**
+   * 文字列の設定値を読む（system_flags の value 列は文字列なので、そのまま使う）。
+   * ★値が正しいかの判定は呼び出し側（選択肢の一覧）で行う。ここは読むだけ。
+   */
+  async getTextFlag(key: string): Promise<string | null> {
+    const r = await this.d1
+      .prepare('SELECT value FROM system_flags WHERE key = ?')
+      .bind(key)
+      .first<{ value: string }>();
+    return r?.value ?? null;
+  }
+
+  async setTextFlag(key: string, value: string, reason: string, by: string): Promise<void> {
+    await this.d1
+      .prepare(`INSERT INTO system_flags (key, value, reason, updated_by, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, reason=excluded.reason,
+                  updated_by=excluded.updated_by, updated_at=excluded.updated_at`)
+      .bind(key, value, reason, by, nowIso())
       .run();
     await this.audit(null, 'flag.set', by, key, 'ok', { value, reason });
   }

@@ -16,13 +16,14 @@
  *
  * 人にしかできないこと（最後に一覧で出す）:
  *   LINE公式アカウントの開設 / Messaging API の有効化 / トークンの発行 /
- *   応答メッセージのオフ / Claude API キーの発行 / note へのログイン
+ *   応答メッセージのオフ / OpenAI の API キーの発行（前払いクレジット）/ note へのログイン
  */
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
+import { VARS, isHealthyCheck } from './setup-vars.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DEV_VARS = resolve(ROOT, '.dev.vars');
@@ -43,31 +44,7 @@ const warn = (m) => console.log(`  ⚠ ${m}`);
 const fail = (m) => console.log(`  ✗ ${m}`);
 
 // ── .dev.vars ────────────────────────────────────────
-/**
- * 必要な値と、その取り方。
- * required=false のものは、無くても動く。
- */
-const VARS = [
-  { key: 'LINE_CHANNEL_SECRET', required: true, secret: true,
-    where: 'LINE Developers → チャネル基本設定 → チャネルシークレット' },
-  { key: 'LINE_CHANNEL_ACCESS_TOKEN', required: true, secret: true,
-    where: 'LINE Developers → Messaging API設定 → チャネルアクセストークン（長期）' },
-  { key: 'ANTHROPIC_API_KEY', required: true, secret: true,
-    where: 'console.anthropic.com（★Pro/Max の個人プランは規約上使えません）' },
-  // ★形の検査を付ける。付け忘れると「設定したのに動かない」になる（2026-08-30 実地）
-  { key: 'ANTHROPIC_WORKSPACE_ID', required: false, secret: true,
-    validate: (v) => (!v || v.startsWith('wrkspc_')) ? null
-      : 'wrkspc_ から始まる値である必要があります（Console の Settings → Workspaces）。空欄でも動きます',
-    where: 'Anthropic Console → Settings → Workspaces（wrkspc_ で始まるID。使っていなければ空でOK）' },
-  { key: 'MASTER_KEY_V1', required: true, secret: true, generate: true,
-    where: '自動生成します（note のログイン情報を暗号化する鍵）' },
-  { key: 'LINE_OWNER_USER_ID', required: false, secret: true,
-    where: '空でOK。最初にメッセージを送った人を自動でオーナー登録します' },
-  { key: 'NOTE_COOKIE', required: false, secret: true,
-    where: '空でOK。拡張機能で連携します（サーバー投稿方式のときだけ使う逃げ道）' },
-  { key: 'NOTE_USER_AGENT', required: false, secret: true, where: '同上' },
-  { key: 'NOTE_URLNAME', required: false, secret: true, where: '同上' },
-];
+// 必要な値の一覧と形の検査は setup-vars.mjs にある（テストから読めるように切り出した）
 
 function readDevVars() {
   const out = {};
@@ -145,6 +122,14 @@ function main() {
     for (const v of missing) console.log(`  ${v.key}\n    → ${v.where}\n`);
     console.log('  開き方:  open -e .dev.vars');
     process.exit(1);
+  }
+
+  // ★どちらで文章を書くかを、ここで一度はっきり見せる（勝手に切り替わったと思わせない）
+  const provider = (vars.LLM_PROVIDER || '').trim().toLowerCase();
+  if (provider === 'anthropic' || (!provider && vars.ANTHROPIC_API_KEY)) {
+    warn('文章は Claude で書きます（Claude のキーが入っているため）。OpenAI に切り替えるときは LLM_PROVIDER=openai を入れてください');
+  } else {
+    ok('文章は OpenAI で書きます');
   }
 
   // 2. シークレットの反映 ------------------------------------------
@@ -267,15 +252,15 @@ async function checkHealth() {
     warn('アドレスを登録した直後は数分かかることがあります。少し待って npm run setup をやり直してください。');
   } else {
     for (const [k, v] of Object.entries(body.checks ?? {})) {
-      (v === 'ok' || String(v).startsWith('agent/') || String(v).startsWith('extension/') || k === 'execution_mode')
-        ? ok(`${k}: ${v}`) : warn(`${k}: ${v}`);
+      isHealthyCheck(k, v) ? ok(`${k}: ${v}`) : warn(`${k}: ${v}`);
     }
     // note 未連携だけが残っているのは、この時点では正常
+    // ★llm（openai / anthropic）と thumbnail（enabled / disabled）は ok 以外の値で正常を表す。
+    //   v === 'ok' だけで判定すると、正しく出来ているのに「足りないものがある」と出る
     const checks = body.checks ?? {};
     const onlyNote = !body.ok
       && String(checks.note_session ?? '').match(/^(none|agent\/not_connected)$/)
-      && Object.entries(checks).every(([k, v]) =>
-        k === 'note_session' || k === 'execution_mode' || v === 'ok');
+      && Object.entries(checks).every(([k, v]) => k === 'note_session' || isHealthyCheck(k, v));
     if (onlyNote) {
       ok('システムは動いています。あとは note と連携するだけです（下の3番）');
     } else if (!body.ok) {
@@ -301,12 +286,16 @@ function printManual() {
 
   3. note と連携する
      LINE で「note連携」と送る → 出たコードを、Chrome 拡張に貼る。
-     拡張は接続先を焼き込んで作ります:
+     拡張は全員共通の1つです（npm run ext:package で dist/note-connect.zip ができます）。
+     Chrome に読み込んだら「▼ 接続先の設定」に次の URL を貼ってください:
 
-       npm run ext:package -- --url ${workerUrl || 'https://〇〇.workers.dev'}
+       ${workerUrl || 'https://〇〇.workers.dev'}
 
-     できた dist/note-connect.zip を Chrome に読み込みます。
      手順書: docs/onboarding-note-extension.md
+
+  4. OpenAI の残高を確かめる
+     platform.openai.com の Billing で、前払いのクレジット（最低5ドル）が入っていること。
+     ★自動チャージ（Auto recharge）はオフのままを推奨します（使いすぎの歯止めになります）。
 
   すべて終わったら、LINE で「記事を作成する」を押して1本試してください。
 `);

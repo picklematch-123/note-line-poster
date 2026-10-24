@@ -3,11 +3,13 @@
  *
  * 「上限に達したので明朝投稿します」と約束した以上、必ず自動で投稿する。
  */
+import { llmConfigFromEnv } from '../ports/llm';
 import type { Env } from '../env';
 import { Db, DEFAULT_TENANT_ID } from '../ports/storage/db';
 import { LineClient, text } from '../adapters/line/client';
 import { checkPolicy, publishArticle, type ServiceDeps } from '../core/article/service';
 import { dispatchPublish } from '../core/agent/dispatch';
+import { DisallowedLinksError, linkBlockRecipients } from '../core/article/links';
 import { KvImageStore } from '../ports/storage/images';
 import { resolveNoteSession, persistRefreshedCookie } from '../core/session/resolve';
 import { log } from '../lib/mask';
@@ -19,8 +21,7 @@ export async function retryBlocked(env: Env): Promise<void> {
   const { session, origin } = await resolveNoteSession(env);
   const deps: ServiceDeps = {
     db,
-    llmApiKey: env.ANTHROPIC_API_KEY,
-    llmWorkspaceId: env.ANTHROPIC_WORKSPACE_ID ?? null,
+    llm: llmConfigFromEnv(env),
     noteSession: session,
     ownerLineUserId: ownerId,
     // ★投稿者が承認した記事も、条件が戻れば自動で出す（外された人の承認は通らない）
@@ -60,7 +61,16 @@ export async function retryBlocked(env: Env): Promise<void> {
         await line.push(notify, [text(`お待たせしました。公開しました。\n${url}`)]);
       }
     } catch (e) {
-      log.warn('自動投稿に失敗', String(e));
+      if (e instanceof DisallowedLinksError) {
+        // ★リンク検査で止めた。記事は failed に落としてあるので、次の Cron で同じ記事を繰り返し試さない。
+        //   「公開する」を押した人・担当者・持ち主に知らせる
+        const a = await db.getArticle(row.id);
+        for (const to of linkBlockRecipients(a, ownerId, row.approved_by)) {
+          await line.push(to, [text(e.userMessage)]);
+        }
+      } else {
+        log.warn('自動投稿に失敗', String(e));
+      }
     }
     // 全体流量を守るため、1回の Cron では1件だけ投稿する
     break;

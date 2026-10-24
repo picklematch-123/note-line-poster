@@ -9,7 +9,10 @@
 import type { Db, ArticleRow } from '../../ports/storage/db';
 import type { ImageStore } from '../../ports/storage/images';
 import { toNoteHtml, plainLength } from '../../ports/publisher/note/html';
-import { fill, normalize } from '../article/placeholders';
+import { composeArticleMarkdown, type GeneratedFill } from '../article/compose';
+import {
+  assertArticleHtmlLinks, imageUrlPlaceholder, generatedImageUrlPlaceholder, listPlacedGeneratedImages, GENERATED_SLOT_OFFSET,
+} from '../article/links';
 
 export interface PlanFormField {
   name: string;
@@ -41,7 +44,7 @@ export interface AgentPlan {
 
 /** 画像URLは公開時まで分からないので、本文には差し込み用の目印を入れておく。 */
 function imageUrlVar(slot: number): string {
-  return `{{image${slot}_url}}`;
+  return imageUrlPlaceholder(slot);
 }
 
 /**
@@ -91,6 +94,26 @@ export async function buildPlan(
     });
   }
 
+  // 2.5 AI が作った文中画像（P3）。写真と同じ上げ方で、目印は {{image(100+N)_url}}（写真の番号とぶつけない）
+  // ★本文に [AI画像N] が無ければ D1 を読まない（P3 より前の記事）
+  const generatedRows = await listPlacedGeneratedImages(deps.db, article);
+  const generated: Record<number, GeneratedFill> = {};
+  for (const row of generatedRows) {
+    const slot = row.gen_slot!;
+    const varSlot = GENERATED_SLOT_OFFSET + slot;
+    generated[slot] = { url: generatedImageUrlPlaceholder(slot), alt: row.alt_text };
+    steps.push({
+      id: `image${varSlot}`,
+      method: 'POST',
+      path: '/api/v1/image_upload/text_note_picture',
+      form: [
+        { name: 'file', asset: row.id, fileName: `ai-image${slot}.png` },
+        { name: 'note_id', value: '{{note_id}}' },
+      ],
+      capture: { [`image${varSlot}_url`]: 'url' },
+    });
+  }
+
   // 3. サムネイル（見出し画像）。上げた時点で記事に紐づくので本文には出さない
   const eyecatch = await deps.db.getEyecatch(article.id);
   if (eyecatch) {
@@ -108,9 +131,16 @@ export async function buildPlan(
   }
 
   // 4. 本文を組み立てる（画像URLは目印のまま。拡張が差し替える）
-  const md = normalize(article.body_md ?? '', images.length);
   const alts: Record<string, string> = article.image_alts_json ? JSON.parse(article.image_alts_json) : {};
-  const html = toNoteHtml(fill(md, urls, alts));
+  const html = toNoteHtml(composeArticleMarkdown({
+    bodyMd: article.body_md ?? '', photoCount: images.length, photoUrls: urls, photoAlts: alts, generated,
+  }));
+  // ★最後の関所。拡張に渡す前に、手順書の本文に許可外のリンク先が無いかを検査する。
+  //   画像は目印 `{{imageN_url}}` のまま（拡張が note に上げた URL に差し替える）なので、目印だけを許可に足す。
+  //   引っかかったら手順書を作らない（＝拡張には何も渡らない）。後始末は blockForDisallowedLinks が行う
+  await assertArticleHtmlLinks(deps.db, article, html, kind, {
+    placeholderSlots: images.length, generatedSlots: Object.keys(generated).map(Number), stage: 'agent_plan',
+  });
   const title = article.title ?? '無題';
   // ★目印は差し替え後も本文の見た目の長さを変えない（タグの中身なので数に入らない）
   const bodyLength = plainLength(html);

@@ -8,6 +8,7 @@
  * ★認証は端末トークン1本。連携時に発行し、ハッシュだけを保存している。
  * ★ここでは note を一切叩かない。叩くのは顧客のブラウザ。
  */
+import { llmConfigFromEnv } from '../../ports/llm';
 import { z } from 'zod';
 import type { Env } from '../../env';
 import { Db, DEFAULT_TENANT_ID } from '../../ports/storage/db';
@@ -99,8 +100,7 @@ export async function handleAgentResult(req: Request, env: Env): Promise<Respons
   const db = new Db(env.DB);
   const deps = {
     db,
-    llmApiKey: env.ANTHROPIC_API_KEY,
-    llmWorkspaceId: env.ANTHROPIC_WORKSPACE_ID ?? null,
+    llm: llmConfigFromEnv(env),
     noteSession: { cookieHeader: '', userAgent: '', urlname: device.noteUrlname ?? '' },
     ownerLineUserId: env.LINE_OWNER_USER_ID || (await db.getOwnerLineUserId(device.tenantId)),
     // ★投稿者が承認した記事も、拡張経由で出せるようにする

@@ -56,6 +56,8 @@ export const RevisionIntent = z.object({
   action: z.enum(['move_image', 'swap_image', 'remove_image', 'set_eyecatch', 'clear_eyecatch', 'rewrite_section', 'change_title', 'regenerate_all', 'unknown']),
   imageIndex: z.number().int().nullable().default(null),
   secondImageIndex: z.number().int().nullable().default(null),
+  /** 写真（[画像N]）か、AI が作った文中画像（[AI画像N]）か。★既定は写真（今までの指示はすべて写真） */
+  imageKind: z.enum(['photo', 'generated']).catch('photo').default('photo'),
   headingIndex: z.number().int().nullable().default(null).describe('0始まりの見出し番号'),
   instruction: z.string().default('').describe('rewrite/change_title のときの具体的な指示'),
 });

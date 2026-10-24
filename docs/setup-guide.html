@@ -661,11 +661,11 @@
     <div class="facts">
       <div class="fact">
         <span class="fact__k">所要</span>
-        <span class="fact__v">約 76 分</span>
+        <span class="fact__v">約 86 分</span>
       </div>
       <div class="fact">
         <span class="fact__k">費用</span>
-        <span class="fact__v">Claude のみ前払い</span>
+        <span class="fact__v">OpenAI のみ前払い</span>
       </div>
       <div class="fact">
         <span class="fact__k">用意するもの</span>
@@ -724,7 +724,7 @@
           システムからの通知が<strong>月200通</strong>まで。
           <strong>使い切っても自動で課金はされません</strong>（届かなくなるだけです）</td></tr>
           <tr><td>note</td><td>無料</td></tr>
-          <tr><td><strong>Claude（Anthropic）</strong></td><td><strong>前払い。クレジットの購入が必要です</strong>（使った分だけ減ります）</td></tr>
+          <tr><td><strong>OpenAI</strong></td><td><strong>前払い。クレジットの購入が必要です</strong>（最低5ドル。使った分だけ減ります）</td></tr>
           <tr><td>Cloudflare</td><td>無料の範囲で足ります</td></tr>
           <tr><td>GitHub</td><td>無料</td></tr>
         </tbody>
@@ -732,9 +732,30 @@
     </div>
     <div class="note">
       <span class="note__label">「完全に0円」ではありません</span>
-      <p>Claude だけは前払いです。記事を書かせるたびに少しずつ減ります。
-      ★<strong>Pro / Max の個人プランは規約上使えません。</strong>
-      console.anthropic.com で発行する従量課金のキーが必要です。</p>
+      <p>OpenAI だけは前払いです。記事を書かせるたびに少しずつ減ります。
+      用意していただく AI のキーは <strong>OpenAI の1つだけ</strong>です
+      （文章を書く・Webで調べる・画像を作る、のすべてに使います）。
+      ★<strong>ChatGPT（Plus など）の月額プランとは別物</strong>で、API 用の前払いクレジットが必要です。</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>OpenAI でかかるもの</th><th>目安（1回あたり）</th></tr></thead>
+        <tbody>
+          <tr><td>記事の文章を書く</td><td>約20〜30円（記事1本）</td></tr>
+          <tr><td>サムネイル（見出し画像）を AI で作る</td><td>約4〜5円（1枚）。写真をサムネにしていない記事で自動で作られます。オフにもできます</td></tr>
+          <tr><td>Webで調べて書く（最初はオフ）</td><td>約3〜11円（記事1本）</td></tr>
+          <tr><td>記事の中に AI の挿絵を入れる（最初は0枚）</td><td>約4〜5円（1枚）</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note">
+      <span class="note__label">この金額は目安です</span>
+      <p>ふだんの記事1本（文章＋サムネ）で<strong>約25〜35円</strong>が目安です。
+      ただし<strong>文章の金額は、実際の記事で測りきれていない見込みの値</strong>です
+      （調べる・画像は試しに動かしたときの実測です）。記事の長さや修正の回数で前後します。
+      正確な額は OpenAI の画面（Usage）でご確認ください。</p>
+      <p>★<strong>自動チャージ（Auto recharge）はオフのままにしてください。</strong>
+      前払いの残高が、使いすぎの歯止めになります。</p>
     </div>
     <div class="note">
       <span class="note__label">LINE の200通を使い切ったら</span>
@@ -770,8 +791,8 @@
         <span class="vault__from">LINE Developers → Messaging API設定（長期）</span>
       </div>
       <div class="vault__row">
-        <span class="vault__key">ANTHROPIC_API_KEY</span>
-        <span class="vault__from">Claude の開発者向け画面（sk-ant- で始まる）</span>
+        <span class="vault__key">OPENAI_API_KEY</span>
+        <span class="vault__from">OpenAI の開発者向け画面（sk- で始まる）</span>
       </div>
 
     </div>
@@ -805,9 +826,9 @@
             <td>★<strong>必ず、いまお使いのアカウントを</strong>（下の注意を読んでください）</td>
           </tr>
           <tr>
-            <td><strong>Claude</strong></td>
-            <td>記事を書く</td>
-            <td>そのまま使えます。ただし <strong>Pro / Max とは別に「API」の支払い登録</strong>が要ります</td>
+            <td><strong>OpenAI</strong></td>
+            <td>記事を書く・調べる・画像を作る</td>
+            <td>そのまま使えます。ただし <strong>ChatGPT の月額プランとは別に「API」の支払い登録</strong>が要ります</td>
           </tr>
           <tr>
             <td><strong>Cloudflare</strong></td>
@@ -1155,40 +1176,53 @@
   <section class="phase" id="p3">
     <div class="phase__head">
       <span class="phase__num">03</span>
-      <h2 class="phase__title">Claude の API キーを発行する</h2>
-      <span class="phase__time">10分</span>
+      <h2 class="phase__title">OpenAI の API キーを発行する</h2>
+      <span class="phase__time">15分</span>
     </div>
     <p class="phase__intro">
-      記事を書くのは Claude です。<strong>ここだけはお金がかかります。</strong>
+      記事を書くのも、Webで調べるのも、画像を作るのも OpenAI です。<strong>ここだけはお金がかかります。</strong>
       先にお金を入れておいて、使った分だけ減っていく仕組みです（携帯のプリペイドと同じ考え方）。
     </p>
     <div class="note">
-      <span class="note__label">すでに Claude をお使いの方へ</span>
+      <span class="note__label">すでに OpenAI（ChatGPT）をお使いの方へ</span>
       <p><strong>アカウントはそのまま使えます。</strong>新しく作る必要はありません。
       ただし下の注意のとおり、<strong>「API」用の支払い登録は別に必要</strong>です。</p>
     </div>
 
     <div class="note note--alarm">
-      <span class="note__label">★普段使っている Claude（Pro / Max）とは別物です</span>
-      <p>月額で使っている Claude Pro / Max を、こうした仕組みの裏側で使うことは
-      <strong>Anthropic の規約で禁止されています</strong>。
-      同じログインで入れますが、<strong>「API」用の支払いを別に登録する必要があります。</strong></p>
+      <span class="note__label">★普段使っている ChatGPT（Plus など）とは別物です</span>
+      <p>ChatGPT の月額料金には、こうした仕組みから使うぶん（API）は<strong>含まれていません</strong>。
+      同じログインで入れますが、<strong>「API」用の前払いクレジットを別に買う必要があります。</strong></p>
     </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>このキーで動くもの</th><th>目安（1回あたり）</th></tr></thead>
+        <tbody>
+          <tr><td>記事の文章を書く</td><td>約20〜30円（記事1本）</td></tr>
+          <tr><td>サムネイル（見出し画像）を作る</td><td>約4〜5円（1枚）</td></tr>
+          <tr><td>Webで調べて書く（最初はオフ）</td><td>約3〜11円（記事1本）</td></tr>
+          <tr><td>記事の中の AI の挿絵（最初は0枚）</td><td>約4〜5円（1枚）</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>どれも目安です。<strong>文章の金額は、実際の記事でまだ測りきれていない見込みの値</strong>です。
+    1ドル＝約150円で計算しています。</p>
 
     <label class="step">
       <input type="checkbox" class="step__check" data-step="s3-1">
       <div class="step__body">
-        <h3 class="step__title">開発者向けの画面にログインする <span class="tag tag--manual">手でやる</span></h3>
-        <p><a class="linkbtn" href="https://platform.claude.com/" target="_blank" rel="noopener">Claude の開発者向け画面を開く</a></p>
+        <h3 class="step__title">開発者向けの画面に登録・ログインする <span class="tag tag--manual">手でやる</span></h3>
+        <p><a class="linkbtn" href="https://platform.openai.com/" target="_blank" rel="noopener">OpenAI の開発者向け画面を開く</a></p>
         <ul>
-          <li>すでに Claude を使っている方は、<strong>同じアカウントでログイン</strong>できます</li>
-          <li>初めての方は、00 で用意したメールアドレスで登録してください</li>
-          <li>組織名を聞かれたら、屋号や個人名で構いません</li>
+          <li>ChatGPT を使っている方は、<strong>同じアカウントでログイン</strong>できます</li>
+          <li>初めての方は、00 で決めたメールアドレスで登録してください</li>
+          <li>電話番号の確認（SMS）を求められることがあります</li>
+          <li>組織名（Organization）を聞かれたら、屋号や個人名で構いません</li>
         </ul>
         <div class="note">
-          <span class="note__label">昔の住所でも開けます</span>
-          <p><code>console.anthropic.com</code> を開くと、この画面に自動で移ります。
-          どちらを開いても同じです。</p>
+          <span class="note__label">ChatGPT の画面とは入口が違います</span>
+          <p>開くのは <code>platform.openai.com</code> です。<code>chatgpt.com</code> ではありません。</p>
         </div>
       </div>
     </label>
@@ -1197,12 +1231,12 @@
       <input type="checkbox" class="step__check" data-step="s3-2">
       <div class="step__body">
         <h3 class="step__title">支払い方法（クレジットカード）を登録する <span class="tag tag--manual">手でやる</span></h3>
-        <p><a class="linkbtn" href="https://platform.claude.com/settings/billing" target="_blank" rel="noopener">お支払いの画面を開く</a></p>
+        <p><a class="linkbtn" href="https://platform.openai.com/settings/organization/billing/overview" target="_blank" rel="noopener">お支払いの画面を開く</a></p>
         <ol>
-          <li>左メニューの <strong>Settings</strong>（設定）→ <strong>Billing</strong>（お支払い）</li>
-          <li><strong>「Add payment method」</strong>（支払い方法を追加）を押す</li>
-          <li>クレジットカードの番号・有効期限・セキュリティコードを入れる</li>
-          <li>請求先の住所を入れる（日本の住所でそのまま入れて大丈夫です）</li>
+          <li>右上の歯車（<strong>Settings</strong>）→ 左メニューの <strong>Billing</strong>（お支払い）</li>
+          <li><strong>「Add payment details」</strong>（支払い方法を追加）を押す</li>
+          <li>「個人（Individual）」か「会社（Company）」かを聞かれたら、当てはまるほうを選ぶ</li>
+          <li>クレジットカードの番号・有効期限・セキュリティコード・請求先の住所を入れる</li>
         </ol>
         <div class="note">
           <span class="note__label">入力欄が英語で戸惑ったら</span>
@@ -1216,21 +1250,27 @@
     <label class="step">
       <input type="checkbox" class="step__check" data-step="s3-3">
       <div class="step__body">
-        <h3 class="step__title">クレジット（前払いの残高）を買う <span class="tag tag--manual">手でやる</span></h3>
-        <p>同じお支払いの画面で <strong>「Buy credits」</strong>（クレジットを購入）を押し、
-        金額を選んで購入します。</p>
+        <h3 class="step__title">クレジット（前払いの残高）を買う。自動チャージはオフ <span class="tag tag--manual">手でやる</span></h3>
+        <p>同じお支払いの画面で <strong>「Add to credit balance」</strong>（残高を追加）を押し、
+        金額を入れて購入します。</p>
         <div class="note">
           <span class="note__label">いくら買えばいい？</span>
-          <p><strong>まずは最小の金額で十分です。</strong>画面に出ている一番小さい額を選んでください。
-          記事1本あたりの目安は <strong>約34円</strong>（本文を書く AI）＋<strong>約4円</strong>（下ごしらえの AI）です。
-          <strong>数百本ぶんは持ちます。</strong></p>
-          <p>残高が減ってきたら、同じ画面で買い足せます。
-          <strong>自動で引き落とされる設定（Auto reload）はオフのままで構いません。</strong></p>
+          <p><strong>まずは最低額の5ドル（約750円）で十分です。</strong>
+          ふだんの記事（文章＋サムネ）なら1本 約25〜35円なので、<strong>20本前後は持ちます</strong>
+          （調べる・挿絵を増やすと、そのぶん早く減ります）。
+          税が加わる場合があります。</p>
+          <p>残高が減ってきたら、同じ画面で買い足せます。</p>
+        </div>
+        <div class="note note--alarm">
+          <span class="note__label">★自動チャージ（Auto recharge）はオフのままにしてください</span>
+          <p>購入のときに「自動で買い足しますか」と聞かれても、<strong>オンにしないでください</strong>。
+          前払いの残高が、<strong>使いすぎの歯止め</strong>になります。
+          使用額の上限（予算）の設定は「知らせるだけで止まらない」場合があるため、歯止めにはなりません。</p>
         </div>
         <div class="note note--alarm">
           <span class="note__label">買わないと動きません</span>
           <p>キーを発行しても、残高が 0 のままだと記事が作れません
-          （LINE に「残高が不足しています」と返ってきます）。</p>
+          （LINE に「残高または利用上限に達しています」と返ってきます）。</p>
         </div>
       </div>
     </label>
@@ -1239,24 +1279,30 @@
       <input type="checkbox" class="step__check" data-step="s3-4">
       <div class="step__body">
         <h3 class="step__title">API キーを発行して控える <span class="tag tag--manual">手でやる</span></h3>
-        <p><a class="linkbtn" href="https://platform.claude.com/settings/keys" target="_blank" rel="noopener">API キーの画面を開く</a></p>
+        <p><a class="linkbtn" href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">API キーの画面を開く</a></p>
         <ol>
           <li>左メニューの <strong>API keys</strong> を開く</li>
-          <li><strong>「Create Key」</strong>（キーを作成）を押す</li>
-          <li>名前を聞かれるので、分かるもので構いません（例：<code>note-line-poster</code>）</li>
-          <li><code>sk-ant-</code> で始まる長い文字列が出るので、<strong>コピーして控える</strong></li>
+          <li><strong>「Create new secret key」</strong>（キーを作成）を押す</li>
+          <li>名前は分かるもので構いません（例：<code>note-line-poster</code>）。ほかの欄はそのままで大丈夫です</li>
+          <li><code>sk-</code> で始まる長い文字列（<code>sk-proj-</code> で始まることもあります）が出るので、<strong>コピーして控える</strong></li>
         </ol>
         <div class="note note--alarm">
           <span class="note__label">★この画面を閉じると二度と見られません</span>
           <p>その場でコピーして、メモ帳などに控えてください。
           控え損ねたら、<strong>新しいキーを作り直せば大丈夫</strong>です（古いほうは消してください）。</p>
         </div>
+        <div class="note note--alarm">
+          <span class="note__label">★このキーを入れるのは Cloudflare の画面だけです</span>
+          <p>キーは「お金を使える合鍵」です。入れる場所は <strong>06 の配備画面（Cloudflare）だけ</strong>です。
+          <strong>LINE・メール・チャットには貼らないでください。</strong>提供元に送っていただく必要もありません。</p>
+        </div>
         <div class="note">
-          <span class="note__label">ワークスペースを聞かれたら</span>
-          <p><strong>Default のままで構いません。</strong>
-          もし特定のワークスペースを選んだ場合は、
-          <strong>Settings → Workspaces</strong> にある <code>wrkspc_</code> で始まる ID も控えてください
-          （通常は使いません）。</p>
+          <span class="note__label">「組織の認証（Verify Organization）」を求められたら</span>
+          <p>主に<strong>画像を作る機能</strong>で、OpenAI から組織の認証を求められる場合があります。
+          そのときは LINE にそう案内が届きます。
+          Settings → Organization（General）の <strong>「Verify Organization」</strong>から手続きしてください
+          （身分証の確認があります。画面の名前は変わることがあります）。
+          認証が済むまでは画像が作られませんが、記事の文章は届きます。</p>
         </div>
       </div>
     </label>
@@ -1376,10 +1422,11 @@
             <tbody>
               <tr><td>LINE_CHANNEL_SECRET</td><td>01 で控えたチャネルシークレット</td></tr>
               <tr><td>LINE_CHANNEL_ACCESS_TOKEN</td><td>01 で控えたアクセストークン</td></tr>
-              <tr><td>ANTHROPIC_API_KEY</td><td>03 で発行した <code>sk-ant-</code> のキー</td></tr>
+              <tr><td>OPENAI_API_KEY</td><td>03 で発行した <code>sk-</code> で始まるキー</td></tr>
             </tbody>
           </table>
         </div>
+        <p><strong>入力欄はこの3つだけです。</strong>ほかの AI のキーを入れる欄はありません。</p>
         <p><strong>データベース名・保管庫の名前は、そのままで構いません。</strong>
         「ビルドコマンド」は空のまま、「デプロイコマンド」は <code>npm run deploy</code> のままです。</p>
       </div>
@@ -1652,7 +1699,7 @@
     <div class="phase__head">
       <span class="phase__num">09</span>
       <h2 class="phase__title">1本通してみる</h2>
-      <span class="phase__time">10分</span>
+      <span class="phase__time">15分</span>
     </div>
     <p class="phase__intro">
       いきなり公開せず、下書きで形を確かめてから公開します。note への公開は取り消せません。
@@ -1662,9 +1709,10 @@
       <input type="checkbox" class="step__check" data-step="s9-1">
       <div class="step__body">
         <h3 class="step__title">記事を作らせる <span class="tag tag--manual">手でやる</span></h3>
-        <p>メニュー左の<strong>「記事を作成する」</strong>を押して、ネタを送ります。1〜3分でプレビューが返ってきます。</p>
-        <p>先にメニュー中央の<strong>「プロフィールを登録する」</strong>で商売の内容を登録しておくと、同じネタでも記事の中身が変わります。効果を見たいなら、登録前後で2本試すとよく分かります。</p>
-        <div class="note"><strong>ボタンの文言について</strong>：この機能は中身を作り直して「ナレッジ」と呼んでいますが、メニュー画像の文言は「プロフィール登録」のままです。どちらの言い方でも反応します。</div>
+        <p>メニュー左上の<strong>「記事を作る」</strong>を押して、ネタを送ります。1〜3分でプレビューが返ってきます
+        （AI の画像を作る設定にしていると、そのぶん数分長くかかります）。</p>
+        <p>先にメニュー右上の<strong>「ナレッジ」</strong>で商売の内容や決まりごとを登録しておくと、同じネタでも記事の中身が変わります。効果を見たいなら、登録前後で2本試すとよく分かります。</p>
+        <div class="note"><strong>言い方について</strong>：「ナレッジ」は、以前は「プロフィール登録」と呼んでいた機能です。どちらの言い方で送っても反応します。</div>
       </div>
     </label>
 
@@ -1702,6 +1750,59 @@
           <p>なお、書き直したいだけなら消す必要はありません。
           一覧から記事を開いて<strong>「修正する」</strong>を押せば、
           <strong>同じ URL のまま</strong>中身を差し替えられます。</p>
+        </div>
+      </div>
+    </label>
+
+    <label class="step">
+      <input type="checkbox" class="step__check" data-step="s9-5">
+      <div class="step__body">
+        <h3 class="step__title">「AI設定」を見ておく（変えなくても大丈夫） <span class="tag tag--manual">手でやる</span></h3>
+        <p>メニュー下段の<strong>「AI設定」</strong>で、AI の働き方を選べます。
+        変えられるのは持ち主だけです。<strong>最初はお金と手間が少ない側</strong>になっています。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>項目</th><th>最初の設定</th><th>変えると</th></tr></thead>
+            <tbody>
+              <tr><td>調べ方</td><td><strong>与えた情報だけ</strong>（ネタとナレッジだけで書く）</td>
+              <td>「Webで調べる」にすると、AI が調べて<strong>出典つき</strong>で書きます（記事1本 約3〜11円）</td></tr>
+              <tr><td>調べる先・調べる上限</td><td>指定なし・1日5件まで</td>
+              <td>官公庁・医療/学術・統計のサイトに絞れます</td></tr>
+              <tr><td>文中の画像の枚数</td><td><strong>0枚</strong>（作らない）</td>
+              <td>見出しの下に AI の挿絵が入ります（1枚 約4〜5円・最大5枚）</td></tr>
+              <tr><td>サムネの設定</td><td>写真をサムネにしていない記事で<strong>自動で作る</strong>・1日10枚まで</td>
+              <td>オフにすると AI のサムネは作りません</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>投稿のペース（1日の本数・間隔）は、隣の<strong>「投稿設定」</strong>で変えます（07 で見たものと同じです）。</p>
+
+        <div class="note note--alarm">
+          <span class="note__label">★「Webで調べる」を使うときの注意</span>
+          <ul>
+            <li>記事の最後の「参考にした情報」は、<strong>AI が実際に見たページから機械で付けています</strong>。
+            ただし、<strong>書かれた内容が正しいかまでは保証できません</strong>。公開する前に、出典を開いて確かめてください</li>
+            <li>健康・医療・お金の話題は、<strong>「調べる先」を官公庁や医療/学術に絞る</strong>のをおすすめします</li>
+            <li>調べた一般的な情報を、<strong>ご自身の商品やサービスの効果のように書かない</strong>よう気をつけてください（広告の決まりに触れることがあります）</li>
+            <li>調べられなかったときは、「与えた情報だけで書きました」とプレビューに出ます（黙って書き進めません）</li>
+          </ul>
+        </div>
+
+        <div class="note note--alarm">
+          <span class="note__label">★AI の画像を使うときの注意</span>
+          <ul>
+            <li>AI の画像が入った記事は、<strong>まず「下書きに保存する」で note の画面を見てから</strong>公開してください（確かめずに公開しようとすると、一度確認のボタンが出ます）</li>
+            <li>画像の中の文字・人の顔・料理やお店の設備などが、<strong>実物と違う形で描かれることがあります</strong>。実物と誤解されそうな絵は、使わないでください</li>
+            <li>文中に AI の画像が入った記事には、末尾に<strong>「AIで作成したイメージです」</strong>という1行が自動で入ります</li>
+          </ul>
+        </div>
+
+        <div class="note">
+          <span class="note__label">AI が勝手にリンクを入れないようにしていますが、完全ではありません</span>
+          <p>記事に残せるリンクは、<strong>ナレッジやネタにご自身が書いたもの</strong>と、
+          <strong>調べたときの出典</strong>だけに機械で絞っています。それ以外のリンクが見つかったときは公開を止めます。
+          ただし、<code>example[.]com</code> のように<strong>形を崩したサイト名の書き方</strong>までは、機械では見分けきれません。
+          公開する前に、本文を一度読んでください。</p>
         </div>
       </div>
     </label>
@@ -1749,10 +1850,36 @@
             そのあと<strong>あなたが最初に</strong>LINE へ送ってください</td>
           </tr>
           <tr>
-            <td>記事の生成が「ワークスペースIDの設定が必要です」で失敗する</td>
-            <td>Claude のキーがワークスペースに紐づいています。
-            Cloudflare の画面 → お使いの Worker → 設定 → 変数とシークレット で
-            <code>ANTHROPIC_WORKSPACE_ID</code> を登録してください</td>
+            <td>LINE に「OpenAI の残高または利用上限に達しています」と返ってくる</td>
+            <td>前払いの残高が足りません。<code>03</code> のお支払いの画面で
+            <strong>「Add to credit balance」</strong>から買い足してください（最低5ドル）。
+            書きかけの内容は残っているので、買い足したらもう一度お試しください</td>
+          </tr>
+          <tr>
+            <td>「OpenAI の API キーが無効です」「正しく登録されていません」</td>
+            <td>キーの貼り間違いか、キーを消した可能性があります。<code>03</code> で新しいキーを作り、
+            Cloudflare の画面 → お使いの Worker → 設定 → 変数とシークレット の
+            <code>OPENAI_API_KEY</code> を貼り直してください（<code>sk-</code> で始まり、前後に空白が無いこと）</td>
+          </tr>
+          <tr>
+            <td>「組織の認証（Organization Verification）が必要」と出る</td>
+            <td>OpenAI 側の手続きです。<code>03</code> の「組織の認証を求められたら」のとおり手続きしてください。
+            済むまでは画像が作られませんが、記事の文章は届きます</td>
+          </tr>
+          <tr>
+            <td>「OpenAI のモデルが使えません」と出る</td>
+            <td>使えないときは自動で別のモデルに切り替えます。それでも出る場合は、
+            OpenAI 側の変更でシステムの更新が必要なことがあります。<strong>提供元にご連絡ください</strong></td>
+          </tr>
+          <tr>
+            <td><code>/health</code> の <code>llm</code> が <code>none</code></td>
+            <td>OpenAI のキーが登録されていません。Cloudflare の画面 → お使いの Worker → 設定 →
+            変数とシークレット で <code>OPENAI_API_KEY</code> を登録してください</td>
+          </tr>
+          <tr>
+            <td>記事の最後に「参考にした情報」が付かない／「与えた情報だけで書きました」と出る</td>
+            <td>「AI設定」の調べ方が「与えた情報だけ」になっているか、調べたけれど確かな出典が見つからなかったためです。
+            調べられなかったときは、プレビューの「もう一度調べる」で調べ直せます</td>
           </tr>
           <tr>
             <td>送っても何も返ってこない</td>
@@ -1809,7 +1936,8 @@
       <table>
         <thead><tr><th>人がやること</th><th>いつ</th></tr></thead>
         <tbody>
-          <tr><td>5つのアカウントを作る（LINE・note・Claude・Cloudflare・GitHub）</td><td>初回のみ</td></tr>
+          <tr><td>5つのアカウントを作る（LINE・note・OpenAI・Cloudflare・GitHub）</td><td>初回のみ</td></tr>
+          <tr><td>OpenAI の残高を買い足す</td><td>残高が減ったとき</td></tr>
           <tr><td>鍵を3つ、配備の画面に貼る</td><td>初回のみ</td></tr>
           <tr><td>LINE の応答メッセージをオフにする</td><td>初回のみ</td></tr>
           <tr><td>note にログインして、拡張のボタンを押す</td><td>初回＋月1回ほど</td></tr>
@@ -1817,7 +1945,8 @@
       </table>
     </div>
     <p>
-      日常的に発生するのは<strong>最後の1つだけ</strong>です。それも3手で終わります。
+      日常的に発生するのは、<strong>note へのログインのし直し</strong>と、
+      <strong>OpenAI の残高の買い足し</strong>の2つだけです。どちらも数手で終わります。
     </p>
   </section>
 

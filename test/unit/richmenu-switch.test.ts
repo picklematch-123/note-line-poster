@@ -14,7 +14,9 @@ import normalMenu from '../../assets/richmenu.json';
 import { COMMANDS } from '../../src/adapters/line/commands';
 
 const root = new URL('../../', import.meta.url).pathname;
-const setupImage = `${root}assets/richmenu-setup.png`;
+// ★いまのコードが使うのは版付きの名前（v2）。旧名は古いコードのために残す
+const setupImage = `${root}assets/richmenu-setup-v2.png`;
+const oldSetupImage = `${root}assets/richmenu-setup.png`;
 
 describe('どちらのメニューを出すか', () => {
   it('note と繋がっていなければ、セットアップ用', () => {
@@ -60,9 +62,18 @@ describe('セットアップ用メニューの定義', () => {
   }
 });
 
-// ★画像はこれから用意する（オーナー が作成）。
-//   置かれたら、この検査が自動的に効き始める。
-describe.skipIf(!existsSync(setupImage))('セットアップ用メニューの画像', () => {
+describe('セットアップ用メニューの画像', () => {
+  it('★v2 の画像が置かれている（Worker はこの名前で取りに行く）', () => {
+    expect(existsSync(setupImage)).toBe(true);
+  });
+
+  it('★旧名の画像も残っている（古いコードの環境が取りに行く・2500×843）', () => {
+    expect(existsSync(oldSetupImage)).toBe(true);
+    const buf = readFileSync(oldSetupImage);
+    expect({ width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) }).toEqual({ width: 2500, height: 843 });
+    expect(statSync(oldSetupImage).size).toBeLessThanOrEqual(1024 * 1024);
+  });
+
   it('★画像の大きさが定義と一致している', () => {
     const buf = readFileSync(setupImage);
     const width = buf.readUInt32BE(16);

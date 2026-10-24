@@ -16,7 +16,9 @@ import {
   reopenPublished, setEyecatch, clearEyecatch, saveArticleAsDraft, PolicyBlockedError, type ServiceDeps,
 } from '../../core/article/service';
 import { NoteApiError } from '../../ports/publisher/note/client';
-import { AnthropicLlm, LlmError } from '../../ports/llm/anthropic';
+import { DisallowedLinksError, linkBlockRecipients } from '../../core/article/links';
+import { LlmError } from '../../ports/llm/types';
+import { createLlm, llmConfigFromEnv } from '../../ports/llm';
 import { RevisionIntent } from '../../core/generation/schema';
 import { analyzeContext } from '../../core/generation/pipeline';
 import { buildContextSnippet, listEntries, removeEntry } from '../../core/generation/context';
@@ -42,6 +44,12 @@ import { parseDailyLimit, parseIntervalSec } from '../../core/policy/options';
 import { KvImageStore } from '../../ports/storage/images';
 import { newId } from '../../lib/id';
 import { log } from '../../lib/mask';
+import { getThumbSettings, setThumbAuto, setThumbDailyLimit, DAILY_LIMIT_OPTIONS, NOTE_NO_KEY } from '../../core/image/thumbnail';
+import { buildThumbSettings } from './messages/thumbnail';
+import { buildAiSettings, buildDomainChoices, buildResearchLimitChoices } from './messages/research';
+import { getResearchSettings, applyResearchSetting } from '../../core/research/settings';
+import { canRedoResearch } from '../../core/research/run';
+import { createResearchLlm } from '../../ports/llm';
 import { canUse, isOwner, roleOf, NOT_OWNER_MESSAGE, OWNER_ONLY_MESSAGE } from '../../core/line/access';
 import {
   openInvite, peekInvite, closeInvite, MAX_STAFF,
@@ -54,9 +62,18 @@ import { buildProvisionalSnippet } from '../../core/generation/context';
 import { buildKnowledgeReceived } from './messages/knowledge';
 import { issueSetupCode } from '../../core/setup/state';
 import { resolveMasterKey } from '../../core/setup/masterkey';
+import { validateIdeaLength } from '../../core/line/idea-input';
+import { formatRevisionWaitMessage } from '../../core/generation/estimate';
+import {
+  getInlineSettings, applyInlineSetting, effectiveInlineCount, inlineWaitNote, hasImageKey, loadInlineView,
+  countInlineForArticle, MAX_INLINE_PER_ARTICLE, NOTE_ARTICLE_LIMIT,
+} from '../../core/image/inline';
+import { buildInlineCountChoices, buildInlineLimitChoices, buildAiImageReviewPrompt } from './messages/inline';
+import {
+  startLockedImageJob, regenStateCheck, NOTE_STILL_GENERATING, NOTE_INLINE_LOCKED, NOTE_THUMB_LOCKED,
+} from '../../core/image/lock';
+import { needsAiImageReview, markAiImagesConfirmed } from '../../core/image/review';
 
-/** ネタとして受け付ける最短の長さ。これ未満は雑談として扱う。 */
-const MIN_IDEA_LENGTH = 10;
 /** 画像の到着を待つ秒数 */
 const DEBOUNCE_SEC = 60;
 /**
@@ -81,8 +98,7 @@ async function deps(env: Env): Promise<ServiceDeps> {
   const { session, origin } = await resolveNoteSession(env);
   return {
     db: new Db(env.DB),
-    llmApiKey: env.ANTHROPIC_API_KEY,
-    llmWorkspaceId: env.ANTHROPIC_WORKSPACE_ID ?? null,
+    llm: llmConfigFromEnv(env),
     noteSession: session,
     ownerLineUserId: env.LINE_OWNER_USER_ID || null,
     images: new KvImageStore(env.KV),
@@ -426,6 +442,17 @@ async function handleText(
   if (COMMANDS.settings.test(cmd)) {
     return showSettings(env, line, d, replyToken);
   }
+  if (COMMANDS.moreSettings.test(cmd)) {
+    return showMoreSettings(line, d, replyToken, userId);
+  }
+  if (COMMANDS.aiSettings.test(cmd)) {
+    if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+    return showAiSettings(env, line, d, replyToken);
+  }
+  if (COMMANDS.thumbSettings.test(cmd)) {
+    if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+    return showThumbSettings(env, line, d, replyToken);
+  }
 
   // ── 2. いま何を待っているか（モード）─────────────────────
   const mode = await getMode(env.KV, DEFAULT_TENANT_ID, userId);
@@ -486,7 +513,7 @@ async function handleText(
       await line.reply(replyToken, [buildPendingNotice(pending)]);
       return;
     }
-    if (body.length < MIN_IDEA_LENGTH) {
+    if (!validateIdeaLength(body).valid) {
       await setMode(env.KV, DEFAULT_TENANT_ID, userId, { kind: 'article_new' });
       await line.reply(replyToken, [text(
         'もう少し詳しく教えてください。\n' +
@@ -513,7 +540,7 @@ async function handleText(
     }
     await requestRewrite(d, active.id, body);
     await env.GENERATE.create({ params: { articleId: active.id, lineUserId: userId, debounceSec: 0 } });
-    await line.reply(replyToken, [text('前回は失敗したので、その内容で作り直します。1〜3分お待ちください。')]);
+    await line.reply(replyToken, [text(`前回は失敗したので、その内容で${formatRevisionWaitMessage()}`)]);
     return;
   }
 
@@ -553,7 +580,7 @@ async function handleText(
   // 承認待ちの記事があるなら、この発言は「承認」か「修正指示」
   if (active && (active.state === 'awaiting_approval' || active.state === 'editing')) {
     if (/^(公開|OK|ok|はい|投稿)/.test(body)) {
-      return doPublish(active.id, env, line, d, userId, replyToken);
+      return publishAfterAiImageReview(active.id, env, line, d, userId, replyToken);
     }
     if (/^(下書き|したがき)/.test(body)) {
       return doSaveDraft(active.id, line, d, userId, replyToken);
@@ -583,8 +610,8 @@ async function handleText(
     await line.reply(replyToken, [buildPendingNotice(active)]);
     return;
   }
-  // 短ければメニューを出す。十分な長さがあれば、そのままネタとして受け付ける。
-  if (body.length < MIN_IDEA_LENGTH) {
+  // 3〜500文字ならネタとして受け付ける。範囲外はメニューを出す。
+  if (!validateIdeaLength(body).valid) {
     await line.reply(replyToken, [buildMenu()]);
     return;
   }
@@ -622,10 +649,13 @@ async function startGeneration(
   await env.GENERATE.create({
     params: { articleId: article.id, lineUserId: userId, debounceSec: DEBOUNCE_SEC },
   });
+  // 文中の画像を作る設定なら、その分の待ち時間も先に伝える（短く約束しない）
+  const inlineNote = inlineWaitNote(await effectiveInlineCount(d.db, env.OPENAI_API_KEY));
   await line.reply(replyToken, [text(
     '受け付けました。\n' +
     '画像があれば続けて送ってください。\n\n' +
-    `最後のメッセージから約${DEBOUNCE_SEC}秒後に書き始めて、1〜3分でお送りします。`
+    `最後のメッセージから約${DEBOUNCE_SEC}秒後に書き始めて、1〜3分でお送りします。` +
+    (inlineNote ? `\n${inlineNote}` : '')
   )]);
 }
 
@@ -803,6 +833,35 @@ async function handlePostback(
     case 'ctx_edit':
       return showContext(env, line, d, replyToken, userId);
 
+    // ★サムネの設定は費用に直結するので持ち主だけ
+    case 'thumb_auto': {
+      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      await setThumbAuto(d.db, params.get('on') === '1', `line:${userId}`);
+      return showThumbSettings(env, line, d, replyToken);
+    }
+    case 'thumb_limit': {
+      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      const n = Number(params.get('n'));
+      if (!(DAILY_LIMIT_OPTIONS as readonly number[]).includes(n)) return; // 読めない値は何も変えない
+      await setThumbDailyLimit(d.db, n, `line:${userId}`);
+      return showThumbSettings(env, line, d, replyToken);
+    }
+
+    // ★Webリサーチの設定も費用に直結するので持ち主だけ。読めない値は何も変えない（危ない側に倒さない）
+    case 'ai_mode':
+    case 'ai_domains':
+    case 'ai_domains_set':
+    case 'ai_rlimit':
+    case 'ai_rlimit_set':
+    case 'ai_thumb':
+    // ★文中の画像（P3）も費用に直結するので持ち主だけ
+    case 'ai_img':
+    case 'ai_img_set':
+    case 'ai_ilimit':
+    case 'ai_ilimit_set':
+      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      return handleAiSettingsPostback(action, params, env, line, d, replyToken, userId);
+
     case 'cfg_daily':
       return line.reply(replyToken, [buildDailyLimitChoices((await d.db.getTenant(DEFAULT_TENANT_ID)).daily_post_limit)]);
 
@@ -836,7 +895,14 @@ async function handlePostback(
 
   switch (action) {
     case 'publish':
+      return publishAfterAiImageReview(articleId, env, line, d, userId, replyToken);
+
+    case 'publish_confirm': {
+      // 「AI画像がまだ確認されていません」で『このまま公開する』を押した。印を付けて通常の公開へ
+      // ★印を付けるのは承認できる人（持ち主・投稿者）だけ。それ以外は doPublish がいつもどおり断る
+      if (canApprove(d, userId)) await markAiImagesConfirmed(d.db, articleId);
       return doPublish(articleId, env, line, d, userId, replyToken);
+    }
 
     case 'cancel': {
       const a = await d.db.getArticle(articleId);
@@ -885,6 +951,95 @@ async function handlePostback(
     case 'savedraft':
       return doSaveDraft(articleId, line, d, userId, replyToken);
 
+    case 'thumb_regen': {
+      // 作り直しは費用がかかるので、その記事を担当している人（持ち主を含む）だけ
+      const a = await d.db.getArticle(articleId);
+      // ★受け付けるのは確認待ちだけ（作っている最中に古いボタンで重ねて走らせない・源蔵レビュー P3 必須1）
+      const st = regenStateCheck(a?.state);
+      if (st === 'generating') return line.reply(replyToken, [text(NOTE_STILL_GENERATING)]);
+      if (!a || st !== 'ok') {
+        await line.reply(replyToken, [text('いまはサムネを作り直せない状態です。')]);
+        return;
+      }
+      if (!isOwner(d.ownerLineUserId, userId) && a.requested_by !== userId) {
+        return line.reply(replyToken, [text('この記事を作った人か、持ち主だけが作り直せます。')]);
+      }
+      if (!env.OPENAI_API_KEY) {
+        await line.reply(replyToken, [text(NOTE_NO_KEY)]);
+        return;
+      }
+      // ★「作成中」の印が取れたときだけ起動する（二度押しで二重に課金しない）。外すのは Workflow 側
+      const started = await startLockedImageJob(env.KV, 'thumb', articleId, newId(), async (lockToken) => {
+        await env.GENERATE.create({ params: { kind: 'thumbnail', articleId, lineUserId: userId, lockToken } });
+      });
+      if (started === 'locked') return line.reply(replyToken, [text(NOTE_THUMB_LOCKED)]);
+      await line.reply(replyToken, [text('サムネを作り直します。1分ほどで結果をお知らせします。')]);
+      return;
+    }
+
+    case 'inline_regen': {
+      // 文中の画像の作り直しは費用がかかるので、その記事を担当している人（持ち主を含む）だけ。上限にも数える
+      const a = await d.db.getArticle(articleId);
+      // ★受け付けるのは確認待ちだけ。preview_ready は文中の画像を自動で作っている最中（源蔵レビュー P3 必須1）
+      const st = regenStateCheck(a?.state);
+      if (st === 'generating') return line.reply(replyToken, [text(NOTE_STILL_GENERATING)]);
+      if (!a || st !== 'ok') {
+        await line.reply(replyToken, [text('いまは文中の画像を作り直せない状態です。')]);
+        return;
+      }
+      if (!isOwner(d.ownerLineUserId, userId) && a.requested_by !== userId) {
+        return line.reply(replyToken, [text('この記事を作った人か、持ち主だけが作り直せます。')]);
+      }
+      if (!hasImageKey(env.OPENAI_API_KEY)) {
+        await line.reply(replyToken, [text('文中の画像の自動生成は未設定です（OpenAI の API キーを登録すると使えます）。')]);
+        return;
+      }
+      const view = await loadInlineView(d.db, a, { hasKey: true });
+      if (!view) {
+        await line.reply(replyToken, [text('この記事には、AI が作る画像の場所がありません。')]);
+        return;
+      }
+      if ((await countInlineForArticle(d.db, articleId)) >= MAX_INLINE_PER_ARTICLE) {
+        await line.reply(replyToken, [text(`${NOTE_ARTICLE_LIMIT}。`)]);
+        return;
+      }
+      // ★別の作業中の記事があれば引き受けない（「もう一度調べる」と同じ作り）
+      const busy = await busyWithOther(d, userId, articleId);
+      if (busy) return line.reply(replyToken, [buildPendingNotice(busy)]);
+      // ★「作成中」の印が取れたときだけ、担当を引き受けて起動する。取れなければ予約も起動もしない。
+      //   外すのは Workflow 側（終わる・失敗する）。外し損ねても10分で切れる
+      const started = await startLockedImageJob(env.KV, 'inline', articleId, newId(), async (lockToken) => {
+        await d.db.setRequestedBy(articleId, userId);
+        await env.GENERATE.create({ params: { kind: 'inline_images', articleId, lineUserId: userId, lockToken } });
+      });
+      if (started === 'locked') return line.reply(replyToken, [text(NOTE_INLINE_LOCKED)]);
+      await line.reply(replyToken, [text(`文中の画像を作り直します（${view.slots}枚）。最大${view.slots}分ほどで結果をお知らせします。`)]);
+      return;
+    }
+
+    case 'research_redo': {
+      // 調べ直しは費用がかかるので、その記事を担当している人（持ち主を含む）だけ。上限にも数える
+      const a = await d.db.getArticle(articleId);
+      if (!a || a.state !== 'awaiting_approval') {
+        await line.reply(replyToken, [text('いまは調べ直せない状態です。')]);
+        return;
+      }
+      if (!isOwner(d.ownerLineUserId, userId) && a.requested_by !== userId) {
+        return line.reply(replyToken, [text('この記事を作った人か、持ち主だけが調べ直せます。')]);
+      }
+      if (!(await canRedoResearch(d.db, a, Boolean(createResearchLlm(env))))) {
+        return line.reply(replyToken, [text('調べ直せる回数の上限に達したか、AI設定が「与えた情報だけ」になっています。')]);
+      }
+      // ★担当の引き受けは「やり直す」と同じ作り（別の作業中の記事があれば引き受けない）
+      const busy = await busyWithOther(d, userId, articleId);
+      if (busy) return line.reply(replyToken, [buildPendingNotice(busy)]);
+      await d.db.setRequestedBy(articleId, userId);
+      await d.db.setState(articleId, a.state, 'editing', `line:${userId}`, { reason: 'research_redo' });
+      await env.GENERATE.create({ params: { articleId, lineUserId: userId, debounceSec: 0, forceResearch: true } });
+      await line.reply(replyToken, [text('もう一度調べて、書き直します。2〜4分ほどでお送りします。')]);
+      return;
+    }
+
     case 'eyecatch': {
       const slot = Number(params.get('slot')) || null;
       try {
@@ -909,7 +1064,7 @@ async function handlePostback(
       await d.db.setRequestedBy(articleId, userId);
       await requestRewrite(d, articleId, a.revision_instruction ?? a.source_text);
       await env.GENERATE.create({ params: { articleId, lineUserId: userId, debounceSec: 0 } });
-      await line.reply(replyToken, [text('もう一度作ります。1〜3分お待ちください。')]);
+      await line.reply(replyToken, [text(`もう一度${formatRevisionWaitMessage()}`)]);
       return;
     }
 
@@ -928,6 +1083,27 @@ async function handlePostback(
 }
 
 // ── 公開 ────────────────────────────────────────────────
+/** 承認できる人か（持ち主・投稿者。持ち主が未登録なら誰でも＝approve と同じ考え方） */
+function canApprove(d: ServiceDeps, userId: string): boolean {
+  if (!d.ownerLineUserId) return true;
+  return userId === d.ownerLineUserId || (d.staffLineUserIds ?? []).includes(userId);
+}
+
+/**
+ * 「公開する」の入口。AI が作った画像を誰も見ていないまま初めて公開しようとしたら、一度だけ確認する
+ * （源蔵レビュー P3 必須3）。下書き保存済み・確認済み・AI 画像なしなら、そのまま通常の公開へ
+ * ★承認できない人には聞かない（doPublish がいつもどおり断る）
+ */
+async function publishAfterAiImageReview(
+  articleId: string, env: Env, line: LineClient, d: ServiceDeps, userId: string, replyToken: string,
+): Promise<void> {
+  if (canApprove(d, userId) && await needsAiImageReview(d.db, await d.db.getArticle(articleId))) {
+    await line.reply(replyToken, [buildAiImageReviewPrompt(articleId)]);
+    return;
+  }
+  return doPublish(articleId, env, line, d, userId, replyToken);
+}
+
 async function doPublish(
   articleId: string, env: Env, line: LineClient, d: ServiceDeps, userId: string, replyToken: string,
 ): Promise<void> {
@@ -943,14 +1119,21 @@ async function doPublish(
     const a = await d.db.getArticle(articleId);
     if (decision.retryable && a) {
       // 顧客の作業を無駄にしない。条件が回復したら Cron が自動で投稿する
-      await d.db.setState(articleId, a.state, 'blocked', `line:${userId}`, { reason: decision.reason });
+      await d.db.setState(articleId, a.state, 'blocked', `line:${userId}`, { reason: decision.reason, retryAfter: decision.retryAfter });
     }
     await line.reply(replyToken, [text(decision.userMessage!)]);
     return;
   }
 
   // ★実行先を決める。agent なら note を叩くのは顧客のブラウザ
-  const dispatch = await dispatchPublish(d, articleId, 'publish');
+  // ★許可外のリンク先があれば、ここで止まる（note には何も送らない）
+  let dispatch: Awaited<ReturnType<typeof dispatchPublish>>;
+  try {
+    dispatch = await dispatchPublish(d, articleId, 'publish');
+  } catch (e) {
+    if (e instanceof DisallowedLinksError) return notifyLinkBlocked(line, d, articleId, e, userId, replyToken);
+    throw e;
+  }
 
   if (dispatch.mode === 'no_device') {
     await line.reply(replyToken, [text(buildNoDeviceMessage())]);
@@ -974,10 +1157,25 @@ async function doPublish(
     const { url } = await publishArticle(d, articleId);
     await line.push(userId, [text(`公開しました。\n${url}`)]);
   } catch (e) {
+    if (e instanceof DisallowedLinksError) return notifyLinkBlocked(line, d, articleId, e, userId, null);
     const message = e instanceof PolicyBlockedError ? e.decision.userMessage
       : e instanceof NoteApiError ? e.userMessage
       : '投稿に失敗しました。しばらくしてからもう一度お試しください。';
     await line.push(userId, [text(message!)]);
+  }
+}
+
+/**
+ * リンク検査で止めたことを知らせる（押した人・記事の担当者・持ち主）。
+ * ★押した人には返信（無料）で、ほかの人にはプッシュで。同じ人には1回だけ
+ */
+async function notifyLinkBlocked(
+  line: LineClient, d: ServiceDeps, articleId: string, e: DisallowedLinksError, userId: string, replyToken: string | null,
+): Promise<void> {
+  const a = await d.db.getArticle(articleId);
+  for (const to of linkBlockRecipients(a, d.ownerLineUserId, userId)) {
+    if (to === userId && replyToken) await line.reply(replyToken, [text(e.userMessage)]);
+    else await line.push(to, [text(e.userMessage)]);
   }
 }
 
@@ -998,7 +1196,13 @@ function buildNoDeviceMessage(): string {
 async function doSaveDraft(
   articleId: string, line: LineClient, d: ServiceDeps, userId: string, replyToken: string,
 ): Promise<void> {
-  const dispatch = await dispatchPublish(d, articleId, 'draft');
+  let dispatch: Awaited<ReturnType<typeof dispatchPublish>>;
+  try {
+    dispatch = await dispatchPublish(d, articleId, 'draft');
+  } catch (e) {
+    if (e instanceof DisallowedLinksError) return notifyLinkBlocked(line, d, articleId, e, userId, replyToken);
+    throw e;
+  }
 
   if (dispatch.mode === 'no_device') {
     await line.reply(replyToken, [text(buildNoDeviceMessage())]);
@@ -1023,6 +1227,7 @@ async function doSaveDraft(
       '新しい記事を作れる状態になりました。'
     )]);
   } catch (e) {
+    if (e instanceof DisallowedLinksError) return notifyLinkBlocked(line, d, articleId, e, userId, null);
     const message = e instanceof PolicyBlockedError ? e.decision.userMessage
       : e instanceof NoteApiError ? e.userMessage
       : '下書きの保存に失敗しました。';
@@ -1039,30 +1244,33 @@ async function handleRevision(
 
   const headings = parseHeadings(a.body_md).map((h) => h.text);
   const imageCount = parsePlaceholders(a.body_md).length;
+  const generatedCount = parsePlaceholders(a.body_md, 'generated').length;
 
-  // 意図分類だけは軽いモデル（Haiku）で。1円未満で済む
-  const llm = new AnthropicLlm(d.llmApiKey, d.llmWorkspaceId);
+  // 意図分類だけは軽いモデルで。1円未満で済む
+  const llm = createLlm(d.llm);
   const { data: intent } = await llm.structured({
     tier: 'light',
     label: '修正指示の分類',
     schema: RevisionIntent,
     maxTokens: 500,
     system: classifyRevision.system,
-    user: classifyRevision.user(instruction, headings, imageCount),
+    user: classifyRevision.user(instruction, headings, imageCount, generatedCount),
   });
 
   // 画像の位置操作は LLM を使わず純関数で即処理する（数秒・API費用ゼロ）
   try {
     let result: { markdown: string; message: string } | null = null;
+    // AI が作った文中画像の位置も、写真と同じ純関数で即時に動かす（課金なし）。本文に AI 画像が無ければ写真として扱う
+    const kind = intent.imageKind === 'generated' && generatedCount > 0 ? 'generated' : 'photo';
 
     if (intent.action === 'move_image' && intent.imageIndex && intent.headingIndex !== null) {
       result = await reviseImagePosition(d, articleId,
-        { action: 'move', index: intent.imageIndex, headingIndex: intent.headingIndex });
+        { action: 'move', index: intent.imageIndex, headingIndex: intent.headingIndex }, kind);
     } else if (intent.action === 'swap_image' && intent.imageIndex && intent.secondImageIndex) {
       result = await reviseImagePosition(d, articleId,
-        { action: 'swap', a: intent.imageIndex, b: intent.secondImageIndex });
+        { action: 'swap', a: intent.imageIndex, b: intent.secondImageIndex }, kind);
     } else if (intent.action === 'remove_image' && intent.imageIndex) {
-      result = await reviseImagePosition(d, articleId, { action: 'remove', index: intent.imageIndex });
+      result = await reviseImagePosition(d, articleId, { action: 'remove', index: intent.imageIndex }, kind);
     } else if (intent.action === 'set_eyecatch') {
       // サムネ指定は本文を作り直さないので、そのまま返す
       const { message } = await setEyecatch(d, articleId, intent.imageIndex);
@@ -1084,8 +1292,9 @@ async function handleRevision(
           markdown: result.markdown,
           metaDescription: updated.meta_description ?? '',
           hashtags: updated.hashtags_json ? JSON.parse(updated.hashtags_json) : [],
-          charCount: result.markdown.replace(/\[画像\d+\]/g, '').length,
+          charCount: result.markdown.replace(/\[(?:AI)?画像\d+\]/g, '').length,
           hasEyecatch: Boolean(await d.db.getEyecatch(articleId)),
+          inlineImages: await loadInlineView(d.db, updated, { hasKey: hasImageKey(env.OPENAI_API_KEY) }),
         }),
       ]);
       return;
@@ -1102,7 +1311,7 @@ async function handleRevision(
     await env.GENERATE.create({
       params: { articleId, lineUserId: userId, debounceSec: 0 },
     });
-    await line.reply(replyToken, [text('書き直します。1〜3分お待ちください。')]);
+    await line.reply(replyToken, [text(formatRevisionWaitMessage())]);
     return;
   }
 
@@ -1319,6 +1528,84 @@ async function settingsView(env: Env, d: ServiceDeps): Promise<SettingsView> {
     agentConnected,
     agentOnline: agentConnected && (await isAgentOnline(env.DB, DEFAULT_TENANT_ID)),
   };
+}
+
+/**
+ * 「その他の設定」: 連携・投稿者・設定画面への入り口。
+ * ★ボタンは「文字を送る」形にして、ふだん打つコマンドと同じ経路を通す（持ち主チェックも同じ）。
+ */
+async function showMoreSettings(line: LineClient, d: ServiceDeps, replyToken: string, userId: string): Promise<void> {
+  const owner = isOwner(d.ownerLineUserId, userId);
+  const labels = owner
+    ? [['連携状況', '連携状況'], ['投稿者一覧', '投稿者一覧'], ['投稿者を追加', '投稿者を追加'], ['設定画面を開く', 'セットアップ'], ['使い方', 'メニュー']]
+    : [['使い方', 'メニュー']];
+  await line.reply(replyToken, [{
+    type: 'text',
+    text: owner ? 'その他の設定です。開きたいものを選んでください。' : 'メニューです。',
+    quickReply: {
+      items: labels.map(([label, sendText]) => ({
+        type: 'action' as const,
+        action: { type: 'message' as const, label, text: sendText },
+      })),
+    },
+  }]);
+}
+
+async function showAiSettings(env: Env, line: LineClient, d: ServiceDeps, replyToken: string): Promise<void> {
+  // ★文中の画像の設定は、画像を作れるキーがある環境でだけ見せる（キーが無ければ項目もボタンも出さない）
+  const inline = hasImageKey(env.OPENAI_API_KEY) ? await getInlineSettings(d.db) : undefined;
+  await line.reply(replyToken, [buildAiSettings(await getResearchSettings(d.db), Boolean(createResearchLlm(env)), inline)]);
+}
+
+/** AI設定のボタン（持ち主チェックは呼び出し側で済んでいる） */
+async function handleAiSettingsPostback(
+  action: string, params: URLSearchParams, env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
+): Promise<void> {
+  const by = `line:${userId}`;
+  switch (action) {
+    case 'ai_thumb':
+      return showThumbSettings(env, line, d, replyToken);
+    case 'ai_domains':
+      return line.reply(replyToken, [buildDomainChoices(await getResearchSettings(d.db))]);
+    case 'ai_rlimit':
+      return line.reply(replyToken, [buildResearchLimitChoices(await getResearchSettings(d.db))]);
+    case 'ai_img':
+    case 'ai_ilimit':
+      // キーが無い環境では選ぶ画面も出さない（AI設定の画面に戻す）
+      if (!hasImageKey(env.OPENAI_API_KEY)) return showAiSettings(env, line, d, replyToken);
+      return line.reply(replyToken, [action === 'ai_img'
+        ? buildInlineCountChoices(await getInlineSettings(d.db))
+        : buildInlineLimitChoices(await getInlineSettings(d.db))]);
+    case 'ai_img_set':
+    case 'ai_ilimit_set': {
+      // ★持ち主・キーの有無・値の読み取りは core 側で判定する（キーが無い環境では有効にしない）
+      const r = await applyInlineSetting(d.db, {
+        isOwner: isOwner(d.ownerLineUserId, userId),
+        hasKey: hasImageKey(env.OPENAI_API_KEY),
+        action,
+        value: params.get('n'),
+        by,
+      });
+      if (r === 'denied') return ownerOnly(line, replyToken);
+      if (r === 'ignored') return; // 読めない値は何も変えない
+      return showAiSettings(env, line, d, replyToken);
+    }
+  }
+  // ★持ち主・キーの有無・値の読み取りは core 側で判定する（キーが無い環境では有効にしない）
+  const result = await applyResearchSetting(d.db, {
+    isOwner: isOwner(d.ownerLineUserId, userId),
+    hasKey: Boolean(createResearchLlm(env)),
+    action,
+    value: params.get(action === 'ai_rlimit_set' ? 'n' : 'v'),
+    by,
+  });
+  if (result === 'denied') return ownerOnly(line, replyToken);
+  if (result === 'ignored') return; // 読めない値は何も変えない
+  return showAiSettings(env, line, d, replyToken);
+}
+
+async function showThumbSettings(env: Env, line: LineClient, d: ServiceDeps, replyToken: string): Promise<void> {
+  await line.reply(replyToken, [buildThumbSettings(await getThumbSettings(d.db), Boolean(env.OPENAI_API_KEY))]);
 }
 
 async function showSettings(env: Env, line: LineClient, d: ServiceDeps, replyToken: string): Promise<void> {

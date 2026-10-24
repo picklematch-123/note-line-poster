@@ -11,9 +11,22 @@
  */
 import type { z } from 'zod';
 import { log } from '../../lib/mask';
+import { LlmError, DEFAULT_STRUCTURED_MAX_RETRIES, extractJson } from './types';
+import type { Llm, LlmUsage, LlmResult, ModelTier } from './types';
 
 const API = 'https://api.anthropic.com/v1/messages';
 const VERSION = '2023-06-01';
+
+/**
+ * 1回の通信の時間切れ（★2026-10-24 源蔵 再レビュー「後でよい」）。OpenAI 版（TEXT_TIMEOUT_MS）と同じ考え方。
+ * 時間切れが無いと、応答が返らないとき step「記事を生成する」の 10 分の時間切れまで待ち、記事が「生成中」のまま止まる。
+ * 時間切れは kind='timeout'・recoverable として、structured の再試行の上限内でやり直す。
+ */
+export const CLAUDE_TIMEOUT_MS = 180_000;
+
+function isAbort(e: unknown): boolean {
+  return e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError');
+}
 
 export const MODELS = {
   /** 記事の構成・本文・仕上げ。1本あたり約34円 */
@@ -22,38 +35,15 @@ export const MODELS = {
   light: 'claude-haiku-4-5-20251001',
 } as const;
 
-export type ModelTier = keyof typeof MODELS;
-
-export interface LlmUsage {
-  inputTokens: number;
-  outputTokens: number;
-}
-
-export interface LlmResult<T> {
-  data: T;
-  usage: LlmUsage;
-}
-
-export class LlmError extends Error {
-  constructor(
-    message: string,
-    readonly userMessage: string,
-    /** 時間をおけば直る種類か（レート制限・一時障害・通信エラー） */
-    readonly recoverable: boolean,
-    /** 原因追跡用。ログに残す */
-    readonly status?: number,
-  ) {
-    super(message);
-    this.name = 'LlmError';
-  }
-}
+export type { ModelTier, LlmUsage, LlmResult, Llm, StructuredOptions } from './types';
+export { LlmError, DEFAULT_STRUCTURED_MAX_RETRIES, extractJson } from './types';
 
 interface MessagesResponse {
   content: Array<{ type: string; text?: string }>;
   usage: { input_tokens: number; output_tokens: number };
 }
 
-export class AnthropicLlm {
+export class AnthropicLlm implements Llm {
   /**
    * @param workspaceId ワークスペースに紐づいたAPIキー（identity-linked key）を使う場合に必須。
    *   Console の Settings → Workspaces で確認できる `wrkspc_` で始まるID。
@@ -62,7 +52,12 @@ export class AnthropicLlm {
   /** 実際にヘッダへ載せるワークスペースID。形が違うものは載せない */
   private readonly workspaceId: string | null;
 
-  constructor(private readonly apiKey: string, workspaceId?: string | null) {
+  constructor(
+    private readonly apiKey: string,
+    workspaceId?: string | null,
+    /** 通信の時間切れ（ミリ秒）。テストで短くするためのもの */
+    private readonly timeoutMs: number = CLAUDE_TIMEOUT_MS,
+  ) {
     if (!apiKey?.startsWith('sk-ant-')) {
       throw new LlmError('APIキーの形式が不正',
         'Claude の API キーが正しく登録されていません。console.anthropic.com で発行したキー（sk-ant- で始まるもの）をご登録ください。', false);
@@ -81,6 +76,9 @@ export class AnthropicLlm {
   }
 
   private async call(model: string, system: string, user: string, maxTokens: number): Promise<MessagesResponse> {
+    const signal = AbortSignal.timeout(this.timeoutMs);
+    const timeoutError = (e: unknown) => new LlmError(`timeout after ${this.timeoutMs}ms: ${String(e)}`,
+      'Claude の応答に時間がかかりすぎたため、打ち切りました。', true, 0, 'timeout');
     let res: Response;
     try {
       res = await fetch(API, {
@@ -98,13 +96,19 @@ export class AnthropicLlm {
           system,
           messages: [{ role: 'user', content: user }],
         }),
+        signal,
       });
     } catch (e) {
+      if (isAbort(e) || signal.aborted) throw timeoutError(e);
       throw new LlmError(String(e), '記事の生成中に通信エラーが発生しました。', true, 0);
     }
 
     if (!res.ok) {
-      const body = await res.text();
+      let body: string;
+      try { body = await res.text(); } catch (e) {
+        if (isAbort(e) || signal.aborted) throw timeoutError(e);
+        body = String(e);
+      }
       if (res.status === 401) {
         throw new LlmError(body, 'Claude の API キーが無効です。console.anthropic.com でご確認ください。', false, res.status);
       }
@@ -143,7 +147,13 @@ export class AnthropicLlm {
         body, '記事の生成中にエラーが発生しました。', false, res.status);
     }
 
-    return res.json<MessagesResponse>();
+    // ★本文の受け取り中も時間切れの対象
+    try {
+      return await res.json<MessagesResponse>();
+    } catch (e) {
+      if (isAbort(e) || signal.aborted) throw timeoutError(e);
+      throw new LlmError(String(e), '記事の生成中に通信エラーが発生しました。', true, res.status);
+    }
   }
 
   /**
@@ -159,7 +169,7 @@ export class AnthropicLlm {
     maxRetries?: number;
     label: string;
   }): Promise<LlmResult<T>> {
-    const maxRetries = opts.maxRetries ?? 2;
+    const maxRetries = opts.maxRetries ?? DEFAULT_STRUCTURED_MAX_RETRIES;
     const usage: LlmUsage = { inputTokens: 0, outputTokens: 0 };
     let lastError = '';
 
@@ -201,19 +211,5 @@ export class AnthropicLlm {
 
     throw new LlmError(`${opts.label}: スキーマ検証に${maxRetries + 1}回失敗 — ${lastError}`,
       '記事の生成に失敗しました。もう一度お試しください。', true);
-  }
-}
-
-/** コードフェンスや前置きが混ざっても JSON を取り出す。 */
-export function extractJson(text: string): unknown {
-  const fence = /```(?:json)?\s*([\s\S]*?)```/.exec(text);
-  const candidate = fence ? fence[1] : text;
-  const start = candidate.indexOf('{');
-  const end = candidate.lastIndexOf('}');
-  if (start === -1 || end === -1) return null;
-  try {
-    return JSON.parse(candidate.slice(start, end + 1));
-  } catch {
-    return null;
   }
 }

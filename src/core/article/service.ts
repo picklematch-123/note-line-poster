@@ -7,20 +7,27 @@
 import { Db, type ArticleRow, DEFAULT_TENANT_ID } from '../../ports/storage/db';
 import { NoteClient, NoteApiError, type NoteSession } from '../../ports/publisher/note/client';
 import { toNoteHtml, plainLength } from '../../ports/publisher/note/html';
-import { AnthropicLlm, LlmError } from '../../ports/llm/anthropic';
+import { LlmError } from '../../ports/llm/types';
+import { createLlm, type LlmConfig } from '../../ports/llm';
 import { generate } from '../generation/pipeline';
 import { ensureContextUrls } from '../generation/context';
-import { canPublish, type PolicyDecision } from '../policy';
+import { parseResearch, researchForGeneration } from '../research/run';
+import { finalizeArticle } from '../research/finalize';
+import { findUnverifiedTerms, findMiscitedTerms, mergeVerifyResults } from '../research/verify';
+import { canPublish, nextJstMorning, type PolicyDecision, type PolicyContext } from '../policy';
 import { assertTransition } from './state';
-import { fill, normalize, parseHeadings, move, swap, remove } from './placeholders';
+import { parseHeadings, move, swap, remove, splitGeneratedPlaceholders, placeholderToken, type PlaceholderKind } from './placeholders';
+import { precheckArticleLinks, assertArticleHtmlLinks, DisallowedLinksError, listPlacedGeneratedImages, GENERATED_SLOT_OFFSET } from './links';
+import { composeArticleMarkdown, type GeneratedFill } from './compose';
+import { effectiveInlineCount, reuseGeneratedImages, deleteGeneratedSlot, syncGeneratedHeadings } from '../image/inline';
 import type { ImageStore } from '../../ports/storage/images';
 import { nowIso } from '../../lib/time';
 import { log } from '../../lib/mask';
 
 export interface ServiceDeps {
   db: Db;
-  llmApiKey: string;
-  llmWorkspaceId?: string | null;
+  /** 使う LLM の設定（Claude / OpenAI のどちらを使うかもここで決まる） */
+  llm: LlmConfig;
   noteSession: NoteSession;
   ownerLineUserId: string | null;
   /** 投稿者（持ち主と同じく承認できる）。渡さなければ持ち主だけ */
@@ -59,10 +66,12 @@ export async function generateArticle(deps: ServiceDeps, articleId: string): Pro
   await deps.db.setState(articleId, article.state, 'generating', 'system');
 
   const images = await deps.db.listImages(articleId);
+  // AI が作る文中画像の枚数（P3）。★既定0・OpenAI のキーが無ければ0（設定に関わらず）
+  const generatedCount = await effectiveInlineCount(deps.db, deps.llm.openaiKey);
   const style = await deps.db.getActiveStyleProfile(article.tenant_id);
   const context = await deps.db.getActiveContext(article.tenant_id);
 
-  const llm = new AnthropicLlm(deps.llmApiKey, deps.llmWorkspaceId);
+  const llm = createLlm(deps.llm);
   const hintKeywords = extractHintKeywords(article.source_text);
 
   // 修正指示は source_text に混ぜず、生成時にだけ足す。
@@ -72,19 +81,55 @@ export async function generateArticle(deps: ServiceDeps, articleId: string): Pro
       `※前回の記事はこの指示に沿って作り直してください。元のネタの意図は保つこと。`
     : article.source_text;
 
+  // Webリサーチの結果（Workflow の「記事を調べる」で保存済み）。無ければ今までどおり
+  const research = parseResearch(article.research_json);
+  const contextPrompt = ensureContextUrls(context?.raw_text ?? null, context?.prompt_snippet ?? null);
+
   const out = await generate(llm, {
     sourceText,
     hintKeywords,
-    imageCount: images.length,
+    // ★「写真 k 枚＋生成 m 枚」で、今までどおり [画像1]〜[画像k+m] を書かせる（見出しの選び方も今のまま）。
+    //   保存の直前に純関数で k+1 番目以降を [AI画像N] に書き換える（設計書 18-2）
+    imageCount: images.length + generatedCount,
     stylePrompt: style?.prompt_snippet ?? null,
     // ★以前に登録されたプロフィールでも URL が落ちないよう、読み出すたびに補う
-    contextPrompt: ensureContextUrls(context?.raw_text ?? null, context?.prompt_snippet ?? null),
+    contextPrompt,
+    research: researchForGeneration(research),
   });
 
+  // ★仕上げ（調査の有無に関わらず必ず通す）: 〔n〕の目印を出典の一覧に変え、
+  //   本人が書いたもの（ナレッジ・ネタ・修正指示）と検査済みの出典以外の URL を消す
+  const facts = research?.status === 'ok' ? research.facts : [];
+  const fin = finalizeArticle({
+    markdown: out.markdown,
+    facts,
+    trustedTexts: [context?.raw_text, article.source_text, article.revision_instruction],
+  });
+  // ★写真と AI 画像の目印を分ける（LLM を通さない）。以後 [画像N] は写真だけを指す
+  const bodyMd = splitGeneratedPlaceholders(fin.markdown, images.length);
+  // alt は写真の分（1..k）だけ残す。AI 画像の alt は指示文づくりで作り、images.alt_text に持つ
+  const imageAlts = Object.fromEntries(Object.entries(out.imageAlts)
+    .filter(([k]) => Number(k) >= 1 && Number(k) <= images.length));
+  // ★修正で作り直したときは、前回の AI 画像を使い回す（見出しが同じものはその画像、残りは順番どおり）。
+  //   足りない分だけ、この後の Workflow の step で新しく作る。余りは消す（二重課金を避ける・設計書 18-7）
+  await reuseGeneratedImages(deps.db, deps.images, articleId, bodyMd);
+
+  if (research) {
+    // 照合: 本文の数字・固有名詞が、事実メモ・ネタ・ナレッジのどれかにあるか（無ければプレビューで「要確認」）
+    const unsupported = findUnverifiedTerms(fin.body, [
+      ...facts.flatMap((f) => [f.claim, f.sourceTitle]),
+      article.source_text, article.revision_instruction, context?.raw_text, contextPrompt,
+    ]);
+    // 〔n〕を付けた文の数字・固有名詞は、メモ n にあること（出典の付け違い・中身のすり替えを拾う）
+    const check = mergeVerifyResults(unsupported, findMiscitedTerms(out.markdown, facts));
+    research.check = { usedIds: fin.usedIds, referenceCount: fin.referenceCount, flags: check.flags, total: check.total };
+  }
+
   await deps.db.updateArticle(articleId, {
+    ...(research ? { research_json: JSON.stringify(research) } : {}),
     title: out.title,
-    image_alts_json: JSON.stringify(out.imageAlts),
-    body_md: out.markdown,
+    image_alts_json: JSON.stringify(imageAlts),
+    body_md: bodyMd,
     meta_description: out.metaDescription,
     keywords_json: JSON.stringify(out.keywords),
     outline_json: JSON.stringify(out.outline),
@@ -93,11 +138,11 @@ export async function generateArticle(deps: ServiceDeps, articleId: string): Pro
     llm_output_tokens: out.usage.outputTokens,
   });
   await deps.db.setState(articleId, 'generating', 'preview_ready', 'system', {
-    見出し数: parseHeadings(out.markdown).length,
+    見出し数: parseHeadings(bodyMd).length,
   });
 
   const updated = (await deps.db.getArticle(articleId))!;
-  return { article: updated, charCount: out.markdown.replace(/\[画像\d+\]/g, '').length };
+  return { article: updated, charCount: bodyMd.replace(/\[(?:AI)?画像\d+\]/g, '').length };
 }
 
 /**
@@ -134,6 +179,9 @@ export async function saveArticleAsDraft(deps: ServiceDeps, articleId: string): 
       userMessage: 'システムメンテナンス中のため、いまは note に保存できません。',
     });
   }
+
+  // ★最後の関所（note に何かを送る前）。許可外のリンク先があれば下書きにもしない
+  await precheckArticleLinks(deps.db, a, 'draft');
 
   const client = new NoteClient(deps.noteSession);
   if (!(await client.isAlive())) {
@@ -172,9 +220,17 @@ export async function saveArticleAsDraft(deps: ServiceDeps, articleId: string): 
       await deps.db.setImageNoteUrl(images[i].id, up.url, i + 1);
     }
 
-    const md = normalize(a.body_md ?? '', images.length);
+    // AI が作った文中画像（P3）。写真・サムネと同じく note に上げてから [AI画像N] の位置に差し込む
+    const generated = await uploadGeneratedImages(deps, client, a, created.id);
+
     const alts: Record<string, string> = a.image_alts_json ? JSON.parse(a.image_alts_json) : {};
-    const html = toNoteHtml(fill(md, urls, alts));
+    const html = toNoteHtml(composeArticleMarkdown({
+      bodyMd: a.body_md ?? '', photoCount: images.length, photoUrls: urls, photoAlts: alts, generated,
+    }));
+    // ★送る直前の最終 HTML でも検査する（許可に足すのは、いま note に上げた画像の URL だけ）
+    await assertArticleHtmlLinks(deps.db, a, html, 'draft', {
+      imageUrls: [...Object.values(urls), ...Object.values(generated).map((g) => g.url)], stage: 'final',
+    });
 
     await client.saveDraft(created.id, {
       title: a.title ?? '無題',
@@ -195,6 +251,8 @@ export async function saveArticleAsDraft(deps: ServiceDeps, articleId: string): 
     log.info('note に下書き保存しました', { articleId });
     return { editUrl: `https://editor.note.com/notes/${created.key}/edit/` };
   } catch (e) {
+    // リンク検査で止めた場合は、後始末（状態・監査ログ）を済ませてある
+    if (e instanceof DisallowedLinksError) throw e;
     const recoverable = e instanceof NoteApiError && e.recoverable;
     if (recoverable) {
       await deps.db.setState(articleId, 'saving_draft', 'awaiting_session', 'system');
@@ -247,8 +305,20 @@ export async function checkPolicy(deps: ServiceDeps, articleId: string): Promise
   const a = await deps.db.getArticle(articleId);
   if (!a) throw new Error('記事が見つかりません');
   const tenant = await deps.db.ensureTenant(a.tenant_id);
+  let publishWait: PolicyContext['publishWait'];
+  if (a.state === 'blocked' || a.state === 'awaiting_session') {
+    const wait = await deps.db.getPublishWait(articleId);
+    if (wait) {
+      const detail = JSON.parse(wait.detail_json) as { reason: 'daily_limit' | 'too_soon'; retryAfter?: string };
+      // 修正前は理由だけを記録していた。日次上限なら記録日の翌朝9時を復元する。
+      const retryAfter = detail.retryAfter ?? (detail.reason === 'daily_limit' ? nextJstMorning(wait.created_at) : undefined);
+      if (retryAfter && Number.isFinite(new Date(retryAfter).getTime())) {
+        publishWait = { reason: detail.reason, retryAfter };
+      }
+    }
+  }
 
-  return canPublish({
+  const decision = canPublish({
     killSwitchOn: !(await deps.db.getFlag('publish_enabled')),
     tenant: {
       status: tenant.status,
@@ -266,7 +336,17 @@ export async function checkPolicy(deps: ServiceDeps, articleId: string): Promise
     globalLimitPerMinute: await deps.db.getNumberFlag('global_limit_per_minute', 3),
     // すでに note 上に記事があるなら、これは上書き更新
     isUpdate: Boolean(a.note_id),
+    publishWait,
   });
+  // Cronで予定時刻に上限へ再到達した場合は、新しい待機時刻を保存する。
+  // 未来の予定が残っている間は同じ記録を増やさず、翌日にずらさない。
+  if ((a.state === 'blocked' || a.state === 'awaiting_session')
+      && decision.retryAfter && decision.retryAfter !== publishWait?.retryAfter) {
+    await deps.db.logEvent(articleId, a.state, 'blocked', 'system', {
+      reason: decision.reason, retryAfter: decision.retryAfter,
+    });
+  }
+  return decision;
 }
 
 /**
@@ -280,6 +360,9 @@ export async function publishArticle(deps: ServiceDeps, articleId: string): Prom
   }
 
   const a = (await deps.db.getArticle(articleId))!;
+  // ★最後の関所（note に何かを送る前）。許可外のリンク先があれば公開しない
+  await precheckArticleLinks(deps.db, a, 'publish');
+
   const client = new NoteClient(deps.noteSession);
 
   // 投稿直前にセッションの生死を確認する（前日から失効している可能性がある）
@@ -321,9 +404,17 @@ export async function publishArticle(deps: ServiceDeps, articleId: string): Prom
       }
     }
 
-    const md = normalize(a.body_md ?? '', images.length);
+    // AI が作った文中画像（P3）。写真と同じく note に上げてから [AI画像N] の位置に差し込む
+    const generated = await uploadGeneratedImages(deps, client, a, created.id);
+
     const alts: Record<string, string> = a.image_alts_json ? JSON.parse(a.image_alts_json) : {};
-    const html = toNoteHtml(fill(md, urls, alts));
+    const html = toNoteHtml(composeArticleMarkdown({
+      bodyMd: a.body_md ?? '', photoCount: images.length, photoUrls: urls, photoAlts: alts, generated,
+    }));
+    // ★送る直前の最終 HTML でも検査する（許可に足すのは、いま note に上げた画像の URL だけ）
+    await assertArticleHtmlLinks(deps.db, a, html, 'publish', {
+      imageUrls: [...Object.values(urls), ...Object.values(generated).map((g) => g.url)], stage: 'final',
+    });
     const length = plainLength(html);
     const hashtags: string[] = a.hashtags_json ? JSON.parse(a.hashtags_json) : [];
 
@@ -354,6 +445,8 @@ export async function publishArticle(deps: ServiceDeps, articleId: string): Prom
     log.info(isUpdate ? 'note の記事を更新しました' : 'note へ公開しました', { articleId, url });
     return { url };
   } catch (e) {
+    // リンク検査で止めた場合は、後始末（状態・監査ログ）を済ませてある
+    if (e instanceof DisallowedLinksError) throw e;
     const recoverable = e instanceof NoteApiError && e.recoverable;
     await deps.db.updateArticle(articleId, {
       error_code: e instanceof NoteApiError ? e.code : 'unknown',
@@ -369,6 +462,26 @@ export async function publishArticle(deps: ServiceDeps, articleId: string): Prom
     });
     throw e;
   }
+}
+
+/**
+ * 本文に置かれている AI 文中画像を note に上げ、番号 → URL・alt を返す。
+ * ★本文に無い番号の画像（「AI画像2を消して」のあと）は上げない（使わない画像で note を散らかさない）
+ */
+async function uploadGeneratedImages(
+  deps: ServiceDeps, client: NoteClient, a: ArticleRow, noteId: number,
+): Promise<Record<number, GeneratedFill>> {
+  const out: Record<number, GeneratedFill> = {};
+  for (const row of await listPlacedGeneratedImages(deps.db, a)) {
+    const slot = row.gen_slot!;
+    const stored = await deps.images.get(row.r2_key);
+    if (!stored) continue;
+    const up = await client.uploadImage(
+      noteId, new Blob([stored.bytes], { type: stored.contentType }), `ai-image${slot}.png`);
+    out[slot] = { url: up.url, alt: row.alt_text };
+    await deps.db.setImageNoteUrl(row.id, up.url, GENERATED_SLOT_OFFSET + slot);
+  }
+  return out;
 }
 
 /** ポリシーで止められたことを示す例外。 */
@@ -412,32 +525,44 @@ export async function reviseImagePosition(
   op: { action: 'move'; index: number; headingIndex: number }
      | { action: 'swap'; a: number; b: number }
      | { action: 'remove'; index: number },
+  /** 写真（既定）か、AI が作った文中画像か。どちらも純関数で即時・課金なし */
+  kind: PlaceholderKind = 'photo',
 ): Promise<{ markdown: string; message: string }> {
   const a = await deps.db.getArticle(articleId);
   if (!a?.body_md) throw new Error('記事が見つかりません');
 
   let md = a.body_md;
   let message: string;
+  const t = (n: number) => placeholderToken(n, kind);
 
   switch (op.action) {
     case 'move': {
       const headings = parseHeadings(md);
-      md = move(md, op.index, op.headingIndex);
+      md = move(md, op.index, op.headingIndex, kind);
       const name = headings[Math.min(op.headingIndex, headings.length - 1)]?.text ?? '末尾';
-      message = `[画像${op.index}] を「${name}」の下に移動しました`;
+      message = `${t(op.index)} を「${name}」の下に移動しました`;
       break;
     }
     case 'swap':
-      md = swap(md, op.a, op.b);
-      message = `[画像${op.a}] と [画像${op.b}] を入れ替えました`;
+      md = swap(md, op.a, op.b, kind);
+      message = `${t(op.a)} と ${t(op.b)} を入れ替えました`;
       break;
     case 'remove':
-      md = remove(md, op.index);
-      message = `[画像${op.index}] を削除しました`;
+      md = remove(md, op.index, kind);
+      message = `${t(op.index)} を削除しました`;
       break;
   }
 
   await deps.db.updateArticle(articleId, { body_md: md });
+  if (kind === 'generated') {
+    if (op.action === 'remove') {
+      // ★消した AI 画像は行と置き場も消す。残すと次の書き直しで使い回され、黙って戻ってくる（源蔵レビュー P3 必須2）
+      await deleteGeneratedSlot(deps.db, deps.images, articleId, op.index);
+    } else {
+      // ★動かした番号の「作ったときの見出し」を今の位置に合わせる（誤警告・書き直しで元の位置へ戻るのを防ぐ）
+      await syncGeneratedHeadings(deps.db, articleId, md, op.action === 'move' ? [op.index] : [op.a, op.b]);
+    }
+  }
   return { markdown: md, message };
 }
 

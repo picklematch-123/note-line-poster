@@ -62,10 +62,23 @@ function autolink(s: string): string {
   return out + linkifyBare(s.slice(last));
 }
 
+/**
+ * 画像の差し込み（placeholders.ts の fill）が作った形の行か。
+ * ★この形だけを生の HTML のまま通す。`<figure>` で始まるだけの行を素通りさせていたため、
+ *   `<figure><a href="//evil.com/x">` のような行が、変換もエスケープもされずに公開されえた
+ *   （2026-10-24 源蔵レビュー必須1）。それ以外の生 HTML の行は、ふつうの文としてエスケープする。
+ */
+// src は画像の URL か、拡張が後で置き換える目印（core/agent/plan.ts の `{{imageN_url}}`）だけ
+const FILLED_FIGURE = /^<figure><img src="(?:https?:\/\/[^"<>\s]+|\{\{image\d+_url\}\})"(?: alt="[^"<>]*")?><\/figure>$/;
+
+export function isFilledFigure(line: string): boolean {
+  return FILLED_FIGURE.test(line.trim());
+}
+
 /** インライン記法（太字・リンク）を HTML にする。 */
 export function inline(src: string): string {
-  // すでに <figure><img> が埋め込まれている行はそのまま通す
-  if (/^\s*<figure>/.test(src)) return src.trim();
+  // fill が埋め込んだ画像の行だけはそのまま通す
+  if (isFilledFigure(src)) return src.trim();
 
   let s = escapeHtml(src);
   // [text](url)
@@ -102,8 +115,8 @@ function toBlocks(md: string): Block[] {
 
     if (line.trim() === '') { flush(); continue; }
 
-    // 埋め込み済みの figure（画像）はそのまま1ブロック
-    if (/^\s*<figure>/.test(line)) { flush(); blocks.push({ kind: 'raw', lines: [line.trim()] }); continue; }
+    // fill が埋め込んだ figure（画像）だけはそのまま1ブロック。それ以外の生 HTML は下の段落としてエスケープされる
+    if (isFilledFigure(line)) { flush(); blocks.push({ kind: 'raw', lines: [line.trim()] }); continue; }
 
     const h = /^(#{2,3})\s+(.+)$/.exec(line);
     if (h) { flush(); blocks.push({ kind: h[1].length === 2 ? 'h2' : 'h3', lines: [h[2].trim()] }); continue; }

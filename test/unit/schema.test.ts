@@ -156,8 +156,10 @@ describe('テナントを登録する経路', () => {
 
     const { name } = db.prepare('SELECT name FROM tenants WHERE id = ?')
       .get(DEFAULT_TENANT_ID) as { name: string };
-    expect(name).not.toContain('オーナー');
-    expect(name).not.toContain('最初の環境');
+    // ★個人名ではなく役割名（DEFAULT_TENANT_NAME）で始まること。
+    //   以前は「特定の名前を含まない」を名前の文字列で書いていたが、配布テンプレートの組み立てで
+    //   その名前が「オーナー」に置き換わり、配布物の側だけこのテストが落ちていた（2026-10 P4-1 で発見）
+    expect(name).toBe('オーナー');
     db.close();
   });
 });

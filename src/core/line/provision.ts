@@ -114,7 +114,7 @@ export async function provisionLine(
     const ok = await switchTo(token, kv, kind);
     steps.push(ok
       ? { label: 'メニューの作成', ok: true,
-          detail: kind === 'setup' ? 'セットアップ用（2ボタン）' : '通常（3ボタン）' }
+          detail: kind === 'setup' ? 'セットアップ用（2ボタン）' : '通常（6ボタン）' }
       : { label: 'メニューの作成', ok: false,
           detail: 'メニュー画像を取得できませんでした。文字を打てば操作はできます' });
   } catch (e) {

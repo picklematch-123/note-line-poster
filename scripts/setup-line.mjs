@@ -23,13 +23,14 @@ const DATA_API = 'https://api-data.line.me/v2/bot';
 // ★既定値は置かない。--url か WORKER_URL で必ず渡す。
 // 既定値を置くと、渡し忘れたときに他人の Worker へ Webhook を向けてしまう。
 const DEFAULT_URL = '';
-const RICHMENU_IMAGE = resolve(ROOT, 'assets/richmenu.png');
+// ★版付きの名前（v2）。旧名 assets/richmenu.png は古いコードのために旧デザインのまま残してある
+const RICHMENU_IMAGE = resolve(ROOT, 'assets/richmenu-v2.png');
 const RICHMENU_NAME = 'note-line-poster';
 
 /**
  * リッチメニューの定義は assets/richmenu.json に置く。
  * ★配布する全員でまったく同じメニューにするため、定義はここに書かない。
- *   画像（assets/richmenu.png）・この JSON・src/adapters/line/commands.ts の
+ *   画像（assets/richmenu-v2.png）・この JSON・src/adapters/line/commands.ts の
  *   3つが揃っていることは test/unit/richmenu.test.ts で担保している。
  */
 const RICHMENU = JSON.parse(readFileSync(resolve(ROOT, 'assets/richmenu.json'), 'utf8'));
@@ -156,11 +157,11 @@ async function setupRichMenu() {
 
   if (!existsSync(RICHMENU_IMAGE)) {
     warn(`画像がありません: ${RICHMENU_IMAGE}`);
-    warn('2500x843 / 1MB以下 の PNG を置いてから再実行してください。');
+    warn('2500x1686（通常）/ 2500x843（セットアップ用）・1MB以下 の PNG を置いてから再実行してください。');
     return;
   }
   const image = new Uint8Array(readFileSync(RICHMENU_IMAGE));
-  info(`画像: assets/richmenu.png（${(image.length / 1024).toFixed(0)} KB）`);
+  info(`画像: assets/richmenu-v2.png（${(image.length / 1024).toFixed(0)} KB）`);
   if (image.length > 1024 * 1024) {
     warn('画像が 1MB を超えています。LINE に弾かれます。');
     return;

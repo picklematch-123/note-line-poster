@@ -8,6 +8,8 @@ LINE_CHANNEL_SECRET=
 #   →「チャネルアクセストークン（長期）」の発行ボタンで出る値（200文字くらい）
 LINE_CHANNEL_ACCESS_TOKEN=
 
-# console.anthropic.com で発行するキー（sk-ant- で始まる）
-#   ※Pro / Max の個人プランは規約上使えません
-ANTHROPIC_API_KEY=
+# platform.openai.com →「API keys」で発行するキー（sk- で始まる）
+#   文章を書く・Webで調べる・画像を作る、のすべてにこのキー1つを使います
+#   ※先に前払いのクレジット（最低5ドル）を買ってください。自動チャージはオフのままを推奨します
+#   ※ChatGPT（Plus など）の月額プランとは別物です
+OPENAI_API_KEY=

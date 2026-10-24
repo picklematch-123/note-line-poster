@@ -4,8 +4,9 @@
  * 各ステップは独立して再試行できる。Workflows の step 単位に対応させることで、
  * 途中で失敗しても最初からやり直さない。
  */
-import { AnthropicLlm, type LlmUsage } from '../../ports/llm/anthropic';
+import type { Llm, LlmUsage } from '../../ports/llm/types';
 import * as P from './prompts';
+import type { ResearchPromptInput } from './prompts';
 import { KeywordAnalysis, Outline, BodyDraft, SeoPolish, StyleProfile, KnowledgeDigest } from './schema';
 import { normalize, parseHeadings } from '../article/placeholders';
 import { log } from '../../lib/mask';
@@ -18,6 +19,11 @@ export interface GenerationInput {
   stylePrompt?: string | null;
   /** 事業コンテキストの promptSnippet。★記事の中身を決める */
   contextPrompt?: string | null;
+  /**
+   * Webリサーチの結果（core/research）。未指定＝調査の仕組みが無い環境で、今までどおりの書き方。
+   * mode='given' のときは「ナレッジとネタに無い事実を足さない」を明記する。
+   */
+  research?: ResearchPromptInput | null;
 }
 
 export interface GenerationOutput {
@@ -39,32 +45,32 @@ const addUsage = (a: LlmUsage, b: LlmUsage): LlmUsage => ({
 });
 
 /** ステップ1: キーワード設計 */
-export async function analyzeKeywords(llm: AnthropicLlm, input: GenerationInput) {
+export async function analyzeKeywords(llm: Llm, input: GenerationInput) {
   return llm.structured({
     tier: 'heavy',
     label: 'キーワード分析',
     schema: KeywordAnalysis,
     maxTokens: 2000,
     system: P.analyzeKeywords.system,
-    user: P.analyzeKeywords.user(input.sourceText, input.hintKeywords, input.stylePrompt, input.contextPrompt),
+    user: P.analyzeKeywords.user(input.sourceText, input.hintKeywords, input.stylePrompt, input.contextPrompt, input.research),
   });
 }
 
 /** ステップ2: 構成 */
-export async function buildOutline(llm: AnthropicLlm, input: GenerationInput, kw: KeywordAnalysis) {
+export async function buildOutline(llm: Llm, input: GenerationInput, kw: KeywordAnalysis) {
   return llm.structured({
     tier: 'heavy',
     label: '構成作成',
     schema: Outline,
     maxTokens: 4000,
     system: P.buildOutline.system,
-    user: P.buildOutline.user(input.sourceText, kw, input.imageCount, input.stylePrompt, input.contextPrompt),
+    user: P.buildOutline.user(input.sourceText, kw, input.imageCount, input.stylePrompt, input.contextPrompt, input.research),
   });
 }
 
 /** ステップ3: 本文 */
 export async function writeBody(
-  llm: AnthropicLlm, input: GenerationInput, kw: KeywordAnalysis, outline: Outline,
+  llm: Llm, input: GenerationInput, kw: KeywordAnalysis, outline: Outline,
 ) {
   return llm.structured({
     tier: 'heavy',
@@ -72,13 +78,13 @@ export async function writeBody(
     schema: BodyDraft,
     maxTokens: 16000,
     system: P.writeBody.system,
-    user: P.writeBody.user(input.sourceText, kw, outline, input.imageCount, input.stylePrompt, input.contextPrompt),
+    user: P.writeBody.user(input.sourceText, kw, outline, input.imageCount, input.stylePrompt, input.contextPrompt, input.research),
   });
 }
 
 /** ステップ4: SEO仕上げ */
 export async function polishSeo(
-  llm: AnthropicLlm, input: GenerationInput, kw: KeywordAnalysis, markdown: string,
+  llm: Llm, input: GenerationInput, kw: KeywordAnalysis, markdown: string,
 ) {
   return llm.structured({
     tier: 'heavy',
@@ -86,12 +92,12 @@ export async function polishSeo(
     schema: SeoPolish,
     maxTokens: 8000,
     system: P.polishSeo.system,
-    user: P.polishSeo.user(markdown, kw, input.imageCount, input.stylePrompt, input.contextPrompt),
+    user: P.polishSeo.user(markdown, kw, input.imageCount, input.stylePrompt, input.contextPrompt, input.research),
   });
 }
 
 /** 4ステップを通しで実行する（Workflows を使わない経路・テスト用）。 */
-export async function generate(llm: AnthropicLlm, input: GenerationInput): Promise<GenerationOutput> {
+export async function generate(llm: Llm, input: GenerationInput): Promise<GenerationOutput> {
   let usage: LlmUsage = { inputTokens: 0, outputTokens: 0 };
 
   const kw = await analyzeKeywords(llm, input);
@@ -132,7 +138,7 @@ export async function generate(llm: AnthropicLlm, input: GenerationInput): Promi
 }
 
 /** 過去記事などから文体プロファイルを作る（ナレッジ機能）。 */
-export async function analyzeStyle(llm: AnthropicLlm, samples: string[]) {
+export async function analyzeStyle(llm: Llm, samples: string[]) {
   if (samples.length === 0) throw new Error('分析するサンプルがありません');
   return llm.structured({
     tier: 'heavy',
@@ -145,7 +151,7 @@ export async function analyzeStyle(llm: AnthropicLlm, samples: string[]) {
 }
 
 /** 本人が書いた自己紹介から、記事の前提条件を構造化する。 */
-export async function analyzeContext(llm: AnthropicLlm, rawText: string) {
+export async function analyzeContext(llm: Llm, rawText: string) {
   return llm.structured({
     tier: 'heavy',
     label: 'ナレッジの整理',

@@ -24,6 +24,26 @@ const DATA_API = 'https://api-data.line.me/v2/bot';
 /** 画像の取得先。配布リポジトリは Public なので鍵なしで読める */
 const RAW = 'https://raw.githubusercontent.com/e-pei/note-line-poster-template/main/assets';
 
+/**
+ * ★画像のファイル名には**版**を付ける（2026-10 P4-2 源蔵レビュー必須1）。
+ *   定義（assets/*.json）はコードに同梱されるが、画像は Public の main から取る。
+ *   同じ名前のまま中身を差し替えると、どちらかの順番で必ず壊れる:
+ *   ・新しいコードが先 → 古い画像（2500×843）を新しい定義（2500×1686）に載せて LINE に断られる
+ *   ・画像が先 → 古いコードの環境が、新しい画像を古い定義に載せて断られる
+ *   だから新旧は別の名前で並べて置く。旧名（richmenu.png / richmenu-setup.png）は
+ *   古いコードが参照し続けるので、**旧デザインのまま残す**（消さない・上書きしない）。
+ *   デザインを変えるときは v3 を足し、ここを書き換える。
+ */
+export const MENU_IMAGE_FILES = {
+  setup: 'richmenu-setup-v2.png',
+  normal: 'richmenu-v2.png',
+} as const;
+
+/** 画像の取得先 URL（テストで確かめられるように関数にしてある） */
+export function menuImageUrl(kind: MenuKind): string {
+  return `${RAW}/${MENU_IMAGE_FILES[kind]}`;
+}
+
 export type MenuKind = 'setup' | 'normal';
 
 interface MenuSpec {
@@ -34,8 +54,8 @@ interface MenuSpec {
 }
 
 const SPECS: Record<MenuKind, MenuSpec> = {
-  setup: { definition: SETUP_MENU, imageUrl: `${RAW}/richmenu-setup.png`, name: SETUP_MENU.name },
-  normal: { definition: NORMAL_MENU, imageUrl: `${RAW}/richmenu.png`, name: NORMAL_MENU.name },
+  setup: { definition: SETUP_MENU, imageUrl: menuImageUrl('setup'), name: SETUP_MENU.name },
+  normal: { definition: NORMAL_MENU, imageUrl: menuImageUrl('normal'), name: NORMAL_MENU.name },
 };
 
 const kvKey = (kind: MenuKind) => `richmenu:${kind}`;
