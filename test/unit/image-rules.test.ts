@@ -29,9 +29,11 @@ import {
   saveImageRules, getImageRules, addImageRef, deleteImageRef, checkRefUpload, sniffImageMime, normalizeRefName,
   loadReferenceImages, loadImageRulesSummary, titleClause,
   REFERENCE_CLAUSE, RULE_BODY_MAX, REF_MAX_BYTES, REF_MAX_COUNT,
+  refSubsets, pickRefSubset, selectRefs, refNamesClause, getRefRandom, setRefRandom, FLAG_REF_RANDOM,
+  validateImageSettingsBatch, applyImageSettingsBatch, BatchCountChanged, BatchWriteFailed,
 } from '../../src/core/image/rules';
 import { REQUIRED_COLUMNS } from '../../src/core/setup/schema-check';
-import { setupRouter, NEED_SETUP_FIRST } from '../../src/adapters/setup/router';
+import { setupRouter, NEED_SETUP_FIRST, checkBodySize, BODY_LIMITS } from '../../src/adapters/setup/router';
 import { issueSetupCode, SETUP_DONE_KV } from '../../src/core/setup/state';
 import { buildImageRulesSummary } from '../../src/adapters/line/messages/image-rules';
 import { buildAiSettings } from '../../src/adapters/line/messages/research';
@@ -606,10 +608,22 @@ async function runningEnv() {
   return { sqlite, db, kv, env: { DB: asD1(sqlite), KV: kv, LINE_CHANNEL_ACCESS_TOKEN: 'dummy', OPENAI_API_KEY: 'sk-openai-test' } };
 }
 
-const postForm = (env: unknown, path: string, body: Record<string, string>) =>
-  setupRouter.request(path, {
-    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(body).toString(),
+const postForm = (env: unknown, path: string, body: Record<string, string>) => {
+  const text = new URLSearchParams(body).toString();
+  return setupRouter.request(path, {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': String(Buffer.byteLength(text)) }, body: text,
   }, env);
+};
+
+/** ブラウザと同じく、送信の大きさ（Content-Length）を付けて multipart を送る */
+async function sizedRequest(path: string, init: { method: string; body: FormData }, env: unknown) {
+  const tmp = new Request(`http://localhost${path}`, { method: 'POST', body: init.body });
+  const buf = await tmp.arrayBuffer();
+  return setupRouter.request(path, {
+    method: 'POST', body: buf,
+    headers: { 'Content-Type': tmp.headers.get('content-type')!, 'Content-Length': String(buf.byteLength) },
+  }, env);
+}
 
 function uploadForm(fields: Record<string, string>, file?: { bytes: ArrayBuffer; type: string; name: string }): FormData {
   const f = new FormData();
@@ -657,13 +671,13 @@ describe('/setup の「画像のルール」', () => {
   it('★参考画像の追加: コード無しは 403 で何も置かない。正しいコードで追加・削除もコード必須', async () => {
     const { db, env, kv } = await runningEnv();
     const file = { bytes: PNG(), type: 'image/png', name: 'a.png' };
-    const denied = await setupRouter.request('/setup/image-refs', { method: 'POST', body: uploadForm({ name: 'A' }, file) }, env);
+    const denied = await sizedRequest('/setup/image-refs', { method: 'POST', body: uploadForm({ name: 'A' }, file) }, env);
     expect(denied.status).toBe(403);
     expect(await db.listImageRefs(DEFAULT_TENANT_ID)).toHaveLength(0);
     expect(Object.keys(kv.store).some((k) => k.startsWith('img:'))).toBe(false);
 
     const { display } = await issueSetupCode(kv);
-    const ok = await setupRouter.request('/setup/image-refs', { method: 'POST', body: uploadForm({ name: 'A', code: display }, file) }, env);
+    const ok = await sizedRequest('/setup/image-refs', { method: 'POST', body: uploadForm({ name: 'A', code: display }, file) }, env);
     expect(ok.status).toBe(200);
     const [ref] = await db.listImageRefs(DEFAULT_TENANT_ID);
     expect(ref).toMatchObject({ name: 'A', mime: 'image/png' });
@@ -678,13 +692,13 @@ describe('/setup の「画像のルール」', () => {
   it('★拡張子を偽った画像は、コードを使う前に断る（コードは残る）', async () => {
     const { db, env, kv } = await runningEnv();
     const { display } = await issueSetupCode(kv);
-    const res = await setupRouter.request('/setup/image-refs', {
+    const res = await sizedRequest('/setup/image-refs', {
       method: 'POST', body: uploadForm({ name: 'A', code: display }, { bytes: GIF(), type: 'image/png', name: 'fake.png' }),
     }, env);
     expect(res.status).toBe(400);
     expect(await db.listImageRefs(DEFAULT_TENANT_ID)).toHaveLength(0);
     // コードはまだ使える
-    const ok = await setupRouter.request('/setup/image-refs', {
+    const ok = await sizedRequest('/setup/image-refs', {
       method: 'POST', body: uploadForm({ name: 'A', code: display }, { bytes: PNG(), type: 'image/png', name: 'a.png' }),
     }, env);
     expect(ok.status).toBe(200);
@@ -845,7 +859,7 @@ describe('必須2: セットアップ前（コード無しで通る状態）は�
     expect(await r1.text()).toContain('先にセットアップを済ませてください');
     expect(await getImageRules(db, DEFAULT_TENANT_ID, 'thumbnail')).toBeNull();
 
-    const r2 = await setupRouter.request('/setup/image-refs', {
+    const r2 = await sizedRequest('/setup/image-refs', {
       method: 'POST', body: uploadForm({ name: 'A' }, { bytes: PNG(), type: 'image/png', name: 'a.png' }),
     }, env);
     expect(r2.status).toBe(403);
@@ -871,7 +885,7 @@ describe('必須2: セットアップ前（コード無しで通る状態）は�
   it('セットアップ済み＋正しいコードなら通る（3経路とも）', async () => {
     const { db, env, kv } = await runningEnv();
     expect((await postForm(env, '/setup/image-rules', { code: (await issueSetupCode(kv)).display, thumb_body: 'ルール' })).status).toBe(200);
-    expect((await setupRouter.request('/setup/image-refs', {
+    expect((await sizedRequest('/setup/image-refs', {
       method: 'POST', body: uploadForm({ name: 'A', code: (await issueSetupCode(kv)).display }, { bytes: PNG(), type: 'image/png', name: 'a.png' }),
     }, env)).status).toBe(200);
     const [ref] = await db.listImageRefs(DEFAULT_TENANT_ID);
@@ -952,5 +966,432 @@ describe('前倒し4〜7', () => {
     const s = JSON.stringify(buildThumbnailResult('a1', { status: 'created', altText: 'x' }));
     expect(s).toContain(`作成${MAX_PER_ARTICLE}回・画像${MAX_GENERATIONS_PER_ARTICLE}枚まで`);
     expect(s).not.toContain('合計3回');
+  });
+});
+
+
+// ── B. /setup の画像のルールを、1回のコードでまとめて保存（2026-10-27）──────────
+function batchForm(fields: Record<string, string | string[]>, files: Array<{ n: number; name: string; bytes: ArrayBuffer; type?: string }> = []): FormData {
+  const f = new FormData();
+  for (const [k, v] of Object.entries(fields)) for (const x of (Array.isArray(v) ? v : [v])) f.append(k, x);
+  for (const x of files) {
+    f.append(`ref_name_${x.n}`, x.name);
+    f.append(`ref_file_${x.n}`, new File([x.bytes], `r${x.n}.png`, { type: x.type ?? 'image/png' }));
+  }
+  // 選ばなかった欄（ブラウザは名前なし・0バイトで送ってくる）
+  for (let n = 1; n <= 3; n++) if (!files.some((x) => x.n === n)) f.append(`ref_file_${n}`, new File([], '', { type: 'application/octet-stream' }));
+  return f;
+}
+const postAll = (env: unknown, form: FormData) => sizedRequest('/setup/image-rules/all', { method: 'POST', body: form }, env);
+const hasImgKeys = (kv: { store: Record<string, unknown> }) => Object.keys(kv.store).some((k) => k.startsWith('img:'));
+
+describe('B. /setup の画像のルールを、1回のコードでまとめて保存', () => {
+  it('★1回のコードで、ルール2つ・題名・作り直し・キャラの使い方・参考画像の追加と削除が全部保存される。コードは1回きり', async () => {
+    const { db, env, kv } = await runningEnv();
+    const store = new (await import('../../src/ports/storage/images')).KvImageStore(kv);
+    await addImageRef(db, store, DEFAULT_TENANT_ID, { name: '古い画像', bytes: PNG(), by: 't' });
+    const [old] = await db.listImageRefs(DEFAULT_TENANT_ID);
+    const { display } = await issueSetupCode(kv);
+    const res = await postAll(env, batchForm({
+      code: display, thumb_body: 'サムネのルール', thumb_title_mode: 'title', thumb_inspect: '2',
+      inline_body: '挿絵のルール', ref_random: '1', delete_ref: old.id,
+    }, [{ n: 1, name: '主役（主役）', bytes: PNG() }, { n: 3, name: '相棒', bytes: JPEG(), type: 'image/jpeg' }]));
+    expect(res.status).toBe(200);
+    expect(await getImageRules(db, DEFAULT_TENANT_ID, 'thumbnail')).toMatchObject({ body: 'サムネのルール', titleMode: 'title', inspectRetries: 2 });
+    expect(await getImageRules(db, DEFAULT_TENANT_ID, 'inline')).toMatchObject({ body: '挿絵のルール' });
+    expect(await getRefRandom(db)).toBe(true);
+    const refs = await db.listImageRefs(DEFAULT_TENANT_ID);
+    expect(refs.map((r) => r.name)).toEqual(['主役（主役）', '相棒']);
+    expect(refs.find((r) => r.id === old.id)).toBeUndefined();
+    // コードは使い切り
+    expect((await postAll(env, batchForm({ code: display, thumb_body: '上書き' }))).status).toBe(403);
+    expect((await getImageRules(db, DEFAULT_TENANT_ID, 'thumbnail'))!.body).toBe('サムネのルール');
+  });
+
+  it('★検査に1つでも落ちたら、何も保存せず、コードも残る（ルールが長すぎる＋正しい画像）', async () => {
+    const { db, env, kv } = await runningEnv();
+    const { display } = await issueSetupCode(kv);
+    const bad = await postAll(env, batchForm({
+      code: display, thumb_body: 'あ'.repeat(RULE_BODY_MAX + 1), inline_body: '挿絵', ref_random: '1',
+    }, [{ n: 1, name: 'A', bytes: PNG() }]));
+    expect(bad.status).toBe(400);
+    expect(await bad.text()).toContain('確認コードはまだ使えます');
+    expect(await getImageRules(db, DEFAULT_TENANT_ID, 'thumbnail')).toBeNull();
+    expect(await getImageRules(db, DEFAULT_TENANT_ID, 'inline')).toBeNull();
+    expect(await db.listImageRefs(DEFAULT_TENANT_ID)).toHaveLength(0);
+    expect(await getRefRandom(db)).toBe(false);
+    expect(hasImgKeys(kv)).toBe(false);
+    // 同じコードで、直した内容が通る
+    expect((await postAll(env, batchForm({ code: display, thumb_body: '直した' }))).status).toBe(200);
+  });
+
+  it('参考画像3枚をまとめて追加できる', async () => {
+    const { db, env, kv } = await runningEnv();
+    const res = await postAll(env, batchForm({ code: (await issueSetupCode(kv)).display, ref_random: '0' },
+      [{ n: 1, name: 'A', bytes: PNG() }, { n: 2, name: 'B', bytes: JPEG(), type: 'image/jpeg' }, { n: 3, name: 'C', bytes: WEBP(), type: 'image/webp' }]));
+    expect(res.status).toBe(200);
+    expect((await db.listImageRefs(DEFAULT_TENANT_ID)).map((r) => [r.name, r.mime])).toEqual([['A', 'image/png'], ['B', 'image/jpeg'], ['C', 'image/webp']]);
+  });
+
+  it('★枚数超過・形式違い・大きさ超過は 400 で、何も保存しない（コードも使わない）', async () => {
+    const { db, env, kv } = await runningEnv();
+    const store = new (await import('../../src/ports/storage/images')).KvImageStore(kv);
+    await addImageRef(db, store, DEFAULT_TENANT_ID, { name: '既存1', bytes: PNG(), by: 't' });
+    await addImageRef(db, store, DEFAULT_TENANT_ID, { name: '既存2', bytes: PNG(), by: 't' });
+    const { display } = await issueSetupCode(kv);
+    const keysBefore = Object.keys(kv.store).length;   // コードの発行分を含めて数える（コードが消費されないことも見る）
+    const big = new Uint8Array(REF_MAX_BYTES + 10); big.set(new Uint8Array(PNG()), 0);
+    for (const [label, form] of [
+      ['枚数', batchForm({ code: display, thumb_body: 'x' }, [{ n: 1, name: 'A', bytes: PNG() }, { n: 2, name: 'B', bytes: PNG() }])],
+      ['形式', batchForm({ code: display, thumb_body: 'x' }, [{ n: 1, name: 'A', bytes: GIF() }])],
+      ['大きさ', batchForm({ code: display, thumb_body: 'x' }, [{ n: 1, name: 'A', bytes: big.buffer }])],
+    ] as const) {
+      const res = await postAll(env, form);
+      expect(res.status, label).toBe(400);
+      expect((await db.listImageRefs(DEFAULT_TENANT_ID)).length, label).toBe(2);
+      expect(await getImageRules(db, DEFAULT_TENANT_ID, 'thumbnail'), label).toBeNull();
+    }
+    expect(Object.keys(kv.store).length).toBe(keysBefore);
+    // 1枚消して1枚足すなら、3枚に収まるので通る（同じコードがまだ使える）
+    const [r1] = await db.listImageRefs(DEFAULT_TENANT_ID);
+    expect((await postAll(env, batchForm({ code: display, delete_ref: r1.id }, [{ n: 1, name: 'A', bytes: PNG() }, { n: 2, name: 'B', bytes: PNG() }]))).status).toBe(200);
+    expect(await db.listImageRefs(DEFAULT_TENANT_ID)).toHaveLength(3);
+  });
+
+  it('★コード無し・不正なコードは 403 で何も保存しない', async () => {
+    const { db, env, kv } = await runningEnv();
+    for (const code of [undefined, 'ZZZZ-9999']) {
+      const res = await postAll(env, batchForm({ ...(code ? { code } : {}), thumb_body: '悪意', ref_random: '1' }, [{ n: 1, name: 'A', bytes: PNG() }]));
+      expect(res.status).toBe(403);
+    }
+    expect(await getImageRules(db, DEFAULT_TENANT_ID, 'thumbnail')).toBeNull();
+    expect(await db.listImageRefs(DEFAULT_TENANT_ID)).toHaveLength(0);
+    expect(await getRefRandom(db)).toBe(false);
+    expect(hasImgKeys(kv)).toBe(false);
+  });
+
+  it('★初回（セットアップ前）は 403「先にセットアップを」で、何も保存しない', async () => {
+    const sqlite = migrate();
+    const db = new Db(asD1(sqlite));
+    await db.ensureTenant();
+    const kv = fakeKv();
+    const env = { DB: asD1(sqlite), KV: kv, LINE_CHANNEL_ACCESS_TOKEN: 'dummy', OPENAI_API_KEY: 'sk-openai-test' };
+    const res = await postAll(env, batchForm({ thumb_body: 'ルール' }, [{ n: 1, name: 'A', bytes: PNG() }]));
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain('先にセットアップを済ませてください');
+    expect(await db.listImageRefs(DEFAULT_TENANT_ID)).toHaveLength(0);
+  });
+
+  it('★書き込みの途中で失敗したら、足しかけた参考画像を取り消す（置き場と表の両方）', async () => {
+    const { db } = await setup();
+    const store = memStore();
+    let puts = 0;
+    const failing = { ...store, put: async (k: string, b: ArrayBuffer, t: string, o?: { persistent?: boolean }) => {
+      if (++puts === 2) throw new Error('置き場の不調');
+      return store.put(k, b, t, o);
+    } };
+    const v = validateImageSettingsBatch({ deleteIds: [], uploads: [{ name: 'A', bytes: PNG() }, { name: 'B', bytes: PNG() }], thumbBody: 'ルール' }, []);
+    expect(v.ok).toBe(true);
+    if (!v.ok) return;
+    await expect(applyImageSettingsBatch(db, failing, DEFAULT_TENANT_ID, v.batch, 't')).rejects.toThrow();
+    expect(await db.listImageRefs(DEFAULT_TENANT_ID)).toHaveLength(0);
+    expect(store.m.size).toBe(0);
+    expect(await getImageRules(db, DEFAULT_TENANT_ID, 'thumbnail')).toBeNull();   // ルールより前で止まった
+  });
+
+  it('画面はまとめて保存のフォームが中心。名前の例（役割）・コードの入手方法・本文を出さないことは今のまま', async () => {
+    const { db, env } = await runningEnv();
+    await saveImageRules(db, DEFAULT_TENANT_ID, 'thumbnail', { body: '社外秘の本文', by: 't' });
+    const html = await (await setupRouter.request('/setup', {}, env)).text();
+    expect(html).toContain('action="/setup/image-rules/all"');
+    expect(html).toContain('enctype="multipart/form-data"');
+    expect(html).toContain('（主役）');
+    expect(html).toContain('name="ref_random"');
+    expect(html).toContain('「セットアップ」</b> と送ると届きます');
+    expect(html).not.toContain('社外秘の本文');
+    expect(html).toMatch(/最大 約17〜20円/);
+  });
+});
+
+// ── C. 参考画像のランダム選択（2026-10-27）──────────────────────────
+/** 決まった順に値を返す乱数（テストで組を固定する） */
+const seq = (...vals: number[]) => { let i = 0; const f = () => vals[Math.min(i++, vals.length - 1)]; f.calls = () => i; return f; };
+
+describe('C. 参考画像のランダム選択', () => {
+  it('組は大きさ1または2。3枚なら6通り・2枚なら3通り・1枚なら1通り。どの組も選ばれうる', () => {
+    expect(refSubsets(3)).toEqual([[0], [1], [2], [0, 1], [0, 2], [1, 2]]);
+    expect(refSubsets(2)).toEqual([[0], [1], [0, 1]]);
+    expect(refSubsets(1)).toEqual([[0]]);
+    expect(pickRefSubset(0)).toEqual([]);
+    const seen = new Set<string>();
+    for (let k = 0; k < 6; k++) seen.add(JSON.stringify(pickRefSubset(3, () => (k + 0.5) / 6)));
+    expect(seen.size).toBe(6);
+    expect(selectRefs(['A', 'B', 'C'], () => 0.99)).toEqual(['B', 'C']);
+    expect(selectRefs(['A'], () => 0.7)).toEqual(['A']);
+  });
+
+  it('どの画像が誰かを書く文（名前は登録した文字列そのまま）', () => {
+    expect(refNamesClause(['主役', 'ライバル'])).toBe('参考画像は2枚。1枚目は「主役」、2枚目は「ライバル」。この画像に登場させるキャラクターは、この2人だけ。');
+    expect(refNamesClause(['主役'])).toContain('この1人だけ');
+  });
+
+  async function withRefs(n: number) {
+    const ctx = await setup();
+    for (const name of ['キャラA（主役）', 'キャラB（ライバル）', 'キャラC（親友）'].slice(0, n)) {
+      await addImageRef(ctx.db, ctx.images, DEFAULT_TENANT_ID, { name, bytes: PNG(), by: 't' });
+    }
+    return ctx;
+  }
+
+  it('★オフ（既定）なら従来どおり全部の参考画像を渡し、名前の文は足さない', async () => {
+    const { deps, article } = await withRefs(3);
+    const net = mockOpenAi();
+    expect((await ensureThumbnail({ ...deps, random: () => { throw new Error('呼ばれない'); } }, article.id)).status).toBe('created');
+    expect(net.edit[0].getAll('image[]')).toHaveLength(3);
+    expect(String(net.edit[0].get('prompt'))).not.toContain('枚目は');
+    expect(net.plans[0].input).not.toContain('この画像に登場させるキャラクター');
+  });
+
+  it('★オン: サムネは選んだ組だけを渡し、どの画像が誰かを指示に書く。指示文づくりにも名前を渡す', async () => {
+    const { deps, db, article } = await withRefs(3);
+    await setRefRandom(db, true, 't');
+    const net = mockOpenAi();
+    expect((await ensureThumbnail({ ...deps, random: () => 0.99 }, article.id)).status).toBe('created');   // 6通りの最後＝[B, C]
+    expect(net.edit[0].getAll('image[]')).toHaveLength(2);
+    const prompt = String(net.edit[0].get('prompt'));
+    expect(prompt).toContain('1枚目は「キャラB（ライバル）」、2枚目は「キャラC（親友）」');
+    expect(prompt).toContain(REFERENCE_CLAUSE);
+    expect(net.plans[0].input).toContain('この画像に登場させるキャラクター（この2人だけを描く）】キャラB（ライバル）、キャラC（親友）');
+    expect(net.plans[0].input).not.toContain('キャラA');
+  });
+
+  it('★検品のやり直しでも、最初に選んだ組を使い続ける（乱数は1回だけ使う）', async () => {
+    const { deps, db, article } = await withRefs(3);
+    await setRefRandom(db, true, 't');
+    await saveImageRules(db, DEFAULT_TENANT_ID, 'thumbnail', { inspectRetries: 2, by: 't' });
+    const net = mockOpenAi([{ pass: false, issues: ['手が崩れている'] }, { pass: true, issues: [] }]);
+    const rng = seq(0.1, 0.99, 0.5);
+    expect((await ensureThumbnail({ ...deps, random: rng }, article.id)).status).toBe('created');
+    expect(net.edit).toHaveLength(2);
+    for (const f of net.edit) {
+      expect(f.getAll('image[]')).toHaveLength(1);
+      expect(String(f.get('prompt'))).toContain('1枚目は「キャラA（主役）」');
+    }
+    expect(rng.calls()).toBe(1);
+  });
+
+  it('1枚・2枚の登録でも、その範囲で選ぶ', async () => {
+    const one = await withRefs(1);
+    await setRefRandom(one.db, true, 't');
+    let net = mockOpenAi();
+    await ensureThumbnail({ ...one.deps, random: () => 0.9 }, one.article.id);
+    expect(net.edit[0].getAll('image[]')).toHaveLength(1);
+    vi.restoreAllMocks();
+    const two = await withRefs(2);
+    await setRefRandom(two.db, true, 't');
+    net = mockOpenAi();
+    await ensureThumbnail({ ...two.deps, random: () => 0.9 }, two.article.id);   // 3通りの最後＝[A, B]
+    expect(net.edit[0].getAll('image[]')).toHaveLength(2);
+    expect(String(net.edit[0].get('prompt'))).toContain('1枚目は「キャラA（主役）」、2枚目は「キャラB（ライバル）」');
+  });
+
+  it('★文中画像も画像ごとに選ぶ。指示文づくりに画像ごとの登場キャラを渡し、描くときは選んだ組だけ', async () => {
+    const { deps, db, article } = await withRefs(3);
+    await setRefRandom(db, true, 't');
+    await db.updateArticle(article.id, { body_md: '## 見出し1\n本文\n[AI画像1]\n## 見出し2\n本文\n[AI画像2]\n' });
+    const net = mockOpenAi([], { plan: { images: [{ slot: 1, prompt: PLAN_PROMPT, altText: '挿絵1' }, { slot: 2, prompt: PLAN_PROMPT, altText: '挿絵2' }] } });
+    const plan = await prepareInlinePlan({ ...deps, random: seq(0.05, 0.75) }, article.id);   // slot1=[A]・slot2=[A, C]
+    expect(plan.status).toBe('ok');
+    if (plan.status !== 'ok') return;
+    expect(net.plans[0].input).toContain('- slot 1: キャラA（主役）');
+    expect(net.plans[0].input).toContain('- slot 2: キャラA（主役）、キャラC（親友）');
+    expect(plan.items[0].refIds).toHaveLength(1);
+    expect(plan.items[1].refIds).toHaveLength(2);
+    await ensureInlineImage(deps, article.id, plan.items[1]);
+    expect(net.edit[0].getAll('image[]')).toHaveLength(2);
+    expect(String(net.edit[0].get('prompt'))).toContain('1枚目は「キャラA（主役）」、2枚目は「キャラC（親友）」');
+  });
+
+  it('文中画像もオフなら従来どおり（refIds なし・全部渡す・名前の文なし）', async () => {
+    const { deps, db, article } = await withRefs(2);
+    await db.updateArticle(article.id, { body_md: '## 見出し1\n本文\n[AI画像1]\n' });
+    const net = mockOpenAi([], { plan: { images: [{ slot: 1, prompt: PLAN_PROMPT, altText: '挿絵' }] } });
+    const plan = await prepareInlinePlan(deps, article.id);
+    if (plan.status !== 'ok') throw new Error('plan');
+    expect(plan.items[0].refIds).toBeUndefined();
+    await ensureInlineImage(deps, article.id, plan.items[0]);
+    expect(net.edit[0].getAll('image[]')).toHaveLength(2);
+    expect(String(net.edit[0].get('prompt'))).toBe(`${PLAN_PROMPT}\n\n${REFERENCE_CLAUSE}`);
+  });
+
+  it('設定は system_flags の数値。読めないときは「オフ」', async () => {
+    const { db, sqlite } = await setup();
+    expect(await getRefRandom(db)).toBe(false);
+    await setRefRandom(db, true, 't');
+    expect((sqlite.prepare('SELECT value FROM system_flags WHERE key = ?').get(FLAG_REF_RANDOM) as { value: string }).value).toBe('1');
+    expect(await getRefRandom({ getNumberFlag: async () => { throw new Error('表が無い'); } } as unknown as Db)).toBe(false);
+  });
+});
+
+
+// ── 源蔵の追加レビュー（B・C）の対応（2026-10-27）──────────────────────
+/** 指定した SQL の run だけを失敗させる D1（それ以外は本物の sqlite） */
+function failingD1(sqlite: DatabaseSync, shouldFail: (sql: string, params: unknown[]) => boolean): D1Database {
+  const base = asD1(sqlite);
+  return { prepare(sql: string) {
+    const st = base.prepare(sql);
+    let params: unknown[] = [];
+    const api = {
+      bind(...v: unknown[]) { params = v; st.bind(...v); return api; },
+      first: <T>() => st.first<T>(),
+      all: <T>() => st.all<T>(),
+      async run() { if (shouldFail(sql, params)) throw new Error('D1 の不調（テスト）'); return st.run(); },
+    };
+    return api;
+  } } as unknown as D1Database;
+}
+
+describe('必須1: 送信の大きさの申告が無い・壊れている・大きすぎるときは、本文を読む前に断る', () => {
+  it('checkBodySize: 申告なし・数字でない・0以下は 411、上限超えは 413、正しければ null', () => {
+    expect(checkBodySize(undefined, 100)?.status).toBe(411);
+    expect(checkBodySize('abc', 100)?.status).toBe(411);
+    expect(checkBodySize('NaN', 100)?.status).toBe(411);
+    expect(checkBodySize('0', 100)?.status).toBe(411);
+    expect(checkBodySize('-5', 100)?.status).toBe(411);
+    expect(checkBodySize('1.5', 100)?.status).toBe(411);
+    expect(checkBodySize('101', 100)?.status).toBe(413);
+    expect(checkBodySize('100', 100)).toBeNull();
+  });
+
+  it('★4つの経路とも、申告なし／NaN／0／超過では本文を1バイトも読まずに断り、何も保存しない', async () => {
+    const { db, env, kv } = await runningEnv();
+    const { display } = await issueSetupCode(kv);
+    for (const [path, max] of [['/setup/image-rules/all', BODY_LIMITS.all], ['/setup/image-refs', BODY_LIMITS.refs],
+      ['/setup/image-rules', BODY_LIMITS.rules], ['/setup/image-refs/delete', BODY_LIMITS.refsDelete]] as const) {
+      for (const [len, want] of [[null, 411], ['abc', 411], ['0', 411], [String(max + 1), 413]] as const) {
+        let pulled = false;
+        const body = new ReadableStream({ pull(ctl) { pulled = true; ctl.enqueue(new TextEncoder().encode(`code=${display}&thumb_body=x`)); ctl.close(); } }, { highWaterMark: 0 });
+        const headers: Record<string, string> = { 'Content-Type': 'application/x-www-form-urlencoded' };
+        if (len !== null) headers['Content-Length'] = len;
+        const req = new Request(`http://localhost${path}`, { method: 'POST', body, headers, duplex: 'half' } as RequestInit);
+        const res = await setupRouter.request(req, undefined, env);
+        expect(res.status, `${path} ${len}`).toBe(want);
+        expect(pulled, `${path} ${len} で本文を読んだ`).toBe(false);
+      }
+    }
+    expect(await getImageRules(db, DEFAULT_TENANT_ID, 'thumbnail')).toBeNull();
+    // コードはまだ使える（本文を読んでいない＝コードも見ていない）
+    expect((await postForm(env, '/setup/image-rules', { code: display, thumb_body: 'ok' })).status).toBe(200);
+  });
+});
+
+describe('必須2・3: 書き込みの途中の失敗', () => {
+  async function batchEnv(shouldFail: (sql: string, params: unknown[]) => boolean) {
+    const sqlite = migrate();
+    const okDb = new Db(asD1(sqlite));
+    await okDb.ensureTenant();
+    const db = new Db(failingD1(sqlite, shouldFail));
+    return { sqlite, okDb, db, store: memStore() };
+  }
+  const valid = (input: Partial<Parameters<typeof validateImageSettingsBatch>[0]>, ids: string[] = []) => {
+    const v = validateImageSettingsBatch({ deleteIds: [], uploads: [], ...input }, ids);
+    if (!v.ok) throw new Error(v.errors.join());
+    return v.batch;
+  };
+
+  it('★ルール段の失敗（サムネ用を保存した直後に文中画像用で失敗）: サムネ用ルール・足した画像・設定がすべて元に戻る', async () => {
+    let armed = true;
+    const { okDb, db, store } = await batchEnv((sql, p) => armed && sql.includes('INSERT INTO image_rules') && p[1] === 'inline');
+    await saveImageRules(okDb, DEFAULT_TENANT_ID, 'thumbnail', { body: '前のサムネ用ルール', titleMode: 'none', inspectRetries: 1, by: 't' });
+    const batch = valid({ thumbBody: '新しいサムネ用ルール', thumbTitleMode: 'title', inlineBody: '新しい挿絵ルール', refRandom: '1', uploads: [{ name: 'A', bytes: PNG() }] });
+    const err = await applyImageSettingsBatch(db, store, DEFAULT_TENANT_ID, batch, 't').catch((e) => e);
+    armed = false;
+    expect(err).toBeInstanceOf(BatchWriteFailed);
+    expect((err as BatchWriteFailed).rollbackFailed).toEqual([]);
+    expect(await getImageRules(okDb, DEFAULT_TENANT_ID, 'thumbnail')).toMatchObject({ body: '前のサムネ用ルール', titleMode: 'none', inspectRetries: 1 });
+    expect(await getImageRules(okDb, DEFAULT_TENANT_ID, 'inline')).toBeNull();
+    expect(await okDb.listImageRefs(DEFAULT_TENANT_ID)).toHaveLength(0);
+    expect(store.m.size).toBe(0);
+    expect(await getRefRandom(okDb)).toBe(false);
+  });
+
+  it('★監査段の失敗（設定を保存したあと）: image_ref_random も元に戻る（前の値が 0 でも、無い状態でも）', async () => {
+    const { sqlite, okDb, db, store } = await batchEnv((sql, p) => sql.includes('INSERT INTO audit_logs') && p[2] === 'image_ref.added');
+    const batch = valid({ thumbBody: 'ルール', refRandom: '1', uploads: [{ name: 'A', bytes: PNG() }] });
+    const err = await applyImageSettingsBatch(db, store, DEFAULT_TENANT_ID, batch, 't').catch((e) => e);
+    expect(err).toBeInstanceOf(BatchWriteFailed);
+    expect(await getRefRandom(okDb)).toBe(false);
+    expect(sqlite.prepare('SELECT COUNT(*) c FROM system_flags WHERE key = ?').get(FLAG_REF_RANDOM)).toEqual({ c: 0 });
+    expect(await getImageRules(okDb, DEFAULT_TENANT_ID, 'thumbnail')).toBeNull();
+    expect(await okDb.listImageRefs(DEFAULT_TENANT_ID)).toHaveLength(0);
+
+    // 前の値が「0」の行として残っていた場合も、0 に戻る
+    await setRefRandom(okDb, false, 't');
+    await applyImageSettingsBatch(db, store, DEFAULT_TENANT_ID, valid({ refRandom: '1', uploads: [{ name: 'B', bytes: PNG() }] }), 't').catch(() => {});
+    expect((sqlite.prepare('SELECT value FROM system_flags WHERE key = ?').get(FLAG_REF_RANDOM) as { value: string }).value).toBe('0');
+  });
+
+  it('★戻す処理まで失敗したら、戻せなかった項目を返す（握りつぶさない）', async () => {
+    const { db, store } = await batchEnv((sql, p) => (sql.includes('INSERT INTO image_rules') && p[1] === 'inline')
+      || sql.startsWith('DELETE FROM image_refs'));
+    const err = await applyImageSettingsBatch(db, store, DEFAULT_TENANT_ID,
+      valid({ inlineBody: '挿絵', uploads: [{ name: 'A', bytes: PNG() }] }), 't').catch((e) => e);
+    expect(err).toBeInstanceOf(BatchWriteFailed);
+    expect((err as BatchWriteFailed).rollbackFailed).toContain('追加した参考画像');
+  });
+
+  it('★削除段の失敗: ほかは保存済みのまま、消せなかった枚数を返す。画面は 200 で「保存しました（N枚は消せませんでした）」', async () => {
+    const sqlite = migrate();
+    const okDb = new Db(asD1(sqlite));
+    await okDb.ensureTenant();
+    const kv = fakeKv({ [SETUP_DONE_KV]: new Date().toISOString() });
+    const store = new (await import('../../src/ports/storage/images')).KvImageStore(kv);
+    await addImageRef(okDb, store, DEFAULT_TENANT_ID, { name: '消す画像', bytes: PNG(), by: 't' });
+    const [old] = await okDb.listImageRefs(DEFAULT_TENANT_ID);
+    const env = { DB: failingD1(sqlite, (sql) => sql.startsWith('DELETE FROM image_refs')), KV: kv, LINE_CHANNEL_ACCESS_TOKEN: 'dummy', OPENAI_API_KEY: 'sk-openai-test' };
+    const res = await postAll(env, batchForm({ code: (await issueSetupCode(kv)).display, thumb_body: '保存されるルール', delete_ref: old.id },
+      [{ n: 1, name: '足す画像', bytes: PNG() }]));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('保存しました（1 枚は消せませんでした');
+    expect(html).not.toContain('取り消しました');
+    expect((await getImageRules(okDb, DEFAULT_TENANT_ID, 'thumbnail'))!.body).toBe('保存されるルール');
+    expect((await okDb.listImageRefs(DEFAULT_TENANT_ID)).map((r) => r.name)).toEqual(['消す画像', '足す画像']);
+  });
+
+  it('画面: 途中で失敗したときは 500 で「何も保存していません」（事実と一致）', async () => {
+    const sqlite = migrate();
+    const okDb = new Db(asD1(sqlite));
+    await okDb.ensureTenant();
+    const kv = fakeKv({ [SETUP_DONE_KV]: new Date().toISOString() });
+    const env = { DB: failingD1(sqlite, (sql, p) => sql.includes('INSERT INTO image_rules') && p[1] === 'inline'), KV: kv, LINE_CHANNEL_ACCESS_TOKEN: 'dummy', OPENAI_API_KEY: 'sk-openai-test' };
+    const res = await postAll(env, batchForm({ code: (await issueSetupCode(kv)).display, thumb_body: 'サムネ', inline_body: '挿絵' }, [{ n: 1, name: 'A', bytes: PNG() }]));
+    expect(res.status).toBe(500);
+    expect(await res.text()).toContain('何も保存していません');
+    expect(await getImageRules(okDb, DEFAULT_TENANT_ID, 'thumbnail')).toBeNull();
+    expect(await okDb.listImageRefs(DEFAULT_TENANT_ID)).toHaveLength(0);
+    expect(Object.keys(kv.store).some((k) => k.startsWith('img:'))).toBe(false);
+  });
+});
+
+describe('前倒し4・5', () => {
+  it('★4: 書く直前に枚数を数え直す（検査のあとに別の保存で増えていたら、何も書かずに止める）', async () => {
+    const { db, images } = await setup();
+    const batch = (() => {
+      const v = validateImageSettingsBatch({ deleteIds: [], uploads: [{ name: 'X', bytes: PNG() }, { name: 'Y', bytes: PNG() }], thumbBody: 'ルール' }, []);
+      if (!v.ok) throw new Error('検査'); return v.batch;
+    })();
+    // 検査のあとに、同時に別の保存で2枚入った
+    await addImageRef(db, images, DEFAULT_TENANT_ID, { name: 'A', bytes: PNG(), by: 't' });
+    await addImageRef(db, images, DEFAULT_TENANT_ID, { name: 'B', bytes: PNG(), by: 't' });
+    await expect(applyImageSettingsBatch(db, images, DEFAULT_TENANT_ID, batch, 't')).rejects.toBeInstanceOf(BatchCountChanged);
+    expect(await db.listImageRefs(DEFAULT_TENANT_ID)).toHaveLength(2);
+    expect(await getImageRules(db, DEFAULT_TENANT_ID, 'thumbnail')).toBeNull();
+  });
+
+  it('5: 参考画像の名前から「」を取り除く（40字のまま）', () => {
+    expect(normalizeRefName('主役」。ほかの指示「')).toBe('主役。ほかの指示');
+    expect(normalizeRefName('あ'.repeat(50))).toHaveLength(40);
+    expect(refNamesClause([normalizeRefName('A」B')])).toContain('1枚目は「AB」');
   });
 });

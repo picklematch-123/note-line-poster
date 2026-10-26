@@ -32,6 +32,7 @@ import { ImageGenError, OpenAiImageClient } from '../../ports/image/openai';
 import type { GeneratedImage, ImageGenerator } from '../../ports/image/types';
 import {
   getImageRules, loadReferenceImages, REFERENCE_CLAUSE, titleClause, type TitleMode,
+  getRefRandom, selectRefs, refNamesClause,
 } from './rules';
 import { jstDate } from '../../lib/time';
 import { newId } from '../../lib/id';
@@ -149,6 +150,13 @@ export interface PlanInput {
   rules?: string | null;
   /** 参考画像の名前（キャラクター名など）。無ければ省く */
   refNames?: string[];
+  /** true = refNames は「この画像に登場させるキャラクター」（参考画像のランダム選択で選んだ組） */
+  cast?: boolean;
+}
+
+/** ランダム選択のとき、指示文づくりに足す1行（名前は顧客が登録した文字列そのまま） */
+export function castLine(names: string[]): string {
+  return `【この画像に登場させるキャラクター（この${names.length === 1 ? '1人' : `${names.length}人`}だけを描く）】${names.join('、')}`;
 }
 
 export function buildPlanUser(i: PlanInput): string {
@@ -160,6 +168,7 @@ export function buildPlanUser(i: PlanInput): string {
     i.knowledge ? `【ナレッジ（この人の立場・避けること・画風の指定）】\n${i.knowledge.slice(0, 3000)}` : '',
     i.rules ? `【この顧客の画像ルール（最優先）】\n${i.rules}` : '',
     i.refNames?.length ? `【参考画像のキャラクター】${i.refNames.join('、')}` : '',
+    i.cast && i.refNames?.length ? castLine(i.refNames) : '',
   ].filter(Boolean).join('\n\n');
 }
 
@@ -183,10 +192,13 @@ export async function planThumbnail(llm: Llm, input: PlanInput, mode: { titleMod
  */
 export function composeThumbPrompt(o: {
   planPrompt: string; titleMode: TitleMode; title: string; hasRefs: boolean; feedback?: string[];
+  /** ランダム選択のとき、渡す参考画像の名前（並びは画像の順）。どの画像が誰かを指示に書く */
+  refNames?: string[];
 }): string {
   const parts = [o.planPrompt];
   if (o.titleMode === 'title' && o.title.trim()) parts.push(titleClause(o.title));
   if (o.hasRefs) parts.push(REFERENCE_CLAUSE);
+  if (o.hasRefs && o.refNames?.length) parts.push(refNamesClause(o.refNames));
   if (o.feedback?.length) {
     parts.push(`前回の画像の問題点（必ず直す）: ${o.feedback.slice(0, 5).map((f) => f.replace(/\s+/g, ' ').slice(0, 120)).join(' / ')}`);
   }
@@ -336,6 +348,8 @@ export interface ThumbnailDeps {
   generator?: ImageGenerator;
   /** いまの時刻（ミリ秒）。テストで経過時間を進めるためのもの */
   now?: () => number;
+  /** 参考画像のランダム選択に使う乱数（0 以上 1 未満）。テストで固定するためのもの */
+  random?: () => number;
 }
 
 export const NOTE_NO_KEY =
@@ -388,7 +402,10 @@ export async function ensureThumbnail(
 
     // 0. 画像のルール・参考画像（★登録が無ければ null / 空。今までと同じ作り方になる）
     const rules = await getImageRules(db, article.tenant_id, 'thumbnail');
-    const refs = await loadReferenceImages(db, deps.images, article.tenant_id);
+    let refs = await loadReferenceImages(db, deps.images, article.tenant_id);
+    // ★ランダム選択: この実行で使う組を1回だけ選ぶ。検品のやり直しでも同じ組を使い続ける（登場キャラが変わって検品がぶれないように）
+    const refRandom = refs.length > 0 && await getRefRandom(db);
+    if (refRandom) refs = selectRefs(refs, deps.random ?? Math.random);
     const titleMode: TitleMode = rules?.titleMode ?? 'none';
     const inspectOn = Boolean(rules) && (rules!.inspectRetries > 0 || titleMode === 'title');
     const maxAttempts = 1 + (inspectOn ? rules!.inspectRetries : 0);
@@ -408,6 +425,7 @@ export async function ensureThumbnail(
       knowledge: context ? (context.prompt_snippet ?? context.raw_text) : null,
       rules: rules?.body || null,
       refNames: refs.length ? refs.map((r) => r.name) : undefined,
+      cast: refRandom,
     }, { titleMode });
 
     // 指示文づくりだけで時間を使い切った（文章の通信が遅い）なら、描かずに終える（課金も実行の記録もしない）
@@ -432,7 +450,10 @@ export async function ensureThumbnail(
         // ★時間がかかりすぎたら次の1枚は作らない（step の時間切れで、記事ごと止まらないように）
         if (now() - startedAt > THUMB_RUN_BUDGET_MS) { stopped = 'time'; break; }
       }
-      const prompt = composeThumbPrompt({ planPrompt: plan.data.prompt, titleMode, title, hasRefs: refs.length > 0, feedback });
+      const prompt = composeThumbPrompt({
+        planPrompt: plan.data.prompt, titleMode, title, hasRefs: refs.length > 0, feedback,
+        refNames: refRandom ? refs.map((r) => r.name) : undefined,
+      });
       await db.audit(article.tenant_id, AUDIT_RESERVED, 'system', articleId, 'ok', { run: runId, attempt });
       attempts++;
       const img = refs.length ? await generator.edit(prompt, refs) : await generator.generate(prompt);
@@ -484,7 +505,7 @@ export async function ensureThumbnail(
       .run();
     await db.audit(article.tenant_id, AUDIT_ACTION, 'system', articleId, 'ok', {
       size: img.size, bytes: img.bytes.byteLength, usage: img.usage,
-      run: runId, attempt: adopted.attempt, inspected: adopted.inspected, refs: refs.length,
+      run: runId, attempt: adopted.attempt, inspected: adopted.inspected, refs: refs.length, refRandom,
     });
     return { status: 'created', altText: plan.data.altText };
   } catch (e) {

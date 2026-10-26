@@ -25,7 +25,7 @@ import { LlmError, type Llm } from '../../ports/llm/types';
 import { createLlm, type LlmConfig } from '../../ports/llm';
 import { ImageGenError, OpenAiImageClient, THUMBNAIL_SIZE, type ImageErrorKind } from '../../ports/image/openai';
 import type { ImageGenerator } from '../../ports/image/types';
-import { getImageRules, listImageRefs, loadReferenceImages, REFERENCE_CLAUSE, REF_MAX_COUNT, type LoadedRef } from './rules';
+import { getImageRules, listImageRefs, loadReferenceImages, REFERENCE_CLAUSE, REF_MAX_COUNT, type LoadedRef, getRefRandom, selectRefs, refNamesClause } from './rules';
 import { RULES_PRIORITY_SYSTEM, REFS_SYSTEM } from './thumbnail';
 import { parse, parseHeadings } from '../article/placeholders';
 import { jstDate } from '../../lib/time';
@@ -314,6 +314,8 @@ export interface InlinePlanInput {
   rules?: string | null;
   /** 参考画像の名前（キャラクター名など）。無ければ省く */
   refNames?: string[];
+  /** ランダム選択のとき、画像（slot）ごとに登場させるキャラクターの名前 */
+  castBySlot?: Record<number, string[]>;
 }
 
 export function buildInlinePlanUser(i: InlinePlanInput): string {
@@ -324,6 +326,10 @@ export function buildInlinePlanUser(i: InlinePlanInput): string {
     i.knowledge ? `【ナレッジ（この人の立場・避けること・画風の指定）】\n${i.knowledge.slice(0, 3000)}` : '',
     i.rules ? `【この顧客の画像ルール（最優先）】\n${i.rules}` : '',
     i.refNames?.length ? `【参考画像のキャラクター】${i.refNames.join('、')}` : '',
+    i.castBySlot && Object.keys(i.castBySlot).length
+      ? `【画像ごとに登場させるキャラクター（その画像には、この人たちだけを描く）】\n${Object.entries(i.castBySlot)
+        .map(([slot, names]) => `- slot ${slot}: ${names.join('、')}`).join('\n')}`
+      : '',
   ].filter(Boolean).join('\n\n');
 }
 
@@ -402,9 +408,15 @@ export interface InlineDeps {
   openaiKey?: string | null;
   /** 画像を作る口（テスト用の差し替え）。省略時は OpenAI（gpt-image-2） */
   generator?: ImageGenerator;
+  /** 参考画像のランダム選択に使う乱数（0 以上 1 未満）。テストで固定するためのもの */
+  random?: () => number;
 }
 
-export interface InlinePlanItem { slot: number; heading: string | null; prompt: string; altText: string }
+export interface InlinePlanItem {
+  slot: number; heading: string | null; prompt: string; altText: string;
+  /** ランダム選択のとき、この画像に使う参考画像の id（並びは画像の順）。無ければ登録した参考画像を全部使う */
+  refIds?: string[];
+}
 
 export type InlinePlanOutcome =
   | { status: 'ok'; items: InlinePlanItem[]; notes: string[] }
@@ -444,7 +456,16 @@ export async function prepareInlinePlan(
     // ★登録が無ければ null / 空（今までと同じ指示文になる）
     const rules = await getImageRules(db, article.tenant_id, 'inline');
     // 指示文づくりに要るのは名前だけ（画像そのものは読まない。置き場から読むのは描くときの1回だけ）
-    const refNames = (await listImageRefs(db, article.tenant_id)).slice(0, REF_MAX_COUNT).map((r) => r.name);
+    const refRows = (await listImageRefs(db, article.tenant_id)).slice(0, REF_MAX_COUNT);
+    const refNames = refRows.map((r) => r.name);
+    // ★ランダム選択: 画像ごとに組を選ぶ（指示文づくりの前に選び、名前を渡して場面に合わせて描かせる）
+    const castIds = new Map<number, string[]>();
+    if (refRows.length && await getRefRandom(db)) {
+      for (const t of targets) castIds.set(t.slot, selectRefs(refRows, deps.random ?? Math.random).map((r) => r.id));
+    }
+    const nameOf = (id: string) => refRows.find((r) => r.id === id)?.name ?? '';
+    const castBySlot = castIds.size
+      ? Object.fromEntries([...castIds].map(([slot, ids]) => [slot, ids.map(nameOf)])) : undefined;
     const llm = createLlm(deps.llm);
     const { data } = await planInlineImages(llm, {
       title: article.title ?? '',
@@ -452,12 +473,18 @@ export async function prepareInlinePlan(
       knowledge: context ? (context.prompt_snippet ?? context.raw_text) : null,
       rules: rules?.body || null,
       refNames: refNames.length ? refNames : undefined,
+      castBySlot,
     });
     const byslot = new Map(data.images.map((x) => [x.slot, x]));
     const items: InlinePlanItem[] = [];
     for (const t of targets) {
       const p = byslot.get(t.slot);
-      if (p) items.push({ slot: t.slot, heading: t.heading, prompt: p.prompt, altText: p.altText.slice(0, 80) });
+      if (p) {
+        items.push({
+          slot: t.slot, heading: t.heading, prompt: p.prompt, altText: p.altText.slice(0, 80),
+          ...(castIds.has(t.slot) ? { refIds: castIds.get(t.slot)! } : {}),
+        });
+      }
     }
     const lacking = targets.length - items.length;
     return { status: 'ok', items, notes: lacking > 0 ? [`${lacking}枚分の指示文を作れませんでした`] : [] };
@@ -508,13 +535,20 @@ export async function ensureInlineImage(
     }
 
     // 参考画像（サムネと共有）。あれば images/edits、無ければ従来どおり
-    const refs = opts.refs ?? await loadReferenceImages(db, deps.images, article.tenant_id);
+    const loaded = opts.refs ?? await loadReferenceImages(db, deps.images, article.tenant_id);
+    // ★ランダム選択のときは、指示文づくりで選んだ組だけを使う（並びも選んだ順）。
+    //   選んだ画像がその後に消されていたら、残った分だけで描く
+    const refs = item.refIds
+      ? item.refIds.map((id) => loaded.find((r) => r.id === id)).filter((r): r is LoadedRef => Boolean(r))
+      : loaded;
+    const editPrompt = [item.prompt, REFERENCE_CLAUSE, item.refIds ? refNamesClause(refs.map((r) => r.name)) : '']
+      .filter(Boolean).join('\n\n');
 
     // 描く（課金はここ）。★直前に予約として数える。この後に失敗しても取り消さない
     const client = deps.generator ?? new OpenAiImageClient(deps.openaiKey!);
     await db.audit(article.tenant_id, AUDIT_INLINE_RESERVED, 'system', articleId, 'ok', { slot });
     const img = refs.length
-      ? await client.edit(`${item.prompt}\n\n${REFERENCE_CLAUSE}`, refs, INLINE_IMAGE_SIZE)
+      ? await client.edit(editPrompt, refs, INLINE_IMAGE_SIZE)
       : await client.generate(item.prompt, INLINE_IMAGE_SIZE);
 
     // ★置き場の名前は一意のIDで作る（サムネと同じ理由。同名で前の画像を消す事故を防ぐ）

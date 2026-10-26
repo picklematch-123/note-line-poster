@@ -144,7 +144,8 @@ export function sniffImageMime(bytes: ArrayBuffer | Uint8Array): RefMime | null 
 
 /** 名前を整える（制御文字・山かっこを落とし、短くする）。空なら既定の名前 */
 export function normalizeRefName(v: unknown, fallback = '参考画像'): string {
-  const s = typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f<>]/g, '').trim() : '';
+  // ★かぎかっこも落とす（指示文の「…」を閉じて、別の指示を差し込めないように）
+  const s = typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f<>「」]/g, '').trim() : '';
   return (s || fallback).slice(0, REF_NAME_MAX);
 }
 
@@ -213,7 +214,7 @@ export async function deleteImageRef(db: Db, images: ImageStore, tenantId: strin
   return true;
 }
 
-export interface LoadedRef extends ReferenceImage { name: string }
+export interface LoadedRef extends ReferenceImage { id: string; name: string }
 
 /**
  * 画像づくりに渡す参考画像を読む（最大3枚）。置き場から消えていたもの・形式が読めないものは飛ばす。
@@ -227,7 +228,7 @@ export async function loadReferenceImages(db: Db, images: ImageStore, tenantId: 
       if (!got) continue;
       const mime = sniffImageMime(got.bytes);
       if (!mime) continue;
-      out.push({ bytes: got.bytes, mime, name: r.name });
+      out.push({ id: r.id, bytes: got.bytes, mime, name: r.name });
     } catch { /* 1枚読めなくても続ける */ }
   }
   return out;
@@ -243,18 +244,249 @@ export function titleClause(title: string): string {
   return `画像の中に、次の文字列を一字一句そのまま描く: 「${t}」。ほかの文字は入れない。`;
 }
 
+// ── 参考画像のランダム選択（2026-10-27）─────────────────────
+/**
+ * 「記事ごとに、登録したキャラクターからランダムに選んで使う」設定。system_flags の数値（0/1）。
+ * ★既定 0（今までどおり、登録した参考画像を全部渡す）。読めないときも 0 側に倒す
+ */
+export const FLAG_REF_RANDOM = 'image_ref_random';
+
+export async function getRefRandom(db: Db): Promise<boolean> {
+  try {
+    return (await db.getNumberFlag(FLAG_REF_RANDOM, 0)) === 1;
+  } catch {
+    return false;
+  }
+}
+
+export async function setRefRandom(db: Db, on: boolean, by: string): Promise<void> {
+  await db.setNumberFlag(FLAG_REF_RANDOM, on ? 1 : 0, '参考画像のランダム選択', by);
+}
+
+/** n 枚から選べる組（大きさ1または2・並びは登録順）。3枚なら 単独3通り＋2枚組3通り＝6通り */
+export function refSubsets(n: number): number[][] {
+  const out: number[][] = [];
+  for (let i = 0; i < n; i++) out.push([i]);
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) out.push([i, j]);
+  return out;
+}
+
+/**
+ * 組を1つ選ぶ（どの組も同じ確率）。rng は 0 以上 1 未満を返す関数（テストで固定するため注入できる）。
+ * 0枚なら空
+ */
+export function pickRefSubset(n: number, rng: () => number = Math.random): number[] {
+  const all = refSubsets(Math.min(Math.max(0, Math.floor(n)), REF_MAX_COUNT));
+  if (!all.length) return [];
+  const r = rng();
+  const i = Math.min(all.length - 1, Math.max(0, Math.floor((Number.isFinite(r) ? r : 0) * all.length)));
+  return all[i];
+}
+
+/** 並びを保ったまま、選んだ組だけを返す */
+export function selectRefs<T>(refs: T[], rng: () => number = Math.random): T[] {
+  return pickRefSubset(refs.length, rng).map((i) => refs[i]);
+}
+
+/**
+ * どの参考画像が誰か（名前は顧客が登録した文字列そのまま）。ランダム選択のときに指示に足す。
+ * 例: 「参考画像は2枚。1枚目は「〇〇」、2枚目は「△△」。この画像に登場させるのは、この2人だけ。」
+ */
+export function refNamesClause(names: string[]): string {
+  if (!names.length) return '';
+  const each = names.map((n, i) => `${i + 1}枚目は「${n.replace(/[\r\n]+/g, ' ')}」`).join('、');
+  return `参考画像は${names.length}枚。${each}。この画像に登場させるキャラクターは、${names.length === 1 ? 'この1人' : `この${names.length}人`}だけ。`;
+}
+
+// ── 画面から、まとめて保存する（1回のコードで。2026-10-27）──────────
+export interface BatchUpload { name: unknown; bytes: ArrayBuffer }
+export interface ImageSettingsBatchInput {
+  thumbBody?: unknown; thumbClear?: boolean; thumbTitleMode?: unknown; thumbInspect?: unknown;
+  inlineBody?: unknown; inlineClear?: boolean;
+  /** '0' / '1'。undefined = 変えない */
+  refRandom?: unknown;
+  /** 消す参考画像の id */
+  deleteIds: string[];
+  /** 足す参考画像 */
+  uploads: BatchUpload[];
+}
+
+export interface ValidatedBatch {
+  input: ImageSettingsBatchInput;
+  uploads: Array<{ name: string; bytes: ArrayBuffer; mime: RefMime }>;
+  deleteIds: string[];
+  refRandom: boolean | null;
+}
+
+/**
+ * ★全部を検査する（何も書かない）。1つでもだめなら理由の一覧を返す。
+ *   呼び出し側は、これが通ってからコードを使い、書き込む（コードを無駄にさせない・半端に保存しない）
+ */
+export function validateImageSettingsBatch(input: ImageSettingsBatchInput, currentRefIds: string[]):
+  { ok: true; batch: ValidatedBatch } | { ok: false; errors: string[] } {
+  const errors: string[] = [];
+  for (const [label, v] of [['サムネ用のルール', input.thumbBody], ['文中の画像用のルール', input.inlineBody]] as const) {
+    if (typeof v === 'string' && normalizeRuleBody(v) === null) errors.push(`${label}が${RULE_BODY_MAX}字を超えています`);
+  }
+  if (input.thumbTitleMode !== undefined && input.thumbTitleMode !== null && parseTitleMode(input.thumbTitleMode) === null) {
+    errors.push('サムネのタイトルの選び方が読めませんでした');
+  }
+  if (input.thumbInspect !== undefined && input.thumbInspect !== null && input.thumbInspect !== '' && parseInspectRetries(input.thumbInspect) === null) {
+    errors.push('作り直しの回数が読めませんでした');
+  }
+  let refRandom: boolean | null = null;
+  if (input.refRandom !== undefined && input.refRandom !== null) {
+    if (input.refRandom === '1' || input.refRandom === 1) refRandom = true;
+    else if (input.refRandom === '0' || input.refRandom === 0) refRandom = false;
+    else errors.push('キャラクターの選び方が読めませんでした');
+  }
+  const deleteIds = [...new Set(input.deleteIds)];
+  for (const id of deleteIds) if (!currentRefIds.includes(id)) errors.push('消す参考画像が見つかりませんでした（画面を開き直してください）');
+  const uploads: ValidatedBatch['uploads'] = [];
+  input.uploads.forEach((u, i) => {
+    const c = checkRefUpload(u.bytes, 0);
+    if (!c.ok) errors.push(`追加する参考画像 ${i + 1} 枚目: ${REF_REJECT_NOTE[c.reason]}`);
+    else uploads.push({ name: normalizeRefName(u.name), bytes: u.bytes, mime: c.mime });
+  });
+  if (currentRefIds.length - deleteIds.filter((id) => currentRefIds.includes(id)).length + input.uploads.length > REF_MAX_COUNT) {
+    errors.push(REF_REJECT_NOTE.too_many);
+  }
+  return errors.length ? { ok: false, errors: [...new Set(errors)] } : { ok: true, batch: { input, uploads, deleteIds, refRandom } };
+}
+
+/** 書き込みの直前に、枚数が変わっていて上限を超える（同時に別の保存があった）。何も書いていない */
+export class BatchCountChanged extends Error {
+  constructor() { super('参考画像の枚数が変わっていました'); }
+}
+
+/**
+ * 書き込みの途中で失敗した（★元に戻す処理まで済ませてから投げる）。
+ * rollbackFailed が空なら「何も保存していない」と言ってよい。空でなければ、戻せなかった項目の名前が入る
+ */
+export class BatchWriteFailed extends Error {
+  constructor(readonly cause: unknown, readonly rollbackFailed: string[]) {
+    super('画像のルールのまとめ保存に失敗しました');
+  }
+}
+
+export interface BatchResult {
+  added: number;
+  deleted: number;
+  /** 消せなかった枚数（★ほかの保存は済んでいる） */
+  deleteFailed: number;
+  thumb: SaveRulesResult;
+  inline: SaveRulesResult;
+}
+
+/**
+ * 検査済みのまとめを書き込む。
+ *
+ * ★「全部入るか、何も入らないか」（合格ライン③）。①〜④のどこで失敗しても、書く前の状態に戻す:
+ *   書く前に、ルール2行（種類ごとの行そのもの、または「無い」）と image_ref_random の値（または「無い」）を控えておき、
+ *   ①参考画像を足す → ②サムネ用ルール → ③文中画像用ルール → ④ランダム選択の設定・監査記録
+ *   のどこかで例外が出たら、足した画像を消し、ルールと設定を控えに戻してから BatchWriteFailed を投げる。
+ *   ★監査記録の失敗も「失敗」として全部取り消す（保存したのに記録が無い、を残さない）。
+ *   戻す処理の失敗は握りつぶさず、ログに出して rollbackFailed に入れる（画面の文言を事実と合わせるため）。
+ * ★⑤参考画像の削除は最後に、1枚ずつ失敗を受け止める（ここでの失敗は取り消さない＝ほかは保存済み）。
+ *   消せなかった枚数を結果に持たせ、画面は「保存しました（N枚は消せませんでした）」と言う。
+ * ★書く直前に枚数をもう一度数える（コードを2つ使った同時送信で3枚を超えないように）。
+ */
+export async function applyImageSettingsBatch(db: Db, images: ImageStore, tenantId: string, batch: ValidatedBatch, by: string):
+  Promise<BatchResult> {
+  const existing = await db.listImageRefs(tenantId);
+  const remain = existing.filter((r) => !batch.deleteIds.includes(r.id)).length;
+  if (remain + batch.uploads.length > REF_MAX_COUNT) throw new BatchCountChanged();
+
+  // ── 控え（書く前の状態）──
+  const before = {
+    thumbnail: await db.getImageRule(tenantId, 'thumbnail'),
+    inline: await db.getImageRule(tenantId, 'inline'),
+    refRandom: (await db.raw.prepare('SELECT value, reason, updated_by, updated_at FROM system_flags WHERE key = ?')
+      .bind(FLAG_REF_RANDOM).first<{ value: string; reason: string | null; updated_by: string | null; updated_at: string | null }>()) ?? null,
+  };
+
+  let sort = Math.max(0, ...existing.map((r) => r.sort + 1));
+  const added: Array<{ id: string; key: string }> = [];
+  let thumb: SaveRulesResult;
+  let inline: SaveRulesResult;
+  try {
+    for (const u of batch.uploads) {
+      const id = newId();
+      const key = `ref_${tenantId}_${id}`;
+      await images.put(key, u.bytes, u.mime, { persistent: true });
+      added.push({ id, key });
+      await db.insertImageRef(tenantId, { id, name: u.name, r2Key: key, mime: u.mime, sizeBytes: u.bytes.byteLength, sort: sort++ });
+    }
+    const i = batch.input;
+    thumb = await saveImageRules(db, tenantId, 'thumbnail', {
+      body: i.thumbBody, clearBody: i.thumbClear, titleMode: i.thumbTitleMode,
+      inspectRetries: i.thumbInspect === '' ? undefined : i.thumbInspect, by,
+    });
+    inline = await saveImageRules(db, tenantId, 'inline', { body: i.inlineBody, clearBody: i.inlineClear, by });
+    if (!thumb.ok || !inline.ok) throw new Error('検査を通ったのにルールを保存できませんでした');
+    if (batch.refRandom !== null) await setRefRandom(db, batch.refRandom, by);
+    for (const a of added) await db.audit(tenantId, 'image_ref.added', by, a.id, 'ok', { batch: true });
+  } catch (e) {
+    const rollbackFailed: string[] = [];
+    const attempt = async (label: string, fn: () => Promise<unknown>) => {
+      try { await fn(); } catch (err) {
+        rollbackFailed.push(label);
+        log.error(`まとめ保存の取り消しに失敗（${label}）`, String(err).slice(0, 120));
+      }
+    };
+    for (const a of [...added].reverse()) {
+      await attempt('追加した参考画像', () => db.raw.prepare('DELETE FROM image_refs WHERE tenant_id = ? AND id = ?').bind(tenantId, a.id).run());
+      await attempt('追加した参考画像の置き場', () => images.delete(a.key));
+    }
+    for (const kind of ['thumbnail', 'inline'] as const) {
+      const row = before[kind];
+      await attempt(kind === 'thumbnail' ? 'サムネ用のルール' : '文中の画像用のルール', () => row
+        ? db.raw.prepare(`INSERT INTO image_rules (tenant_id, kind, body, title_mode, inspect_retries, updated_by, updated_at)
+                          VALUES (?, ?, ?, ?, ?, ?, ?)
+                          ON CONFLICT(tenant_id, kind) DO UPDATE SET body = excluded.body, title_mode = excluded.title_mode,
+                            inspect_retries = excluded.inspect_retries, updated_by = excluded.updated_by, updated_at = excluded.updated_at`)
+          .bind(tenantId, kind, row.body, row.title_mode, row.inspect_retries, row.updated_by ?? null, row.updated_at ?? null).run()
+        : db.raw.prepare('DELETE FROM image_rules WHERE tenant_id = ? AND kind = ?').bind(tenantId, kind).run());
+    }
+    const f = before.refRandom;
+    await attempt('キャラクターの使い方', () => f
+      ? db.raw.prepare(`INSERT INTO system_flags (key, value, reason, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value, reason = excluded.reason,
+                          updated_by = excluded.updated_by, updated_at = excluded.updated_at`)
+        .bind(FLAG_REF_RANDOM, f.value, f.reason, f.updated_by, f.updated_at).run()
+      : db.raw.prepare('DELETE FROM system_flags WHERE key = ?').bind(FLAG_REF_RANDOM).run());
+    throw new BatchWriteFailed(e, rollbackFailed);
+  }
+
+  // ⑤ 削除（最後・1枚ずつ受け止める）
+  let deleted = 0;
+  let deleteFailed = 0;
+  for (const id of batch.deleteIds) {
+    try {
+      if (await deleteImageRef(db, images, tenantId, id, by)) deleted++;
+    } catch (err) {
+      deleteFailed++;
+      log.warn('参考画像を消せませんでした（ほかの保存は済んでいます）', String(err).slice(0, 120));
+    }
+  }
+  return { added: added.length, deleted, deleteFailed, thumb, inline };
+}
+
 // ── LINE・画面に出す要約（★本文・画像は出さない。文字数・枚数だけ）──────────
 export interface ImageRulesSummary {
   thumbnail: { registered: boolean; chars: number; titleMode: TitleMode; inspectRetries: number };
   inline: { registered: boolean; chars: number };
   refs: Array<{ id: string; name: string; sizeBytes: number }>;
+  /** 参考画像を記事ごとにランダムに選ぶか */
+  refRandom: boolean;
 }
 
 export async function loadImageRulesSummary(db: Db, tenantId: string): Promise<ImageRulesSummary> {
-  const [t, i, refs] = await Promise.all([
+  const [t, i, refs, refRandom] = await Promise.all([
     getImageRules(db, tenantId, 'thumbnail'),
     getImageRules(db, tenantId, 'inline'),
     listImageRefs(db, tenantId),
+    getRefRandom(db),
   ]);
   return {
     thumbnail: {
@@ -266,5 +498,6 @@ export async function loadImageRulesSummary(db: Db, tenantId: string): Promise<I
     },
     inline: { registered: Boolean(i), chars: i?.body.length ?? 0 },
     refs: refs.map((r) => ({ id: r.id, name: r.name, sizeBytes: r.size_bytes })),
+    refRandom,
   };
 }

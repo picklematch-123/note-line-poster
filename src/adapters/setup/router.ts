@@ -33,8 +33,9 @@ import { log } from '../../lib/mask';
 import { KvImageStore } from '../../ports/storage/images';
 import {
   loadImageRulesSummary, saveImageRules, addImageRef, deleteImageRef, checkRefUpload, listImageRefs,
-  RULE_BODY_MAX, REF_MAX_BYTES, REF_MAX_COUNT, DEFAULT_INSPECT_RETRIES, INSPECT_RETRY_OPTIONS, REF_REJECT_NOTE,
-  type ImageRulesSummary,
+  validateImageSettingsBatch, applyImageSettingsBatch, BatchCountChanged, BatchWriteFailed,
+  RULE_BODY_MAX, REF_MAX_BYTES, REF_MAX_COUNT, REF_NAME_MAX, DEFAULT_INSPECT_RETRIES, INSPECT_RETRY_OPTIONS, REF_REJECT_NOTE,
+  type ImageRulesSummary, type BatchUpload,
 } from '../../core/image/rules';
 import { MAX_GENERATIONS_PER_ARTICLE } from '../../core/image/thumbnail';
 
@@ -167,12 +168,9 @@ function imageRulesSection(status: Status): string {
   const inspectSel = r.thumbnail.registered ? r.thumbnail.inspectRetries : DEFAULT_INSPECT_RETRIES;
   const inspectLabel = (n: number) => n === 0 ? '作り直さない' : `${n}回まで作り直す`;
   const kb = (n: number) => `${Math.max(1, Math.round(n / 1024))}KB`;
-  const refRows = r.refs.map((ref, i) => `<li>${esc(ref.name)}（${kb(ref.sizeBytes)}）
- <form method="post" action="/setup/image-refs/delete" style="margin-top:.4rem">
-  <input type="hidden" name="id" value="${esc(ref.id)}">
-  ${code(`code_rd${i}`)}
-  <button type="submit" style="background:#c0392b">この参考画像を消す</button>
- </form></li>`).join('');
+  // ★消すのはチェック欄（まとめて保存のフォームの中）。1枚ごとにコードを使わせない
+  const refRows = r.refs.map((ref) => `<li>${esc(ref.name)}（${kb(ref.sizeBytes)}）
+ <label style="margin-top:.3rem"><input type="checkbox" name="delete_ref" value="${esc(ref.id)}" style="width:auto"> この参考画像を消す</label></li>`).join('');
 
   // ★セットアップ前（コード無しで通る状態）は、画像のルールの書き込みを受け付けない。フォームも出さない
   if (!status.requiresCode) {
@@ -192,8 +190,10 @@ ${status.hasImageKey ? '' : '<div class="note">OpenAI の API キーが未登録
  <tr><td>確認と作り直し</td><td>${r.thumbnail.registered ? esc(inspectLabel(r.thumbnail.inspectRetries)) : '確認しない（今までどおり）'}</td></tr>
  <tr><td>文中の画像用のルール</td><td>${r.inline.registered && r.inline.chars ? `登録済み（${r.inline.chars}字）` : '未登録'}</td></tr>
  <tr><td>参考画像</td><td>${r.refs.length} / ${REF_MAX_COUNT} 枚</td></tr>
+ <tr><td>キャラクターの使い方</td><td>${r.refRandom ? '画像ごとにランダムに選ぶ' : '全部使う（今までどおり）'}</td></tr>
 </table>
-<form method="post" action="/setup/image-rules">
+<form method="post" action="/setup/image-rules/all" enctype="multipart/form-data">
+ <div class="note">この欄は<b>まとめて1回で保存</b>します（確認コードは1つで足ります）。変えない欄は空のままで構いません。</div>
  <label for="thumb_body" style="margin-top:1rem">サムネ用のルール（${RULE_BODY_MAX}字まで）</label>
  <textarea id="thumb_body" name="thumb_body" maxlength="${RULE_BODY_MAX}" rows="6" style="width:100%;box-sizing:border-box"
   placeholder="空のまま保存すると、いまの内容を残します"></textarea>
@@ -214,22 +214,23 @@ ${status.hasImageKey ? '' : '<div class="note">OpenAI の API キーが未登録
  <textarea id="inline_body" name="inline_body" maxlength="${RULE_BODY_MAX}" rows="5" style="width:100%;box-sizing:border-box"
   placeholder="空のまま保存すると、いまの内容を残します"></textarea>
  <label style="margin-top:.4rem"><input type="checkbox" name="inline_clear" value="1" style="width:auto"> 文中の画像用のルールを消す</label>
- ${code('code_ir')}
- <button type="submit">画像のルールを保存する</button>
-</form>
 
-<h2>参考画像（キャラクターの見た目）</h2>
-<div class="note">登録すると、サムネと文中の画像の両方で、見た目（顔・髪・服など）の参考に使います。
-PNG・JPEG・WebP、1枚 ${REF_MAX_BYTES / 1024 / 1024}MB まで・${REF_MAX_COUNT} 枚まで。画像そのものはこの画面に表示しません。</div>
-${r.refs.length ? `<ul>${refRows}</ul>` : '<p class="lead">まだ登録されていません。</p>'}
-${r.refs.length < REF_MAX_COUNT ? `<form method="post" action="/setup/image-refs" enctype="multipart/form-data">
- <label for="ref_name">名前（例: キャラクターの名前）</label>
- <input id="ref_name" name="name" maxlength="40" autocomplete="off">
- <label for="ref_file" style="margin-top:1rem">画像</label>
- <input id="ref_file" name="file" type="file" accept="image/png,image/jpeg,image/webp" required>
- ${code('code_ra')}
- <button type="submit">参考画像を追加する</button>
-</form>` : ''}
+ <h2>参考画像（キャラクターの見た目）</h2>
+ <div class="note">登録すると、サムネと文中の画像の両方で、見た目（顔・髪・服など）の参考に使います。
+ PNG・JPEG・WebP、1枚 ${REF_MAX_BYTES / 1024 / 1024}MB まで・合わせて ${REF_MAX_COUNT} 枚まで。画像そのものはこの画面に表示しません。</div>
+ ${r.refs.length ? `<ul>${refRows}</ul>` : '<p class="lead">まだ登録されていません。</p>'}
+ <label for="ref_random" style="margin-top:1rem">キャラクターの使い方</label>
+ <select id="ref_random" name="ref_random">
+  <option value="0"${r.refRandom ? '' : ' selected'}>登録した参考画像を全部使う（今までどおり）</option>
+  <option value="1"${r.refRandom ? ' selected' : ''}>画像ごとにランダムに選ぶ（1人か2人）</option>
+ </select>
+ <p class="d" style="margin-left:0">「ランダムに選ぶ」にすると、サムネ・文中の画像の1枚ごとに、登録したキャラクターから1人または2人を選んで描きます。</p>
+ ${[1, 2, 3].map((n) => `<label for="ref_name_${n}" style="margin-top:1rem">追加する画像 ${n} の名前（例: 「〇〇（主役）」「△△（ライバル）」・${REF_NAME_MAX}字まで）</label>
+ <input id="ref_name_${n}" name="ref_name_${n}" maxlength="${REF_NAME_MAX}" autocomplete="off">
+ <input id="ref_file_${n}" name="ref_file_${n}" type="file" accept="image/png,image/jpeg,image/webp" style="margin-top:.4rem">`).join('')}
+ ${code('code_all')}
+ <button type="submit">画像のルールと参考画像をまとめて保存する</button>
+</form>
 `;
 }
 
@@ -484,6 +485,28 @@ function imageWriteDenied(p: Permission): string | null {
   return null;
 }
 
+/** 画像の書き込み経路ごとの、送信の大きさの上限（バイト） */
+export const BODY_LIMITS = {
+  rules: 256 * 1024,                                   // ルール本文2つ（6000字×2をURLエンコードしても収まる）
+  refs: REF_MAX_BYTES + 64 * 1024,                     // 参考画像1枚
+  refsDelete: 16 * 1024,
+  all: REF_MAX_COUNT * REF_MAX_BYTES + 256 * 1024,     // まとめて保存（3枚＋文字）
+} as const;
+
+/**
+ * ★本文を読む前に、送信の大きさの申告（Content-Length）を確かめる（2026-10-27 源蔵レビュー必須1）。
+ *   申告が無い（chunked）・数字でない・0以下 → 411、上限超え → 413。
+ *   formData() は本文を全部メモリに読むので、確かめずに読むと、認証より前に大きな送信を受け止めてしまう
+ */
+export function checkBodySize(header: string | undefined, max: number): { status: 411 | 413; detail: string } | null {
+  const raw = (header ?? '').trim();
+  if (!/^\d+$/.test(raw) || Number(raw) <= 0) {
+    return { status: 411, detail: '送信の大きさが分かりませんでした。ブラウザの画面から、もう一度お試しください。' };
+  }
+  if (Number(raw) > max) return { status: 413, detail: REF_REJECT_NOTE.too_large };
+  return null;
+}
+
 /** 本文の長さだけ先に見る（コードを使う前。上限超えでコードを無駄にさせない） */
 function tooLong(v: unknown): boolean {
   return typeof v === 'string' && v.replace(/\r\n?/g, '\n').trim().length > RULE_BODY_MAX;
@@ -495,6 +518,8 @@ function tooLong(v: unknown): boolean {
  */
 setupRouter.post('/setup/image-rules', async (c) => {
   const status = await readStatus(c);
+  const size = checkBodySize(c.req.header('content-length'), BODY_LIMITS.rules);
+  if (size) return c.html(page(status, [{ label: '画像のルール', ok: false, detail: size.detail }]), size.status);
   const form = await c.req.formData().catch(() => null);
   // ★コード（1回きり）を使う前に、文字数を検査する（参考画像と同じ順番）。ここでは何も書かない
   if (tooLong(form?.get('thumb_body')) || tooLong(form?.get('inline_body'))) {
@@ -539,10 +564,8 @@ setupRouter.post('/setup/image-rules', async (c) => {
 /** 参考画像を1枚足す（multipart）。★大きすぎる送信は、中身を読む前に断る */
 setupRouter.post('/setup/image-refs', async (c) => {
   const status = await readStatus(c);
-  const length = Number(c.req.header('content-length') ?? '0');
-  if (length > REF_MAX_BYTES + 64 * 1024) {
-    return c.html(page(status, [{ label: '参考画像', ok: false, detail: REF_REJECT_NOTE.too_large }]), 413);
-  }
+  const size = checkBodySize(c.req.header('content-length'), BODY_LIMITS.refs);
+  if (size) return c.html(page(status, [{ label: '参考画像', ok: false, detail: size.detail }]), size.status);
   const form = await c.req.formData().catch(() => null);
   const file = form?.get('file') as unknown;
   const isFile = (v: unknown): v is Blob => typeof v === 'object' && v !== null && typeof (v as Blob).arrayBuffer === 'function';
@@ -581,6 +604,8 @@ setupRouter.post('/setup/image-refs', async (c) => {
 /** 参考画像を1枚消す */
 setupRouter.post('/setup/image-refs/delete', async (c) => {
   const status = await readStatus(c);
+  const size = checkBodySize(c.req.header('content-length'), BODY_LIMITS.refsDelete);
+  if (size) return c.html(page(status, [{ label: '参考画像を消す', ok: false, detail: size.detail }]), size.status);
   const form = await c.req.formData().catch(() => null);
   const permission = await mayRun(c.env.KV, (form?.get('code') as string | null) ?? null, status.requiresCode);
   const deny = imageWriteDenied(permission);
@@ -593,4 +618,83 @@ setupRouter.post('/setup/image-refs/delete', async (c) => {
   return c.html(page(await readStatus(c), [{
     label: '参考画像を消す', ok, detail: ok ? '消しました' : '見つかりませんでした（すでに消えているかもしれません）',
   }]), ok ? 200 : 404);
+});
+
+/**
+ * 画像のルール・参考画像・キャラクターの使い方を、**1回のコードでまとめて**保存する（multipart。2026-10-27）。
+ * ★遠隔で使う顧客に「セットアップ」を何度も送ってもらわないため。
+ * ★全部を検査してから書く。1つでもだめなら、何も保存せず、コードも使わない。
+ * ★初回（コード無しで通る状態）は断る・コード無し／不正は 403（ほかの画像の書き込みと同じ）
+ */
+setupRouter.post('/setup/image-rules/all', async (c) => {
+  const status = await readStatus(c);
+  // ★大きさの申告が無い・壊れている・大きすぎる送信は、中身を読む前に断る（3枚 × 上限 ＋ 文字の分）
+  const size = checkBodySize(c.req.header('content-length'), BODY_LIMITS.all);
+  if (size) return c.html(page(status, [{ label: '画像のルール', ok: false, detail: size.detail }]), size.status);
+  const form = await c.req.formData().catch(() => null);
+  if (!form) return c.html(page(status, [{ label: '画像のルール', ok: false, detail: '入力を受け取れませんでした。もう一度お試しください。' }]), 400);
+
+  const isFile = (v: unknown): v is File => typeof v === 'object' && v !== null && typeof (v as Blob).arrayBuffer === 'function';
+  const uploads: BatchUpload[] = [];
+  for (let n = 1; n <= REF_MAX_COUNT; n++) {
+    const f = form.get(`ref_file_${n}`) as unknown;
+    // ファイルを選ばなかった欄は、ブラウザが「名前なし・0バイト」で送ってくる。それは無視する
+    if (!isFile(f) || (f.size === 0 && !f.name)) continue;
+    uploads.push({ name: form.get(`ref_name_${n}`), bytes: await f.arrayBuffer() });
+  }
+  const str = (k: string) => { const v = form.get(k); return typeof v === 'string' ? v : undefined; };
+  const db = new Db(c.env.DB);
+  const current = await listImageRefs(db, DEFAULT_TENANT_ID);
+  const v = validateImageSettingsBatch({
+    thumbBody: str('thumb_body'), thumbClear: str('thumb_clear') === '1',
+    thumbTitleMode: str('thumb_title_mode'), thumbInspect: str('thumb_inspect'),
+    inlineBody: str('inline_body'), inlineClear: str('inline_clear') === '1',
+    refRandom: str('ref_random'),
+    deleteIds: form.getAll('delete_ref').filter((x): x is string => typeof x === 'string'),
+    uploads,
+  }, current.map((r) => r.id));
+  // ★ここまで何も書いていない。だめならコードを使わずに返す
+  if (!v.ok) {
+    return c.html(page(status, v.errors.map((detail) => ({ label: '画像のルール', ok: false, detail })),
+      '保存していません（確認コードはまだ使えます）。直してからもう一度お試しください。'), 400);
+  }
+
+  const permission = await mayRun(c.env.KV, str('code') ?? null, status.requiresCode);
+  const deny = imageWriteDenied(permission);
+  if (deny) {
+    log.warn('画像のルールのまとめ保存を断りました', permission.reason);
+    return c.html(page(status, [], deny), 403);
+  }
+
+  try {
+    const r = await applyImageSettingsBatch(db, new KvImageStore(c.env.KV), DEFAULT_TENANT_ID, v.batch, 'web');
+    const after = await readStatus(c);
+    const steps: Step[] = [
+      { label: 'サムネ用のルール', ok: true, detail: r.thumb.ok && r.thumb.saved ? '保存しました' : '登録なしのまま（今までどおり）' },
+      { label: '文中の画像用のルール', ok: true, detail: r.inline.ok && r.inline.saved ? '保存しました' : '登録なしのまま（今までどおり）' },
+      { label: '参考画像', ok: r.deleteFailed === 0,
+        detail: `追加 ${r.added} 枚・削除 ${r.deleted} 枚（いま ${after.imageRules.refs.length} 枚）${r.deleteFailed ? `。${r.deleteFailed} 枚は消せませんでした` : ''}` },
+      { label: 'キャラクターの使い方', ok: true, detail: after.imageRules.refRandom ? '画像ごとにランダムに選ぶ' : '全部使う（今までどおり）' },
+    ];
+    // ★削除だけ失敗した場合も、ほかは保存済み。事実どおり「保存しました（N枚は消せませんでした）」と言う
+    return c.html(page(after, steps, r.deleteFailed
+      ? `保存しました（${r.deleteFailed} 枚は消せませんでした。消すときは、もう一度チェックして保存してください）。`
+      : '保存しました。次に作る画像から使われます。'));
+  } catch (e) {
+    if (e instanceof BatchCountChanged) {
+      return c.html(page(await readStatus(c), [{
+        label: '参考画像', ok: false, detail: `${REF_REJECT_NOTE.too_many}（別の保存と重なったようです。何も保存していません）`,
+      }]), 409);
+    }
+    if (e instanceof BatchWriteFailed) {
+      log.warn('画像のルールをまとめて保存できませんでした', String(e.cause).slice(0, 120));
+      return c.html(page(await readStatus(c), [{
+        label: '画像のルール', ok: false,
+        detail: e.rollbackFailed.length
+          ? `保存の途中で失敗し、次の項目は元に戻せませんでした: ${e.rollbackFailed.join('・')}。いまの状態は上の表をご確認ください。`
+          : '保存の途中で失敗したため、何も保存していません（途中まで書いた分は元に戻しました）。少し待ってからやり直してください。',
+      }]), 500);
+    }
+    throw e;
+  }
 });

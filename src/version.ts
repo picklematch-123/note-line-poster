@@ -6,4 +6,4 @@
  *   各環境の版をまとめて見るのは `npm run fleet`（運用側の道具）。
  * ★この行の形を変えるときは、build-template.mjs の stampVersion も直すこと（形が違うと組み立てが止まる）
  */
-export const VERSION: string = '20261026-9ccb9f3-dirty-fbc61f04';
+export const VERSION: string = '20261026-9ccb9f3-dirty-11d14248';
