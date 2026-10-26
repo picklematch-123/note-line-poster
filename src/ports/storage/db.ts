@@ -713,4 +713,79 @@ export class Db {
       .bind(...ids)
       .run();
   }
+
+  // ── 画像のルール・参考画像（0014。判定と検査は core/image/rules.ts）──────────
+  /** 行が無ければ null（＝何も登録していない＝今までと同じ動き） */
+  async getImageRule(tenantId: string, kind: ImageRuleKind): Promise<ImageRuleRow | null> {
+    return this.d1
+      .prepare('SELECT tenant_id, kind, body, title_mode, inspect_retries, updated_by, updated_at FROM image_rules WHERE tenant_id = ? AND kind = ?')
+      .bind(tenantId, kind)
+      .first<ImageRuleRow>();
+  }
+
+  async upsertImageRule(tenantId: string, row: {
+    kind: ImageRuleKind; body: string; titleMode: 'none' | 'title'; inspectRetries: number; by: string;
+  }): Promise<void> {
+    await this.d1
+      .prepare(`INSERT INTO image_rules (tenant_id, kind, body, title_mode, inspect_retries, updated_by, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id, kind) DO UPDATE SET
+                  body = excluded.body, title_mode = excluded.title_mode, inspect_retries = excluded.inspect_retries,
+                  updated_by = excluded.updated_by, updated_at = excluded.updated_at`)
+      .bind(tenantId, row.kind, row.body, row.titleMode, row.inspectRetries, row.by, nowIso())
+      .run();
+  }
+
+  async listImageRefs(tenantId: string): Promise<ImageRefRow[]> {
+    const r = await this.d1
+      .prepare('SELECT id, tenant_id, role, name, r2_key, mime, size_bytes, sort, created_at FROM image_refs WHERE tenant_id = ? ORDER BY sort ASC, created_at ASC')
+      .bind(tenantId)
+      .all<ImageRefRow>();
+    return r.results ?? [];
+  }
+
+  async insertImageRef(tenantId: string, row: {
+    id: string; name: string; r2Key: string; mime: string; sizeBytes: number; sort: number;
+  }): Promise<void> {
+    await this.d1
+      .prepare(`INSERT INTO image_refs (id, tenant_id, role, name, r2_key, mime, size_bytes, sort, created_at)
+                VALUES (?, ?, 'character', ?, ?, ?, ?, ?, ?)`)
+      .bind(row.id, tenantId, row.name, row.r2Key, row.mime, row.sizeBytes, row.sort, nowIso())
+      .run();
+  }
+
+  /** 消した行を返す（置き場の後始末に使う）。無ければ null */
+  async deleteImageRef(tenantId: string, id: string): Promise<ImageRefRow | null> {
+    const row = await this.d1
+      .prepare('SELECT id, tenant_id, role, name, r2_key, mime, size_bytes, sort, created_at FROM image_refs WHERE tenant_id = ? AND id = ?')
+      .bind(tenantId, id)
+      .first<ImageRefRow>();
+    if (!row) return null;
+    await this.d1.prepare('DELETE FROM image_refs WHERE tenant_id = ? AND id = ?').bind(tenantId, id).run();
+    return row;
+  }
+}
+
+export type ImageRuleKind = 'thumbnail' | 'inline';
+
+export interface ImageRuleRow {
+  tenant_id: string;
+  kind: ImageRuleKind;
+  body: string;
+  title_mode: 'none' | 'title';
+  inspect_retries: number;
+  updated_by: string | null;
+  updated_at: string;
+}
+
+export interface ImageRefRow {
+  id: string;
+  tenant_id: string;
+  role: 'character';
+  name: string;
+  r2_key: string;
+  mime: string;
+  size_bytes: number;
+  sort: number;
+  created_at: string;
 }

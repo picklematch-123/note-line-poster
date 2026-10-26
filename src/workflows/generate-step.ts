@@ -11,6 +11,7 @@
 import type { Db } from '../ports/storage/db';
 import type { LineClient } from '../adapters/line/client';
 import { log } from '../lib/mask';
+import type { ThumbnailOutcome } from '../core/image/thumbnail';
 
 export interface GenerationFailure {
   ok: false;
@@ -48,4 +49,22 @@ export async function notifyGenerationFailure(
       'もう一度やってみる場合は、指示をそのまま送ってください。\n' +
       '新しいネタにする場合は「やめる」と送ってください。',
   }]);
+}
+
+/** step「サムネイルを作る」そのものが落ちたときの文面（★記事は止めない） */
+export const THUMB_STEP_STOPPED_NOTE =
+  'サムネの作成が途中で止まりました（時間がかかりすぎたか、一時的な障害のためです）。記事はそのまま使えます。少し待って「サムネを作り直す」を押してください。';
+
+/**
+ * step「サムネイルを作る」を実行し、step そのものが落ちても（5分の時間切れ・想定外の例外）
+ * 外へ出さずに「失敗」として返す（★2026-10-26 源蔵レビュー必須1。「記事を調べる」の受け止めと同じ考え方）。
+ * これが無いと、サムネが固まっただけで例外が Workflow の外へ抜け、プレビューが届かず記事が止まる。
+ */
+export async function runThumbnailStep(run: () => Promise<ThumbnailOutcome>): Promise<ThumbnailOutcome> {
+  try {
+    return await run();
+  } catch (e) {
+    log.error('「サムネイルを作る」が止まったため、サムネなしで続けます', String(e));
+    return { status: 'failed', kind: 'step', note: THUMB_STEP_STOPPED_NOTE };
+  }
 }

@@ -16,8 +16,14 @@ export interface StoredImage {
   contentType: string;
 }
 
+/**
+ * persistent = 期限を切らない（参考画像など、消すまで残すもの。2026-10-26 画像のルール）。
+ * ★既定は今までどおり期限つき。指定しない呼び出しの動きは変わらない
+ */
+export interface PutOptions { persistent?: boolean }
+
 export interface ImageStore {
-  put(key: string, bytes: ArrayBuffer, contentType: string): Promise<void>;
+  put(key: string, bytes: ArrayBuffer, contentType: string, opts?: PutOptions): Promise<void>;
   get(key: string): Promise<StoredImage | null>;
   delete(key: string): Promise<void>;
 }
@@ -26,9 +32,9 @@ export interface ImageStore {
 export class KvImageStore implements ImageStore {
   constructor(private readonly kv: KVNamespace) {}
 
-  async put(key: string, bytes: ArrayBuffer, contentType: string): Promise<void> {
+  async put(key: string, bytes: ArrayBuffer, contentType: string, opts?: PutOptions): Promise<void> {
     await this.kv.put(`img:${key}`, bytes, {
-      expirationTtl: TTL_SECONDS,
+      ...(opts?.persistent ? {} : { expirationTtl: TTL_SECONDS }),
       metadata: { contentType },
     });
   }

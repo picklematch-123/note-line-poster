@@ -51,8 +51,29 @@ export interface StructuredOptions<T> {
   label: string;
 }
 
+/** 画像入力（2026-10-26 画像のルール・サムネの検品）。中身はログに出さない */
+export interface VisionImage {
+  bytes: ArrayBuffer;
+  mime: string;
+}
+
+export interface VisionOptions<T> {
+  tier: ModelTier;
+  system: string;
+  user: string;
+  images: VisionImage[];
+  schema: z.ZodType<T>;
+  maxTokens?: number;
+  label: string;
+}
+
 export interface Llm {
   structured<T>(opts: StructuredOptions<T>): Promise<LlmResult<T>>;
+  /**
+   * 画像を見て答える。★任意: 無い提供元・使えない提供元では、呼び出し側が「未検品」として扱う
+   * （検品が使えないことを理由に、画像づくりや記事を止めない）。
+   */
+  vision?<T>(opts: VisionOptions<T>): Promise<LlmResult<T>>;
 }
 
 /** コードフェンスや前置きが混ざっても JSON を取り出す。 */

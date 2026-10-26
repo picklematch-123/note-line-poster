@@ -47,6 +47,8 @@ import { log } from '../../lib/mask';
 import { getThumbSettings, setThumbAuto, setThumbDailyLimit, DAILY_LIMIT_OPTIONS, NOTE_NO_KEY } from '../../core/image/thumbnail';
 import { buildThumbSettings } from './messages/thumbnail';
 import { buildAiSettings, buildDomainChoices, buildResearchLimitChoices } from './messages/research';
+import { buildImageRulesSummary } from './messages/image-rules';
+import { loadImageRulesSummary } from '../../core/image/rules';
 import { getResearchSettings, applyResearchSetting } from '../../core/research/settings';
 import { canRedoResearch } from '../../core/research/run';
 import { createResearchLlm } from '../../ports/llm';
@@ -859,6 +861,8 @@ async function handlePostback(
     case 'ai_img_set':
     case 'ai_ilimit':
     case 'ai_ilimit_set':
+    // ★画像のルール（2026-10-26）も持ち主だけ（設定画面への入り口なので）
+    case 'ai_imgrules':
       if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
       return handleAiSettingsPostback(action, params, env, line, d, replyToken, userId);
 
@@ -1565,6 +1569,10 @@ async function handleAiSettingsPostback(
   switch (action) {
     case 'ai_thumb':
       return showThumbSettings(env, line, d, replyToken);
+    case 'ai_imgrules':
+      // 状態の要約だけ（本文・画像は出さない）。登録・変更は /setup
+      return line.reply(replyToken, [buildImageRulesSummary(
+        await loadImageRulesSummary(d.db, DEFAULT_TENANT_ID), hasImageKey(env.OPENAI_API_KEY))]);
     case 'ai_domains':
       return line.reply(replyToken, [buildDomainChoices(await getResearchSettings(d.db))]);
     case 'ai_rlimit':

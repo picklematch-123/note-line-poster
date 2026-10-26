@@ -13,6 +13,10 @@
  *     （無認証だと LLM の踏み台にされ、顧客の Anthropic アカウントが止まる）
  *
  * ★書き込みは「初回だけ」無認証。以後は LINE で受け取ったコードが要る（条件3）。
+ *
+ * ★2026-10-26「画像のルール」節を追加（設計書 docs/design-image-rules-2026-10-26.md 3-3）。
+ *   保存・参考画像の追加・削除は、ほかの書き込みと同じ入場口（mayRun）を通す。
+ *   この画面は誰でも開けるので、登録済みのルール本文と参考画像そのものは出さない（文字数・名前・サイズだけ）。
  */
 import { Hono } from 'hono';
 import type { Env } from '../../env';
@@ -26,6 +30,13 @@ import {
   limitLabel, intervalLabel, parseDailyLimit, parseIntervalSec,
 } from '../../core/policy/options';
 import { log } from '../../lib/mask';
+import { KvImageStore } from '../../ports/storage/images';
+import {
+  loadImageRulesSummary, saveImageRules, addImageRef, deleteImageRef, checkRefUpload, listImageRefs,
+  RULE_BODY_MAX, REF_MAX_BYTES, REF_MAX_COUNT, DEFAULT_INSPECT_RETRIES, INSPECT_RETRY_OPTIONS, REF_REJECT_NOTE,
+  type ImageRulesSummary,
+} from '../../core/image/rules';
+import { MAX_GENERATIONS_PER_ARTICLE } from '../../core/image/thumbnail';
 
 export const setupRouter = new Hono<{ Bindings: Env }>();
 
@@ -40,6 +51,10 @@ interface Status {
   requiresCode: boolean;
   /** いまの投稿レート設定。まだ表が無ければ null */
   rate: { daily: number; interval: number } | null;
+  /** 画像のルールの要約（★本文・画像は入れない。文字数・名前・サイズだけ） */
+  imageRules: ImageRulesSummary;
+  /** 画像を作れるキーがあるか（無ければルールは使われない旨を出す） */
+  hasImageKey: boolean;
 }
 
 async function readStatus(c: { env: Env; req: { url: string } }): Promise<Status> {
@@ -69,7 +84,12 @@ async function readStatus(c: { env: Env; req: { url: string } }): Promise<Status
     if (row) rate = { daily: row.daily_post_limit, interval: row.min_interval_sec };
   } catch { /* まだ表が無い。セットアップ後に出せばよい */ }
 
+  // 表がまだ無ければ「未登録」として読む（core 側で受け止める）
+  const imageRules = await loadImageRulesSummary(new Db(c.env.DB), DEFAULT_TENANT_ID);
+
   return {
+    imageRules,
+    hasImageKey: Boolean(c.env.OPENAI_API_KEY?.startsWith('sk-')),
     origin,
     masterKey: source,
     lineConfigured: !!c.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -140,6 +160,79 @@ ${status.requiresCode ? `<div class="note">
 `;
 }
 
+/** 「画像のルール」節。★登録済みの本文・参考画像そのものは出さない */
+function imageRulesSection(status: Status): string {
+  const r = status.imageRules;
+  const code = (id: string) => status.requiresCode ? `<div style="margin-top:1rem">${codeField(id)}</div>` : '';
+  const inspectSel = r.thumbnail.registered ? r.thumbnail.inspectRetries : DEFAULT_INSPECT_RETRIES;
+  const inspectLabel = (n: number) => n === 0 ? '作り直さない' : `${n}回まで作り直す`;
+  const kb = (n: number) => `${Math.max(1, Math.round(n / 1024))}KB`;
+  const refRows = r.refs.map((ref, i) => `<li>${esc(ref.name)}（${kb(ref.sizeBytes)}）
+ <form method="post" action="/setup/image-refs/delete" style="margin-top:.4rem">
+  <input type="hidden" name="id" value="${esc(ref.id)}">
+  ${code(`code_rd${i}`)}
+  <button type="submit" style="background:#c0392b">この参考画像を消す</button>
+ </form></li>`).join('');
+
+  // ★セットアップ前（コード無しで通る状態）は、画像のルールの書き込みを受け付けない。フォームも出さない
+  if (!status.requiresCode) {
+    return `<h2>画像のルール</h2>
+<div class="note">${esc(NEED_SETUP_FIRST)}</div>`;
+  }
+
+  return `<h2>画像のルール</h2>
+<div class="note">
+ サムネイルと文中の画像を AI が作るときのルールです。<b>何も登録しなければ、今までどおりに作ります。</b><br>
+ この画面は誰でも開けるため、登録した内容そのものは表示しません（文字数だけ出します）。書き直すときは、全文を入れ直してください。
+</div>
+${status.hasImageKey ? '' : '<div class="note">OpenAI の API キーが未登録のため、いまは画像を作りません（登録すると使われます）。</div>'}
+<table>
+ <tr><td>サムネ用のルール</td><td>${r.thumbnail.registered && r.thumbnail.chars ? `登録済み（${r.thumbnail.chars}字）` : '未登録'}</td></tr>
+ <tr><td>サムネのタイトル</td><td>${r.thumbnail.titleMode === 'title' ? '記事タイトルを入れる' : '入れない'}</td></tr>
+ <tr><td>確認と作り直し</td><td>${r.thumbnail.registered ? esc(inspectLabel(r.thumbnail.inspectRetries)) : '確認しない（今までどおり）'}</td></tr>
+ <tr><td>文中の画像用のルール</td><td>${r.inline.registered && r.inline.chars ? `登録済み（${r.inline.chars}字）` : '未登録'}</td></tr>
+ <tr><td>参考画像</td><td>${r.refs.length} / ${REF_MAX_COUNT} 枚</td></tr>
+</table>
+<form method="post" action="/setup/image-rules">
+ <label for="thumb_body" style="margin-top:1rem">サムネ用のルール（${RULE_BODY_MAX}字まで）</label>
+ <textarea id="thumb_body" name="thumb_body" maxlength="${RULE_BODY_MAX}" rows="6" style="width:100%;box-sizing:border-box"
+  placeholder="空のまま保存すると、いまの内容を残します"></textarea>
+ <label style="margin-top:.4rem"><input type="checkbox" name="thumb_clear" value="1" style="width:auto"> サムネ用のルールを消す</label>
+ <label for="thumb_title_mode" style="margin-top:1rem">サムネに記事タイトルを入れる</label>
+ <select id="thumb_title_mode" name="thumb_title_mode">
+  <option value="none"${r.thumbnail.titleMode === 'none' ? ' selected' : ''}>入れない（今までどおり）</option>
+  <option value="title"${r.thumbnail.titleMode === 'title' ? ' selected' : ''}>入れる（タイトルを一字一句そのまま）</option>
+ </select>
+ <label for="thumb_inspect" style="margin-top:1rem">作ったサムネを AI が確認し、気になる点があったときの作り直し</label>
+ <select id="thumb_inspect" name="thumb_inspect">${INSPECT_RETRY_OPTIONS.map((n) =>
+   `<option value="${n}"${n === inspectSel ? ' selected' : ''}>${esc(inspectLabel(n))}</option>`).join('')}</select>
+ <p class="d" style="margin-left:0">「作り直さない」の場合: タイトルを入れないときは AI の確認そのものを行いません（今までどおり1枚作るだけ）。
+ タイトルを入れるときは1回だけ確認し、タイトルが違っていたらサムネなしで進めます。<br>
+ サムネ1枚 約5〜6円・確認1回 約1円の目安（ご自身の OpenAI アカウントにかかります）。
+ 1回の作成で最大 約17〜20円。作り直しを含めても1記事 最大${MAX_GENERATIONS_PER_ARTICLE}枚（約35〜40円）までです。作り直した分も、1日の上限に数えます。</p>
+ <label for="inline_body" style="margin-top:1rem">文中の画像用のルール（${RULE_BODY_MAX}字まで）</label>
+ <textarea id="inline_body" name="inline_body" maxlength="${RULE_BODY_MAX}" rows="5" style="width:100%;box-sizing:border-box"
+  placeholder="空のまま保存すると、いまの内容を残します"></textarea>
+ <label style="margin-top:.4rem"><input type="checkbox" name="inline_clear" value="1" style="width:auto"> 文中の画像用のルールを消す</label>
+ ${code('code_ir')}
+ <button type="submit">画像のルールを保存する</button>
+</form>
+
+<h2>参考画像（キャラクターの見た目）</h2>
+<div class="note">登録すると、サムネと文中の画像の両方で、見た目（顔・髪・服など）の参考に使います。
+PNG・JPEG・WebP、1枚 ${REF_MAX_BYTES / 1024 / 1024}MB まで・${REF_MAX_COUNT} 枚まで。画像そのものはこの画面に表示しません。</div>
+${r.refs.length ? `<ul>${refRows}</ul>` : '<p class="lead">まだ登録されていません。</p>'}
+${r.refs.length < REF_MAX_COUNT ? `<form method="post" action="/setup/image-refs" enctype="multipart/form-data">
+ <label for="ref_name">名前（例: キャラクターの名前）</label>
+ <input id="ref_name" name="name" maxlength="40" autocomplete="off">
+ <label for="ref_file" style="margin-top:1rem">画像</label>
+ <input id="ref_file" name="file" type="file" accept="image/png,image/jpeg,image/webp" required>
+ ${code('code_ra')}
+ <button type="submit">参考画像を追加する</button>
+</form>` : ''}
+`;
+}
+
 function page(status: Status, steps: Step[] = [], message = ''): string {
   const mark = (ok: boolean) => ok ? '<span class="ok">✓</span>' : '<span class="ng">×</span>';
   const rows = steps.map((s) =>
@@ -198,6 +291,8 @@ LINE で <b>「セットアップ」</b> と送ると、10分間だけ使える�
 <form method="post" action="/setup/run"><button type="submit">セットアップを実行する</button></form>`}
 
 ${rateSection(status)}
+
+${imageRulesSection(status)}
 
 <h2>持ち主を変える</h2>
 <div class="note">
@@ -364,4 +459,138 @@ setupRouter.post('/setup/settings', async (c) => {
   }], unlimited
     ? '保存しました。上限なしにした場合、どれくらい投稿するかはご自身の判断になります。'
     : '保存しました。'));
+});
+
+
+// ── 画像のルール（2026-10-26）─────────────────────────────
+/** 断ったときの文言（ほかの書き込みと同じ） */
+function deniedMessage(reason: 'code_required' | 'code_invalid'): string {
+  return reason === 'code_required'
+    ? 'コードが必要です。LINE で「セットアップ」と送ると届きます。'
+    : 'コードが違うか、期限が切れています。LINE で取り直してください。';
+}
+
+/**
+ * ★画像のルールの書き込みは、初回（コード無しで通る状態）でも断る（2026-10-26 源蔵レビュー必須2）。
+ *   セットアップ前は誰でもコード無しで書けてしまう。素材やルールを差し込まれないよう、
+ *   セットアップを済ませて（＝LINE でコードを受け取れる状態にして）からにする
+ */
+export const NEED_SETUP_FIRST = '先にセットアップを済ませてください（上の「セットアップを実行する」）。画像のルールと参考画像は、そのあと LINE で受け取るコードを使って登録します。';
+
+type Permission = Awaited<ReturnType<typeof mayRun>>;
+function imageWriteDenied(p: Permission): string | null {
+  if (!p.allowed) return deniedMessage(p.reason);
+  if (p.reason === 'first_run') return NEED_SETUP_FIRST;
+  return null;
+}
+
+/** 本文の長さだけ先に見る（コードを使う前。上限超えでコードを無駄にさせない） */
+function tooLong(v: unknown): boolean {
+  return typeof v === 'string' && v.replace(/\r\n?/g, '\n').trim().length > RULE_BODY_MAX;
+}
+
+/**
+ * 画像のルールを保存する（サムネ用・文中画像用をまとめて。コードは1回きりのため）。
+ * ★空欄は「変えない」。この画面は登録済みの本文を出さないので、空欄で上書きして消さない（消すのはチェック欄）
+ */
+setupRouter.post('/setup/image-rules', async (c) => {
+  const status = await readStatus(c);
+  const form = await c.req.formData().catch(() => null);
+  // ★コード（1回きり）を使う前に、文字数を検査する（参考画像と同じ順番）。ここでは何も書かない
+  if (tooLong(form?.get('thumb_body')) || tooLong(form?.get('inline_body'))) {
+    return c.html(page(status, [{ label: '画像のルール', ok: false, detail: `${RULE_BODY_MAX}字を超えています。短くしてください。` }]), 400);
+  }
+  const permission = await mayRun(c.env.KV, (form?.get('code') as string | null) ?? null, status.requiresCode);
+  const deny = imageWriteDenied(permission);
+  if (deny) {
+    log.warn('画像のルールの保存を断りました', permission.reason);
+    return c.html(page(status, [], deny), 403);
+  }
+
+  const db = new Db(c.env.DB);
+  const steps: Step[] = [];
+  try {
+    const thumb = await saveImageRules(db, DEFAULT_TENANT_ID, 'thumbnail', {
+      body: form?.get('thumb_body') ?? undefined,
+      clearBody: form?.get('thumb_clear') === '1',
+      titleMode: form?.get('thumb_title_mode') ?? undefined,
+      inspectRetries: form?.get('thumb_inspect') ?? undefined,
+      by: 'web',
+    });
+    const inline = await saveImageRules(db, DEFAULT_TENANT_ID, 'inline', {
+      body: form?.get('inline_body') ?? undefined,
+      clearBody: form?.get('inline_clear') === '1',
+      by: 'web',
+    });
+    const label = (r: typeof thumb, name: string): Step => r.ok
+      ? { label: name, ok: true, detail: r.saved ? '保存しました' : '登録なしのまま（今までどおり）' }
+      : { label: name, ok: false, detail: r.reason === 'too_long' ? `${RULE_BODY_MAX}字を超えています。短くしてください。` : '選べない値でした。もう一度お試しください。' };
+    steps.push(label(thumb, 'サムネ用のルール'), label(inline, '文中の画像用のルール'));
+  } catch (e) {
+    log.warn('画像のルールを保存できませんでした', String(e).slice(0, 120));
+    return c.html(page(status, [{
+      label: '画像のルール', ok: false, detail: 'まだ準備が終わっていないようです。先に「セットアップを実行する」をお試しください。',
+    }]), 500);
+  }
+  const allOk = steps.every((x) => x.ok);
+  return c.html(page(await readStatus(c), steps, allOk ? '保存しました。次に作る画像から使われます。' : '一部を保存できませんでした。'), allOk ? 200 : 400);
+});
+
+/** 参考画像を1枚足す（multipart）。★大きすぎる送信は、中身を読む前に断る */
+setupRouter.post('/setup/image-refs', async (c) => {
+  const status = await readStatus(c);
+  const length = Number(c.req.header('content-length') ?? '0');
+  if (length > REF_MAX_BYTES + 64 * 1024) {
+    return c.html(page(status, [{ label: '参考画像', ok: false, detail: REF_REJECT_NOTE.too_large }]), 413);
+  }
+  const form = await c.req.formData().catch(() => null);
+  const file = form?.get('file') as unknown;
+  const isFile = (v: unknown): v is Blob => typeof v === 'object' && v !== null && typeof (v as Blob).arrayBuffer === 'function';
+  if (!isFile(file)) {
+    return c.html(page(status, [{ label: '参考画像', ok: false, detail: REF_REJECT_NOTE.empty }]), 400);
+  }
+  if (file.size > REF_MAX_BYTES) {
+    return c.html(page(status, [{ label: '参考画像', ok: false, detail: REF_REJECT_NOTE.too_large }]), 413);
+  }
+  const bytes = await file.arrayBuffer();
+  // ★コード（1回きり）を使う前に、中身を検査する（形式違いでコードを無駄にさせない）。ここでは何も書かない
+  const pre = checkRefUpload(bytes, (await listImageRefs(new Db(c.env.DB), DEFAULT_TENANT_ID)).length);
+  if (!pre.ok) {
+    return c.html(page(status, [{ label: '参考画像', ok: false, detail: REF_REJECT_NOTE[pre.reason] }]), 400);
+  }
+
+  const permission = await mayRun(c.env.KV, (form?.get('code') as string | null) ?? null, status.requiresCode);
+  const deny = imageWriteDenied(permission);
+  if (deny) {
+    log.warn('参考画像の追加を断りました', permission.reason);
+    return c.html(page(status, [], deny), 403);
+  }
+
+  try {
+    const r = await addImageRef(new Db(c.env.DB), new KvImageStore(c.env.KV), DEFAULT_TENANT_ID, {
+      name: form?.get('name'), bytes, by: 'web',
+    });
+    if (!r.ok) return c.html(page(status, [{ label: '参考画像', ok: false, detail: REF_REJECT_NOTE[r.reason] }]), 400);
+  } catch (e) {
+    log.warn('参考画像を保存できませんでした', String(e).slice(0, 120));
+    return c.html(page(status, [{ label: '参考画像', ok: false, detail: '保存できませんでした。少し待ってからやり直してください。' }]), 500);
+  }
+  return c.html(page(await readStatus(c), [{ label: '参考画像', ok: true, detail: '追加しました' }], '次に作る画像から使われます。'));
+});
+
+/** 参考画像を1枚消す */
+setupRouter.post('/setup/image-refs/delete', async (c) => {
+  const status = await readStatus(c);
+  const form = await c.req.formData().catch(() => null);
+  const permission = await mayRun(c.env.KV, (form?.get('code') as string | null) ?? null, status.requiresCode);
+  const deny = imageWriteDenied(permission);
+  if (deny) {
+    log.warn('参考画像の削除を断りました', permission.reason);
+    return c.html(page(status, [], deny), 403);
+  }
+  const id = String(form?.get('id') ?? '');
+  const ok = id ? await deleteImageRef(new Db(c.env.DB), new KvImageStore(c.env.KV), DEFAULT_TENANT_ID, id, 'web').catch(() => false) : false;
+  return c.html(page(await readStatus(c), [{
+    label: '参考画像を消す', ok, detail: ok ? '消しました' : '見つかりませんでした（すでに消えているかもしれません）',
+  }]), ok ? 200 : 404);
 });

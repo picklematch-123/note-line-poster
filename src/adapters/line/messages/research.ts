@@ -46,6 +46,8 @@ export function buildAiSettings(s: ResearchSettings, hasKey: boolean, inline?: I
         { label: '文中画像の1日上限', data: 'action=ai_ilimit' },
       ] : []),
       { label: 'サムネの設定', data: 'action=ai_thumb' },
+      // 2026-10-26 画像のルール（状態の要約と、設定画面への入り口）
+      { label: '画像のルール', data: 'action=ai_imgrules' },
     ],
   );
 }

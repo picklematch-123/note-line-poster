@@ -7,8 +7,15 @@
  * ★課金されるのは成功したときだけ。再試行は「一時的なエラー」に限り、回数に上限を置く。
  */
 import { log } from '../../lib/mask';
+import type { GeneratedImage, ImageGenerator, ReferenceImage } from './types';
+
+export type { GeneratedImage, ImageGenerator, ReferenceImage } from './types';
 
 const API = 'https://api.openai.com/v1/images/generations';
+/** 参考画像つき（2026-10-26 画像のルール）。multipart で送る */
+export const EDIT_API = 'https://api.openai.com/v1/images/edits';
+/** 参考画像は最大3枚まで送る（それ以上は切り捨てる。1環境の登録上限も3枚） */
+export const MAX_REFERENCE_IMAGES = 3;
 
 export const IMAGE_MODEL = 'gpt-image-2';
 
@@ -29,7 +36,15 @@ export const MAX_RETRIES = 2;
  */
 export const MAX_CALLS_PER_GENERATE = 2 * (MAX_RETRIES + 1);
 
-export type ImageErrorKind = 'auth' | 'billing' | 'verification' | 'policy' | 'rate' | 'temp' | 'bad_request';
+/**
+ * 画像1回の通信の時間切れ（★2026-10-26 源蔵レビュー必須1）。文章（180秒）・調査（120秒）と同じ考え方。
+ * 時間切れが無いと、応答が返らないとき step「サムネイルを作る」の 5 分の時間切れまで待ってしまう。
+ * 実測は1枚 約26〜40秒なので、120 秒あれば通常は届く。
+ */
+export const IMAGE_TIMEOUT_MS = 120_000;
+
+/** timeout = こちらから打ち切った。★再試行しない（生成済み＝課金済みかもしれないため。「200で読めない」と同じ扱い） */
+export type ImageErrorKind = 'auth' | 'billing' | 'verification' | 'policy' | 'rate' | 'temp' | 'timeout' | 'bad_request';
 
 export class ImageGenError extends Error {
   constructor(
@@ -42,13 +57,6 @@ export class ImageGenError extends Error {
     super(message);
     this.name = 'ImageGenError';
   }
-}
-
-export interface GeneratedImage {
-  bytes: ArrayBuffer;
-  contentType: string;
-  size: string;
-  usage?: { inputTokens: number; outputTokens: number };
 }
 
 interface OpenAiError { error?: { message?: string; code?: string; type?: string } }
@@ -101,8 +109,24 @@ function decodeBase64(b64: string): ArrayBuffer {
   return out.buffer;
 }
 
-export class OpenAiImageClient {
-  constructor(private readonly apiKey: string, private readonly model: string = IMAGE_MODEL) {
+/** 参考画像の送り名（顧客がつけた名前は使わない。中身の形式から拡張子だけ決める） */
+function refFilename(r: ReferenceImage, i: number): string {
+  if (r.filename) return r.filename;
+  const ext = r.mime === 'image/jpeg' ? 'jpg' : r.mime === 'image/webp' ? 'webp' : 'png';
+  return `ref${i + 1}.${ext}`;
+}
+
+function isAbort(e: unknown): boolean {
+  return e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError');
+}
+
+export class OpenAiImageClient implements ImageGenerator {
+  constructor(
+    private readonly apiKey: string,
+    private readonly model: string = IMAGE_MODEL,
+    /** 通信の時間切れ（ミリ秒）。テストで短くするためのもの */
+    private readonly timeoutMs: number = IMAGE_TIMEOUT_MS,
+  ) {
     if (!apiKey?.startsWith('sk-')) {
       throw new ImageGenError('OpenAI キーの形式が不正', 'auth',
         'OpenAI の API キーが正しく登録されていません。platform.openai.com で発行したキー（sk- で始まるもの）をご登録ください。');
@@ -112,22 +136,37 @@ export class OpenAiImageClient {
 
   /** 1枚だけ作る。サイズを断られたら標準サイズで1回だけやり直す。 */
   async generate(prompt: string, size: string = THUMBNAIL_SIZE): Promise<GeneratedImage> {
+    return this.withSizeFallback(prompt, size, null);
+  }
+
+  /**
+   * 参考画像つきで1枚作る（POST /v1/images/edits・multipart）。
+   * ★モデルは generate と同じく gpt-image-2 固定。再試行・サイズのやり直し・課金の扱いも同じ。
+   * ★参考画像が1枚も無ければ generate と同じ（呼び出し側の取り違えで失敗させない）
+   */
+  async edit(prompt: string, refs: ReferenceImage[], size: string = THUMBNAIL_SIZE): Promise<GeneratedImage> {
+    const list = refs.slice(0, MAX_REFERENCE_IMAGES);
+    if (list.length === 0) return this.generate(prompt, size);
+    return this.withSizeFallback(prompt, size, list);
+  }
+
+  private async withSizeFallback(prompt: string, size: string, refs: ReferenceImage[] | null): Promise<GeneratedImage> {
     try {
-      return await this.withRetry(prompt, size);
+      return await this.withRetry(prompt, size, refs);
     } catch (e) {
       if (e instanceof ImageGenError && e.kind === 'bad_request' && /size/i.test(e.message) && size !== FALLBACK_SIZE) {
         log.warn(`サイズ ${size} を断られたため ${FALLBACK_SIZE} で作り直します`);
-        return this.withRetry(prompt, FALLBACK_SIZE);
+        return this.withRetry(prompt, FALLBACK_SIZE, refs);
       }
       throw e;
     }
   }
 
-  private async withRetry(prompt: string, size: string): Promise<GeneratedImage> {
+  private async withRetry(prompt: string, size: string, refs: ReferenceImage[] | null): Promise<GeneratedImage> {
     let last: ImageGenError | null = null;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
-        return await this.once(prompt, size);
+        return await this.once(prompt, size, refs);
       } catch (e) {
         if (!(e instanceof ImageGenError)) throw e;
         last = e;
@@ -142,19 +181,50 @@ export class OpenAiImageClient {
     throw last!;
   }
 
-  private async once(prompt: string, size: string): Promise<GeneratedImage> {
+  /** 参考画像つきの送信内容（毎回作り直す。FormData を使い回さない） */
+  private editForm(prompt: string, size: string, refs: ReferenceImage[]): FormData {
+    const form = new FormData();
+    form.append('model', this.model);
+    form.append('prompt', prompt);
+    form.append('size', size);
+    form.append('quality', 'medium');
+    form.append('n', '1');
+    form.append('output_format', 'png');
+    refs.forEach((r, i) => form.append('image[]', new Blob([r.bytes], { type: r.mime }), refFilename(r, i)));
+    return form;
+  }
+
+  private async once(prompt: string, size: string, refs: ReferenceImage[] | null): Promise<GeneratedImage> {
+    // ★本文の受け取り中も時間切れの対象
+    const signal = AbortSignal.timeout(this.timeoutMs);
+    const timeoutError = (e: unknown) => new ImageGenError(`timeout after ${this.timeoutMs}ms: ${String(e)}`, 'timeout',
+      '画像の作成に時間がかかりすぎたため、打ち切りました。少し待って「サムネを作り直す」を押すか、ご自身の写真をサムネにしてください。');
     let res: Response;
     try {
-      res = await fetch(API, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${this.apiKey}` },
-        body: JSON.stringify({ model: this.model, prompt, size, quality: 'medium', n: 1, output_format: 'png' }),
-      });
+      res = refs
+        ? await fetch(EDIT_API, {
+          method: 'POST',
+          // ★content-type は付けない（multipart の区切りは fetch が付ける）
+          headers: { authorization: `Bearer ${this.apiKey}` },
+          body: this.editForm(prompt, size, refs),
+          signal,
+        })
+        : await fetch(API, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${this.apiKey}` },
+          body: JSON.stringify({ model: this.model, prompt, size, quality: 'medium', n: 1, output_format: 'png' }),
+          signal,
+        });
     } catch (e) {
+      if (isAbort(e) || signal.aborted) throw timeoutError(e);
       throw new ImageGenError(`通信エラー: ${String(e)}`, 'temp',
         '通信が不安定でサムネイルを作れませんでした。少し待って「サムネを作り直す」を押してください。');
     }
-    const raw = await res.text();
+    let raw: string;
+    try { raw = await res.text(); } catch (e) {
+      if (isAbort(e) || signal.aborted) throw timeoutError(e);
+      throw new ImageGenError(`受信エラー: ${String(e)}`, 'temp', '画像の受け取りに失敗しました。もう一度お試しください。', res.status);
+    }
     if (!res.ok) {
       let body: OpenAiError = {};
       try { body = JSON.parse(raw); } catch { /* 本文が JSON でない */ }

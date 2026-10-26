@@ -12,7 +12,8 @@
 import type { z } from 'zod';
 import { log } from '../../lib/mask';
 import { LlmError, DEFAULT_STRUCTURED_MAX_RETRIES, extractJson } from './types';
-import type { Llm, LlmUsage, LlmResult, ModelTier } from './types';
+import type { Llm, LlmUsage, LlmResult, ModelTier, VisionOptions } from './types';
+import { bytesToBase64 } from '../../lib/base64';
 
 const API = 'https://api.anthropic.com/v1/messages';
 const VERSION = '2023-06-01';
@@ -75,7 +76,8 @@ export class AnthropicLlm implements Llm {
     }
   }
 
-  private async call(model: string, system: string, user: string, maxTokens: number): Promise<MessagesResponse> {
+  /** @param user 文字だけ、または画像を含む内容ブロック（vision 用） */
+  private async call(model: string, system: string, user: string | unknown[], maxTokens: number): Promise<MessagesResponse> {
     const signal = AbortSignal.timeout(this.timeoutMs);
     const timeoutError = (e: unknown) => new LlmError(`timeout after ${this.timeoutMs}ms: ${String(e)}`,
       'Claude の応答に時間がかかりすぎたため、打ち切りました。', true, 0, 'timeout');
@@ -154,6 +156,32 @@ export class AnthropicLlm implements Llm {
       if (isAbort(e) || signal.aborted) throw timeoutError(e);
       throw new LlmError(String(e), '記事の生成中に通信エラーが発生しました。', true, res.status);
     }
+  }
+
+  /**
+   * 画像を見て答える（サムネの検品・2026-10-26）。画像は base64 の内容ブロックで渡す。
+   * ★再試行しない（検品できなかったら、呼び出し側が「未検品」で画像を採用する）。画像・本文はログに出さない
+   */
+  async vision<T>(opts: VisionOptions<T>): Promise<LlmResult<T>> {
+    const content = [
+      ...opts.images.map((img) => ({
+        type: 'image',
+        source: { type: 'base64', media_type: img.mime, data: bytesToBase64(img.bytes) },
+      })),
+      { type: 'text', text: opts.user },
+    ];
+    const res = await this.call(
+      MODELS[opts.tier],
+      `${opts.system}\n\n必ず JSON オブジェクトのみを出力してください。前置き・説明・コードフェンスは一切不要です。`,
+      content,
+      opts.maxTokens ?? 1500,
+    );
+    const text = res.content.filter((c) => c.type === 'text').map((c) => c.text ?? '').join('');
+    const parsed = opts.schema.safeParse(extractJson(text));
+    if (!parsed.success) {
+      throw new LlmError(`${opts.label}: 出力の形が不正`, '画像の確認に失敗しました。', false, undefined, 'bad_output');
+    }
+    return { data: parsed.data, usage: { inputTokens: res.usage.input_tokens, outputTokens: res.usage.output_tokens } };
   }
 
   /**

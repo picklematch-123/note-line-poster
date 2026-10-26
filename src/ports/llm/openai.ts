@@ -9,9 +9,10 @@
  * ★BYOK: 顧客自身の OpenAI API キー。
  */
 import { log } from '../../lib/mask';
+import { bytesToBase64 } from '../../lib/base64';
 import {
   LlmError, DEFAULT_STRUCTURED_MAX_RETRIES, extractJson,
-  type Llm, type LlmResult, type LlmUsage, type ModelTier, type StructuredOptions,
+  type Llm, type LlmResult, type LlmUsage, type ModelTier, type StructuredOptions, type VisionOptions,
 } from './types';
 
 const API = 'https://api.openai.com/v1/responses';
@@ -34,7 +35,11 @@ export const DEFAULT_CANDIDATES: Record<ModelTier, string[]> = {
  */
 export const DEFAULT_RESEARCH_CANDIDATES = ['gpt-6-luna', 'gpt-5.4-mini'];
 
-type CandidateKey = ModelTier | 'research';
+/**
+ * vision = 画像を見て判定する（サムネの検品・2026-10-26）。light の候補を先に、だめなら heavy の候補。
+ * ★画像を受け付けないモデルは「使えないモデル」として次の候補へ進む（課金されないため）
+ */
+type CandidateKey = ModelTier | 'research' | 'vision';
 
 /** 推論型は「考える分」も出力の上限に数える。本文が途中で切れないよう余裕を足す */
 const REASONING_HEADROOM = 6000;
@@ -55,6 +60,9 @@ export const RESEARCH_TIMEOUT_MS = 120_000;
  */
 export const TEXT_TIMEOUT_MS = 180_000;
 
+/** 画像の検品1回の通信の時間切れ。検品は短い JSON を返すだけなので、文章より短くする */
+export const VISION_TIMEOUT_MS = 90_000;
+
 export interface OpenAiLlmOptions {
   heavy?: string[];
   light?: string[];
@@ -63,6 +71,8 @@ export interface OpenAiLlmOptions {
   researchTimeoutMs?: number;
   /** 文章の通信の時間切れ（ミリ秒）。テストで短くするためのもの */
   textTimeoutMs?: number;
+  /** 画像の検品の通信の時間切れ（ミリ秒）。テストで短くするためのもの */
+  visionTimeoutMs?: number;
 }
 
 export function parseCandidates(raw: string | undefined | null): string[] | undefined {
@@ -160,6 +170,7 @@ export class OpenAiLlm implements Llm {
 
   private readonly researchTimeoutMs: number;
   private readonly textTimeoutMs: number;
+  private readonly visionTimeoutMs: number;
 
   constructor(private readonly apiKey: string, opts: OpenAiLlmOptions = {}) {
     if (!apiKey?.startsWith('sk-')) {
@@ -167,13 +178,17 @@ export class OpenAiLlm implements Llm {
         'OpenAI の API キーが正しく登録されていません。platform.openai.com で発行したキー（sk- で始まるもの）をご登録ください。',
         false, undefined, 'auth');
     }
+    const heavy = opts.heavy ?? DEFAULT_CANDIDATES.heavy;
+    const light = opts.light ?? DEFAULT_CANDIDATES.light;
     this.candidates = {
-      heavy: opts.heavy ?? DEFAULT_CANDIDATES.heavy,
-      light: opts.light ?? DEFAULT_CANDIDATES.light,
+      heavy,
+      light,
       research: opts.research ?? DEFAULT_RESEARCH_CANDIDATES,
+      vision: [...new Set([...light, ...heavy])],
     };
     this.researchTimeoutMs = opts.researchTimeoutMs ?? RESEARCH_TIMEOUT_MS;
     this.textTimeoutMs = opts.textTimeoutMs ?? TEXT_TIMEOUT_MS;
+    this.visionTimeoutMs = opts.visionTimeoutMs ?? VISION_TIMEOUT_MS;
   }
 
   /**
@@ -347,6 +362,56 @@ export class OpenAiLlm implements Llm {
       'OpenAI の文章モデルが、どの候補も使えない状態です。\n' +
       'OpenAI 側でモデルが入れ替わった可能性があります。提供元（運用側）へご連絡ください。\n' +
       '書きかけの内容は残っています。', false, lastUnavailable?.status, 'model_unavailable');
+  }
+
+  /**
+   * 画像を見て答える（サムネの検品）。Responses API の input_image で画像を渡す。
+   *
+   * ★再試行しない（1回呼ぶごとに課金される。検品できなかったら呼び出し側が「未検品」で画像を採用する）。
+   * ★候補は light → heavy の順。画像を受け付けないモデルは次の候補へ進む（課金されない）。
+   * ★store: false（顧客の画像を「保存済みの応答」として残さない）。画像・本文はログに出さない。
+   * ★tier は受け取るが、候補の並びは vision 用（light → heavy）を使う。
+   */
+  async vision<T>(opts: VisionOptions<T>): Promise<LlmResult<T>> {
+    const content = [
+      { type: 'input_text', text: ensureJsonWord(opts.user) },
+      ...opts.images.map((img) => ({
+        type: 'input_image',
+        image_url: `data:${img.mime};base64,${bytesToBase64(img.bytes)}`,
+        // 題名の文字を読むので細かく見る
+        detail: 'high',
+      })),
+    ];
+    const body = {
+      instructions: `${opts.system}\n\n必ず JSON オブジェクトのみを出力してください。前置き・説明・コードフェンスは一切不要です。`,
+      input: [{ role: 'user', content }],
+      max_output_tokens: (opts.maxTokens ?? 1500) + REASONING_HEADROOM,
+      store: false,
+      text: { format: { type: 'json_object' } },
+    };
+    const { out: j } = await this.withCandidates('vision', async (model) => {
+      try {
+        return await this.post(model, body, this.visionTimeoutMs);
+      } catch (e) {
+        // 画像の入力に対応していないモデル → 次の候補へ（このモデルでは課金されない）
+        if (e instanceof LlmError && e.status === 400 && e.kind !== 'model_unavailable' && /image/i.test(e.message)) {
+          throw new LlmError(`${model}: ${e.message}`, 'OpenAI のモデルが画像を受け付けません。', false, 400, 'model_unavailable');
+        }
+        throw e;
+      }
+    });
+    const text = (j.output ?? [])
+      .filter((o) => o.type === 'message')
+      .flatMap((o) => o.content ?? [])
+      .filter((c) => c.type === 'output_text')
+      .map((c) => c.text ?? '')
+      .join('');
+    const usage = { inputTokens: j.usage?.input_tokens ?? 0, outputTokens: j.usage?.output_tokens ?? 0 };
+    const parsed = opts.schema.safeParse(extractJson(text));
+    if (!parsed.success) {
+      throw new LlmError(`${opts.label}: 出力の形が不正`, '画像の確認に失敗しました。', false, undefined, 'bad_output');
+    }
+    return { data: parsed.data, usage };
   }
 
   async structured<T>(opts: StructuredOptions<T>): Promise<LlmResult<T>> {

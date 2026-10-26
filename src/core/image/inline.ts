@@ -14,6 +14,9 @@
  *  - OpenAI のキーが無い環境では何もしない（設定も有効にならない）
  *  - 修正で本文が作り直されたら、前回の画像を使い回す（見出しが同じものはその画像、残りは順番どおり）。
  *    足りない分だけ新しく作る。作り直しは専用ボタンを押したときだけ（二重課金を避ける）
+ *  - ★2026-10-26 画像のルール: 文中画像用のルール欄（kind='inline'）があれば指示文づくりに渡す。
+ *    参考画像（サムネと共有）があれば images/edits で描く。検品・題名モードは入れない（段階1）。
+ *    何も登録しなければ今までと同じ（指示文・呼び出しとも）。枚数の上限・予約・ロックは変えない
  */
 import { z } from 'zod';
 import type { Db, ArticleRow, ImageRow } from '../../ports/storage/db';
@@ -21,6 +24,9 @@ import type { ImageStore } from '../../ports/storage/images';
 import { LlmError, type Llm } from '../../ports/llm/types';
 import { createLlm, type LlmConfig } from '../../ports/llm';
 import { ImageGenError, OpenAiImageClient, THUMBNAIL_SIZE, type ImageErrorKind } from '../../ports/image/openai';
+import type { ImageGenerator } from '../../ports/image/types';
+import { getImageRules, listImageRefs, loadReferenceImages, REFERENCE_CLAUSE, REF_MAX_COUNT, type LoadedRef } from './rules';
+import { RULES_PRIORITY_SYSTEM, REFS_SYSTEM } from './thumbnail';
 import { parse, parseHeadings } from '../article/placeholders';
 import { jstDate } from '../../lib/time';
 import { newId } from '../../lib/id';
@@ -304,6 +310,10 @@ export interface InlinePlanInput {
   slots: GeneratedSlot[];
   /** ナレッジ（立場・避けること・画風の指定）。無ければ null */
   knowledge: string | null;
+  /** この顧客の画像ルール（文中画像用）。無ければ省く */
+  rules?: string | null;
+  /** 参考画像の名前（キャラクター名など）。無ければ省く */
+  refNames?: string[];
 }
 
 export function buildInlinePlanUser(i: InlinePlanInput): string {
@@ -312,7 +322,17 @@ export function buildInlinePlanUser(i: InlinePlanInput): string {
     `【挿絵を入れる場所（${i.slots.length}枚）】\n` + i.slots.map((s) =>
       `- slot ${s.slot}: 見出し「${s.heading ?? '（リード文）'}」\n  その見出しの本文: ${s.excerpt || '（なし）'}`).join('\n'),
     i.knowledge ? `【ナレッジ（この人の立場・避けること・画風の指定）】\n${i.knowledge.slice(0, 3000)}` : '',
+    i.rules ? `【この顧客の画像ルール（最優先）】\n${i.rules}` : '',
+    i.refNames?.length ? `【参考画像のキャラクター】${i.refNames.join('、')}` : '',
   ].filter(Boolean).join('\n\n');
+}
+
+/** ルール・参考画像があるときだけ足す（無ければ INLINE_PLAN_SYSTEM そのもの＝今までと同じ） */
+export function buildInlinePlanSystem(o: { hasRules: boolean; hasRefs: boolean }): string {
+  let sys = INLINE_PLAN_SYSTEM;
+  if (o.hasRules) sys += RULES_PRIORITY_SYSTEM;
+  if (o.hasRefs) sys += REFS_SYSTEM;
+  return sys;
 }
 
 export async function planInlineImages(llm: Llm, input: InlinePlanInput) {
@@ -321,7 +341,7 @@ export async function planInlineImages(llm: Llm, input: InlinePlanInput) {
     label: '文中画像の指示文',
     schema: InlinePlan,
     maxTokens: 4000,
-    system: INLINE_PLAN_SYSTEM,
+    system: buildInlinePlanSystem({ hasRules: Boolean(input.rules), hasRefs: Boolean(input.refNames?.length) }),
     user: buildInlinePlanUser(input),
   });
 }
@@ -361,6 +381,7 @@ export function inlineFailureNote(kind: ImageErrorKind | string): string {
     case 'policy': return 'OpenAI の安全基準で断られました';
     case 'rate': return 'OpenAI が混み合っていました';
     case 'temp': return 'OpenAI 側の一時的な不調でした';
+    case 'timeout': return '画像の作成に時間がかかりすぎたため打ち切りました';
     default: return '画像を作れませんでした';
   }
 }
@@ -379,6 +400,8 @@ export interface InlineDeps {
   llm: LlmConfig;
   /** 未設定なら生成しない */
   openaiKey?: string | null;
+  /** 画像を作る口（テスト用の差し替え）。省略時は OpenAI（gpt-image-2） */
+  generator?: ImageGenerator;
 }
 
 export interface InlinePlanItem { slot: number; heading: string | null; prompt: string; altText: string }
@@ -418,11 +441,17 @@ export async function prepareInlinePlan(
     }
 
     const context = await db.getActiveContext(article.tenant_id);
+    // ★登録が無ければ null / 空（今までと同じ指示文になる）
+    const rules = await getImageRules(db, article.tenant_id, 'inline');
+    // 指示文づくりに要るのは名前だけ（画像そのものは読まない。置き場から読むのは描くときの1回だけ）
+    const refNames = (await listImageRefs(db, article.tenant_id)).slice(0, REF_MAX_COUNT).map((r) => r.name);
     const llm = createLlm(deps.llm);
     const { data } = await planInlineImages(llm, {
       title: article.title ?? '',
       slots: targets,
       knowledge: context ? (context.prompt_snippet ?? context.raw_text) : null,
+      rules: rules?.body || null,
+      refNames: refNames.length ? refNames : undefined,
     });
     const byslot = new Map(data.images.map((x) => [x.slot, x]));
     const items: InlinePlanItem[] = [];
@@ -453,7 +482,9 @@ export type InlineImageOutcome =
  * @param force 作り直し。すでにある画像は、新しい画像ができてから消す（失敗したら前の画像のまま）
  */
 export async function ensureInlineImage(
-  deps: InlineDeps, articleId: string, item: InlinePlanItem, opts: { force?: boolean } = {},
+  deps: InlineDeps, articleId: string, item: InlinePlanItem,
+  /** refs: 読み込み済みの参考画像（runInlineImageSteps が1回の実行で1度だけ読んで渡す）。省略時はここで読む */
+  opts: { force?: boolean; refs?: LoadedRef[] } = {},
 ): Promise<InlineImageOutcome> {
   const { db } = deps;
   const slot = item.slot;
@@ -476,10 +507,15 @@ export async function ensureInlineImage(
       return { status: 'skipped', slot, reason: 'daily_limit', note: noteDailyLimit(settings.dailyLimit), stopRest: true };
     }
 
+    // 参考画像（サムネと共有）。あれば images/edits、無ければ従来どおり
+    const refs = opts.refs ?? await loadReferenceImages(db, deps.images, article.tenant_id);
+
     // 描く（課金はここ）。★直前に予約として数える。この後に失敗しても取り消さない
-    const client = new OpenAiImageClient(deps.openaiKey!);
+    const client = deps.generator ?? new OpenAiImageClient(deps.openaiKey!);
     await db.audit(article.tenant_id, AUDIT_INLINE_RESERVED, 'system', articleId, 'ok', { slot });
-    const img = await client.generate(item.prompt, INLINE_IMAGE_SIZE);
+    const img = refs.length
+      ? await client.edit(`${item.prompt}\n\n${REFERENCE_CLAUSE}`, refs, INLINE_IMAGE_SIZE)
+      : await client.generate(item.prompt, INLINE_IMAGE_SIZE);
 
     // ★置き場の名前は一意のIDで作る（サムネと同じ理由。同名で前の画像を消す事故を防ぐ）
     const n = newId();
@@ -538,13 +574,17 @@ export async function runInlineImageSteps(
   if (plan.status === 'skipped') return plan.note ? [plan.note] : [];
 
   const reasons = [...plan.notes];
+  // ★参考画像は1回の実行で1度だけ読み、全部の画像で使い回す（1枚ごとに置き場から読み直さない）。
+  //   step の戻り値には入れられない（画像のバイト列）ので step の外で読む。読めなければ参考画像なしで続ける
+  let refs: LoadedRef[] = [];
+  try { refs = await loadReferenceImages(deps.db, deps.images, (await deps.db.getArticle(articleId))?.tenant_id ?? ''); } catch { refs = []; }
   for (let i = 0; i < plan.items.length; i++) {
     let out: InlineImageOutcome;
     // 1枚ごとに「作成中」の印の期限を延ばす（5枚で10分を超えても、途中で別の作り直しを通さない）
     await opts.heartbeat?.().catch(() => {});
     try {
       out = await stepDo(`${prefix}文中の画像を作る ${i + 1}`, STEP_CONFIG,
-        () => ensureInlineImage(deps, articleId, plan.items[i], { force: opts.force }));
+        () => ensureInlineImage(deps, articleId, plan.items[i], { force: opts.force, refs }));
     } catch (e) {
       log.error('「文中の画像を作る」が止まったため、この1枚を飛ばします', String(e));
       out = { status: 'failed', slot: plan.items[i].slot, kind: 'step', note: '時間がかかりすぎたため打ち切りました', stopRest: false };

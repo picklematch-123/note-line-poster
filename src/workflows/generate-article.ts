@@ -28,7 +28,7 @@ import { listEntries } from '../core/generation/context';
 import { applyKnowledgeDigest } from '../core/knowledge/apply';
 import { buildKnowledgeSaved, buildKnowledgeOrganizeFailed } from '../adapters/line/messages/knowledge';
 import { ensureThumbnail, type ThumbnailOutcome } from '../core/image/thumbnail';
-import { runGenerationStep, notifyGenerationFailure } from './generate-step';
+import { runGenerationStep, notifyGenerationFailure, runThumbnailStep } from './generate-step';
 import { runInlineImageSteps, loadInlineView, hasImageKey, type StepDo } from '../core/image/inline';
 import { buildInlineRegenResult } from '../adapters/line/messages/inline';
 import { acquireImageLock, releaseImageLock, refreshImageLock, NOTE_INLINE_BUSY_AUTO } from '../core/image/lock';
@@ -171,7 +171,8 @@ export class GenerateArticleWorkflow extends WorkflowEntrypoint<Env, GeneratePar
     //   一時エラーの再試行は OpenAI クライアント側で回数を決めて行っている。
     // ★サムネも「作成中」の印を持つ（作り直しボタンと同時に描かない）。取れなければ今回は作らない
     const thumbToken = `auto:${articleId}:${(event as { instanceId?: string }).instanceId ?? ''}`;
-    const thumb = await step.do('サムネイルを作る', {
+    // ★step そのものが落ちても（5分の時間切れなど）runThumbnailStep が受け止め、サムネなしで先へ進む（源蔵レビュー必須1）
+    const thumb = await runThumbnailStep(() => step.do('サムネイルを作る', {
       retries: { limit: 0, delay: '1 second' },
       timeout: '5 minutes',
     }, async (): Promise<ThumbnailOutcome> => {
@@ -184,7 +185,7 @@ export class GenerateArticleWorkflow extends WorkflowEntrypoint<Env, GeneratePar
       } finally {
         await releaseImageLock(this.env.KV, 'thumb', articleId, thumbToken);
       }
-    });
+    }));
 
     // 2.6 文中の画像を作る（P3・既定0枚＝何もしない。失敗しても記事は届ける）
     // ★指示文は1回、画像は1枚ずつ独立した step（retries: 0・二重課金させない）。
@@ -283,10 +284,11 @@ export class GenerateArticleWorkflow extends WorkflowEntrypoint<Env, GeneratePar
     const line = new LineClient(this.env.LINE_CHANNEL_ACCESS_TOKEN, this.env.KV);
     // ★LINE 側で取った「作成中」の印は、終わっても失敗しても必ず外す（文中画像と同じ作り）
     try {
-      const out = await step.do('サムネイルを作り直す', {
+      // ★step が落ちても受け止め、結果（失敗）を LINE に知らせる
+      const out = await runThumbnailStep(() => step.do('サムネイルを作り直す', {
         retries: { limit: 0, delay: '1 second' },
         timeout: '5 minutes',
-      }, async (): Promise<ThumbnailOutcome> => ensureThumbnail(this.thumbDeps(db), p.articleId, { force: true }));
+      }, async (): Promise<ThumbnailOutcome> => ensureThumbnail(this.thumbDeps(db), p.articleId, { force: true })));
 
       await step.do('作り直しの結果を知らせる', async () => {
         await line.push(p.lineUserId, [buildThumbnailResult(p.articleId, out)]);

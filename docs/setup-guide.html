@@ -661,7 +661,7 @@
     <div class="facts">
       <div class="fact">
         <span class="fact__k">所要</span>
-        <span class="fact__v">約 86 分</span>
+        <span class="fact__v">約 89 分</span>
       </div>
       <div class="fact">
         <span class="fact__k">費用</span>
@@ -1369,9 +1369,9 @@
           <span class="note__label">ふだん、GitHub を開く場面はありません</span>
           <p>開発者向けのサイトに見えますが、<strong>置き場所として使われるだけ</strong>です。
           中を見る必要も、操作する必要もありません。</p>
-          <p>不具合が直ったときに最新版を入れるには、この GitHub での作業が要ります。
-          そのときは<strong>提供元からご案内します</strong>（作業をお任せいただく場合は、
-          提供元をこの置き場所に招待していただくことがあります）。</p>
+          <p>例外は<strong>一度だけ</strong>です。06 の最後に「自動更新をオンにする」で、
+          この GitHub の画面にファイルを1つ作ります（約3分）。以後、不具合の修正や新しい機能は
+          <strong>毎日1回、自動で届きます</strong>。</p>
         </div>
       </div>
     </label>
@@ -1382,7 +1382,7 @@
     <div class="phase__head">
       <span class="phase__num">06</span>
       <h2 class="phase__title">ボタンを押して配備する</h2>
-      <span class="phase__time">5分</span>
+      <span class="phase__time">8分</span>
     </div>
     <p class="phase__intro">
       ここが山場ですが、<strong>やることはボタンを押して、控えた値を貼るだけ</strong>です。
@@ -1482,6 +1482,53 @@
           <span class="note__label">失敗したとき</span>
           <p>赤い文字でエラーが出たら、その内容を控えて「つまずいたら」を確認してください。
           <strong>もう一度やり直す場合は、名前を変えてください</strong>（同じ名前だと、失敗したものが再利用されます）。</p>
+        </div>
+      </div>
+    </label>
+
+    <label class="step">
+      <input type="checkbox" class="step__check" data-step="s6-6">
+      <div class="step__body">
+        <h3 class="step__title">自動更新をオンにする <span class="tag tag--manual">手でやる</span></h3>
+        <p>提供元が不具合を直したり機能を足したりしたとき、<strong>あなたの環境に自動で届く</strong>ようにする設定です。
+        約3分。<strong>黒い画面は使いません。</strong>GitHub の画面だけで終わります。</p>
+        <ol>
+          <li>GitHub を開き、配備で作られた置き場所（リポジトリ）を開きます。
+          名前は配備の画面で決めたもの（初期値は <code>note-line-poster</code>）です</li>
+          <li>ファイルの一覧の上にある <strong>「Add file」</strong> → <strong>「Create new file」</strong> を押します</li>
+          <li>いちばん上のファイル名の欄に、次をそのまま入れます（<code>/</code> を打つとフォルダに分かれますが、それで正しい動きです）
+            <div class="cmd">
+              <button class="cmd__copy" type="button">コピー</button>
+              <div class="cmd__scroll"><code>.github/workflows/auto-update.yml</code></div>
+            </div>
+          </li>
+          <li>下の大きな欄に、次の<strong>1行</strong>をコピーして貼り付けます（改行や空白を足さないでください）
+            <div class="cmd">
+              <button class="cmd__copy" type="button">コピー</button>
+              <div class="cmd__scroll"><code>{"name":"auto-update","on":{"schedule":[{"cron":"17 18 * * *"}],"workflow_dispatch":{}},"permissions":{"contents":"write","issues":"write"},"concurrency":{"group":"auto-update","cancel-in-progress":false},"jobs":{"sync":{"runs-on":"ubuntu-latest","timeout-minutes":30,"steps":[{"uses":"actions/checkout@v4","with":{"persist-credentials":false}},{"uses":"actions/setup-node@v4","with":{"node-version":"22"}},{"run":"node scripts/sync-upstream.mjs","env":{"GITHUB_TOKEN":"${{ secrets.GITHUB_TOKEN }}"}}]}}}</code></div>
+            </div>
+          </li>
+          <li>右上の緑の <strong>「Commit changes…」</strong> → 出てきた画面でもう一度 <strong>「Commit changes」</strong> を押します</li>
+        </ol>
+        <div class="note">
+          <span class="note__label">オンにすると、何が起きるか</span>
+          <ul>
+            <li><strong>毎日1回（日本時間の午前3時ごろ）</strong>、提供元が「顧客に配ってよい」と決めた最新版があるかを確かめます</li>
+            <li>あれば、取り込む前に<strong>検査（テストなど）</strong>をして、通ったときだけ入れます。入れると数分でシステムが作り直されます</li>
+            <li>検査に落ちたときは<strong>何も変えません</strong>。GitHub のこの置き場所に「Issue」（お知らせ）が立ち、
+            GitHub からメールが届きます。そのときは提供元にご連絡ください（原因が解消すると、この Issue は自動で閉じます）</li>
+            <li>新しい機能のために、データベースの<strong>テーブル（表）が追加で変わることはあります</strong>が、あなたのデータ（記事・ナレッジ・note の連携）を<strong>消すことはありません</strong>。データベースのつなぎ先（ID）も変えません</li>
+          </ul>
+        </div>
+        <div class="note note--alarm">
+          <span class="note__label">中身を自分で書き換えた場合</span>
+          <p>置き場所のファイルを自分で書き換えていると、<strong>上書きはせず、自動更新がそこで止まります</strong>
+          （書き換えた内容を消さないためです）。そのときも Issue が立つので、提供元にご相談ください。</p>
+        </div>
+        <div class="note">
+          <span class="note__label">止めたいとき</span>
+          <p>同じ手順で、置き場所のいちばん上に <code>.sync-pin</code> という名前のファイル（中身は空で構いません）を作ると止まります。
+          消せば再開します。GitHub の「Actions」の画面で、このワークフローを無効にしても止まります。</p>
         </div>
       </div>
     </label>
@@ -1916,6 +1963,11 @@
             書き直したいだけなら、一覧から開いて「修正する」で同じ URL のまま直せます</td>
           </tr>
           <tr>
+            <td>GitHub から「自動更新が止まっています」というメールが届いた</td>
+            <td>システムは<strong>これまでどおり動いています</strong>（何も変えていません）。
+            メールの中の Issue の URL を、提供元にお伝えください</td>
+          </tr>
+          <tr>
             <td>いまの状態を知りたい</td>
             <td>LINE で「連携状況」。技術的には <code>/health</code> を開くと全項目が見えます</td>
           </tr>
@@ -1939,6 +1991,7 @@
           <tr><td>5つのアカウントを作る（LINE・note・OpenAI・Cloudflare・GitHub）</td><td>初回のみ</td></tr>
           <tr><td>OpenAI の残高を買い足す</td><td>残高が減ったとき</td></tr>
           <tr><td>鍵を3つ、配備の画面に貼る</td><td>初回のみ</td></tr>
+          <tr><td>自動更新のファイルを1つ作る（GitHub の画面で1行貼る）</td><td>初回のみ</td></tr>
           <tr><td>LINE の応答メッセージをオフにする</td><td>初回のみ</td></tr>
           <tr><td>note にログインして、拡張のボタンを押す</td><td>初回＋月1回ほど</td></tr>
         </tbody>
