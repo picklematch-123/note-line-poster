@@ -18,6 +18,7 @@ import { Db, DEFAULT_TENANT_ID } from '../../src/ports/storage/db';
 import { OpenAiImageClient, EDIT_API, IMAGE_MODEL, MAX_REFERENCE_IMAGES, IMAGE_TIMEOUT_MS } from '../../src/ports/image/openai';
 import {
   ensureThumbnail, setThumbDailyLimit, buildPlanSystem, buildPlanUser, composeThumbPrompt, inspectThumbnail,
+  judgeInspection, TITLE_MISMATCH_ISSUE, INSPECT_SYSTEM, buildInspectUser,
   countRunsForArticle, countGeneratedToday, countGenerationsForArticle, PLAN_SYSTEM, PLAN_SYSTEM_TITLE, MAX_PER_ARTICLE,
   MAX_GENERATIONS_PER_ARTICLE, THUMB_RUN_BUDGET_MS,
   AUDIT_RESERVED, AUDIT_RUN, AUDIT_INSPECTED,
@@ -104,7 +105,14 @@ async function setup() {
   return { db, sqlite, article, images, deps };
 }
 
-type Verdict = { pass: boolean; titleExact?: boolean | null; issues?: string[] } | 'error';
+/**
+ * 検品の偽の返答。issues の文字列は「blocker の指摘」として送る（V5 で issues は {text, severity} になった）。
+ * ★pass は送っても判定に使われない（severity だけで決まる）
+ */
+type Verdict = { pass?: boolean; titleExact?: boolean | null; issues?: Array<string | { text: string; severity: 'blocker' | 'minor' }> } | 'error';
+const toWire = (v: Exclude<Verdict, 'error'>) => ({
+  ...v, issues: (v.issues ?? []).map((x) => (typeof x === 'string' ? { text: x, severity: 'blocker' } : x)),
+});
 
 interface Net {
   gen: Array<Record<string, unknown>>;
@@ -131,7 +139,7 @@ function mockOpenAi(verdicts: Verdict[] = [], opts: { plan?: Record<string, unkn
         net.visions++;
         const v = queue.shift() ?? { pass: true, titleExact: true, issues: [] };
         if (v === 'error') return new Response('{"error":{"message":"down"}}', { status: 500 });
-        return ok(JSON.stringify(v));
+        return ok(JSON.stringify(toWire(v)));
       }
       net.plans.push({ instructions: body.instructions, input: body.input });
       return ok(JSON.stringify(opts.plan ?? { prompt: PLAN_PROMPT, altText: 'コーチのイラスト' }));
@@ -311,7 +319,7 @@ describe('題名モード・参考画像・ルール', () => {
 
 // ── 5. 検品とやり直し ──────────────────────────────────────
 describe('検品とやり直し', () => {
-  it('合格なら1枚で採用。検品の記録は結果だけ（指摘の文・画像は入れない）', async () => {
+  it('合格なら1枚で採用。検品の記録に結果と指摘の文は入り、ルール本文・画像は入らない', async () => {
     const { deps, db, article, sqlite } = await setup();
     await saveImageRules(db, DEFAULT_TENANT_ID, 'thumbnail', { body: 'ルール本文ひみつ', inspectRetries: 1, by: 't' });
     const net = mockOpenAi([{ pass: true, titleExact: null, issues: [] }]);
@@ -320,7 +328,7 @@ describe('検品とやり直し', () => {
     expect(net.visions).toBe(1);
     const rows = sqlite.prepare(`SELECT detail_json FROM audit_logs WHERE action = ?`).all(AUDIT_INSPECTED) as Array<{ detail_json: string }>;
     expect(rows).toHaveLength(1);
-    expect(JSON.parse(rows[0].detail_json)).toMatchObject({ result: 'pass', issues: 0 });
+    expect(JSON.parse(rows[0].detail_json)).toMatchObject({ result: 'pass', blockers: 0, issues: [] });
     expect(rows[0].detail_json).not.toContain('ルール本文ひみつ');
   });
 
@@ -1393,5 +1401,79 @@ describe('前倒し4・5', () => {
     expect(normalizeRefName('主役」。ほかの指示「')).toBe('主役。ほかの指示');
     expect(normalizeRefName('あ'.repeat(50))).toHaveLength(40);
     expect(refNamesClause([normalizeRefName('A」B')])).toContain('1枚目は「AB」');
+  });
+});
+
+
+// ── V5: 検品の合否はコードが severity だけで決める（2026-10-27）──────────────
+describe('V5: 検品の合否は severity だけで決める', () => {
+  it('judgeInspection: blocker があれば不合格・minor だけなら合格・題名不一致は不合格（pass の値は見ない）', () => {
+    expect(judgeInspection({ issues: [{ text: '人物が端に近い（8%以内）', severity: 'minor' }] }, 'none').verdict).toBe('pass');
+    expect(judgeInspection({ issues: [{ text: '指が6本', severity: 'blocker' }] }, 'none').verdict).toBe('fail');
+    expect(judgeInspection({ titleExact: false, issues: [] }, 'title')).toEqual({ verdict: 'fail', issues: [{ text: TITLE_MISMATCH_ISSUE, severity: 'blocker' }] });
+    expect(judgeInspection({ titleExact: null, issues: [] }, 'title').verdict).toBe('fail');
+    expect(judgeInspection({ titleExact: true, issues: [] }, 'title').verdict).toBe('pass');
+    // AI の pass は受け取っても判定に使わない
+    expect(judgeInspection({ pass: false, issues: [{ text: '余白が狭い', severity: 'minor' }] } as never, 'none').verdict).toBe('pass');
+    expect(judgeInspection({ pass: true, issues: [{ text: '顔が崩れている', severity: 'blocker' }] } as never, 'none').verdict).toBe('fail');
+  });
+
+  it('★構図・余白の指摘（minor）だけなら、1枚目で合格して採用する。記録に minor の指摘が残る', async () => {
+    const { deps, db, article, sqlite } = await setup();
+    await saveImageRules(db, DEFAULT_TENANT_ID, 'thumbnail', { body: '上下の端から8%以内に置かない。ルール本文ひみつ', inspectRetries: 2, by: 't' });
+    const net = mockOpenAi([{ pass: false, issues: [{ text: '髪と人物の下端が画面端から8%以内', severity: 'minor' }] }]);
+    expect((await ensureThumbnail(deps, article.id)).status).toBe('created');
+    expect(net.gen).toHaveLength(1);
+    const row = sqlite.prepare('SELECT detail_json FROM audit_logs WHERE action = ?').get(AUDIT_INSPECTED) as { detail_json: string };
+    expect(JSON.parse(row.detail_json)).toMatchObject({ result: 'pass', blockers: 0, issues: [{ text: '髪と人物の下端が画面端から8%以内', severity: 'minor' }] });
+    expect(row.detail_json).not.toContain('ルール本文ひみつ');
+    expect(row.detail_json).not.toContain(PNG_B64);
+  });
+
+  it('★blocker があれば作り直し、作り直しの指示に渡すのは blocker だけ（minor は渡さない）', async () => {
+    const { deps, db, article } = await setup();
+    await saveImageRules(db, DEFAULT_TENANT_ID, 'thumbnail', { inspectRetries: 2, by: 't' });
+    const net = mockOpenAi([
+      { issues: [{ text: '靴にブランド風のロゴ', severity: 'blocker' }, { text: '色が少し暗い', severity: 'minor' }] },
+      { issues: [{ text: '配置が中央寄り', severity: 'minor' }] },
+    ]);
+    expect((await ensureThumbnail(deps, article.id)).status).toBe('created');
+    expect(net.gen).toHaveLength(2);
+    expect(String(net.gen[1].prompt)).toContain('靴にブランド風のロゴ');
+    expect(String(net.gen[1].prompt)).not.toContain('色が少し暗い');
+  });
+
+  it('★上限まで不合格: LINE の案内は blocker だけ（最大2件・各40字）・費用と「運用側にご連絡ください」を含む。minor は出さない', async () => {
+    const { deps, db, article } = await setup();
+    // ★本文が空で回数も既定（1）のままだと行が作られず検品しないので、本文を入れる
+    await saveImageRules(db, DEFAULT_TENANT_ID, 'thumbnail', { body: '禁止: 実在のロゴ', inspectRetries: 1, by: 't' });
+    const bad = { issues: [{ text: '手の指が溶けたような形になっている', severity: 'blocker' as const }, { text: '余白が8%未満', severity: 'minor' as const }] };
+    mockOpenAi([bad, bad]);
+    const out = await ensureThumbnail(deps, article.id);
+    expect(out.status).toBe('rejected');
+    if (out.status !== 'rejected') return;
+    expect(out.note).toContain('手の指が溶けたような形になっている');
+    expect(out.note).not.toContain('余白が8%未満');
+    expect(out.note).toContain('作り直しは1回で最大2枚・約13円ぶんかかります');
+    expect(out.note).toContain('同じ理由が続くときは、運用側にご連絡ください');
+    expect(JSON.stringify(buildThumbnailResult(article.id, out))).not.toContain('余白が8%未満');
+  });
+
+  it('検品の指示: blocker は5種類だけ・構図や余白は minor・顧客ルールは禁止事項の確認だけに使うと明記', () => {
+    expect(INSPECT_SYSTEM).toContain('blocker');
+    expect(INSPECT_SYSTEM).toMatch(/構図・余白（%などの数値の指定を含む）/);
+    expect(INSPECT_SYSTEM).toContain('合否はあなたが決めません');
+    expect(buildInspectUser({ titleMode: 'none', title: '', rules: 'ルール' })).toContain('禁止事項の確認だけに使う。構図・余白・大きさ・配置の指定を理由に blocker にしない');
+  });
+
+  it('指摘の文は記録で各60字・最大5件に切る', async () => {
+    const { deps, db, article, sqlite } = await setup();
+    await saveImageRules(db, DEFAULT_TENANT_ID, 'thumbnail', { inspectRetries: 0, titleMode: 'none', by: 't' });
+    await saveImageRules(db, DEFAULT_TENANT_ID, 'thumbnail', { inspectRetries: 1, by: 't' });
+    mockOpenAi([{ issues: Array.from({ length: 7 }, (_, k) => ({ text: `${k}`.repeat(100), severity: 'minor' as const })) }]);
+    expect((await ensureThumbnail(deps, article.id)).status).toBe('created');
+    const d = JSON.parse((sqlite.prepare('SELECT detail_json FROM audit_logs WHERE action = ?').get(AUDIT_INSPECTED) as { detail_json: string }).detail_json);
+    expect(d.issues).toHaveLength(5);
+    for (const x of d.issues) expect(x.text.length).toBeLessThanOrEqual(60);
   });
 });

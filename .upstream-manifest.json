@@ -1,5 +1,5 @@
 {
-  "version": "20261026-9ccb9f3-dirty-11d14248",
+  "version": "20261027-9ccb9f3-dirty-08ddf80d",
   "files": {
     ".dev.vars.example": "2455b3a5f9d137531e76beccb4a08c17cb649d67baf7800824d2cf5f3cbfa3b8",
     "README.md": "2e536ea3304505b866ebc068364f33f759a2df79313ab042023070f0f692ff53",
@@ -84,7 +84,7 @@
     "src/core/image/lock.ts": "2562aae62e84ec3416f8328256e0f6b5cf9a5fa562c277f6ffebfba2099a5e5a",
     "src/core/image/review.ts": "7c5d9cba0a26ac743cc326e2230321d0327bafb00e1f48a28a99dbc7a9a0593e",
     "src/core/image/rules.ts": "5c37fd8b0261f0b6bfa4837904bf57a9f2fae64b2471ccba14b827a01a34fab8",
-    "src/core/image/thumbnail.ts": "cc1f54a8b37315fe9e4addd57a4245a5f7e09d2f15c97d3aa6572ab71c71b66e",
+    "src/core/image/thumbnail.ts": "bcb13b5bbd4d775fb288a09bbe527ceec169457970fc954f70bb05ae64742dab",
     "src/core/knowledge/apply.ts": "1abfd01d5b579ad2566a92048ccf91adddd273dc477753e5cc8fac32dfb2e197",
     "src/core/line/access.ts": "437d4d5ce7e5576fe585db81dd4b87da3eae0f2fde1fd53cad287347f2ea4b6d",
     "src/core/line/idea-input.ts": "a703137e777ad12c25d8cc221cd5c753b5abdcd1276c158e81d7405245d56619",
@@ -127,7 +127,7 @@
     "src/ports/publisher/note/public.ts": "1598cf37b0e1d2e9ab3477bbc272515c02d8e7fdff6da3ec9d159b50dc5bc851",
     "src/ports/storage/db.ts": "a104a075779b210b6cd536aeae7d9a6cad79fa2bbb1216c5db021c218c867b9e",
     "src/ports/storage/images.ts": "559336785d1cb763e4bcb80736e454daa84d86176d9416ed0901b0d89393a605",
-    "src/version.ts": "a2fe0035a8396c3eb75e8f1b3b490431af6cde6cab1dc9e3971cb2efe0b02098",
+    "src/version.ts": "8360afbca8bbd556cc19e3f7cc250e8090e608d00d0792aca15682b50a5e3e4d",
     "src/workflows/generate-article.ts": "7d729fdc3ca836953a106dfe2deab58e3e6259b351b07d1f51b2e1bd2f44c77a",
     "src/workflows/generate-step.ts": "8a1de8e2c854e9dcdc6b04914acc792c61e5096ad159b56f3ac459aea1bdc4da",
     "test/unit/access.test.ts": "616308c5887426a146240ac38d1799079ba010685ceb338f30998901e1177ab8",
@@ -140,7 +140,7 @@
     "test/unit/generation-timeout.test.ts": "5d2739dd1ce46c9d33f437d52869110e448772a3ef69d66ec32217a85e7a2a06",
     "test/unit/html.test.ts": "1afed811e005f3c6d221f52d6b312e6efcc3cd5fe3a707310a08e328b5c6ccdf",
     "test/unit/idea-input.test.ts": "947177963a18a587342112d3b602e4dbab8fe10aa84c65997c753116b03f734d",
-    "test/unit/image-rules.test.ts": "5a2796669ed678a4766396a1563c404d18c4eaa32c557ba47a1ac8252cd72bb5",
+    "test/unit/image-rules.test.ts": "6b19d078e8ba653cccdb7215ed2cb825d5101f24466143db610b6d6e5fc53de4",
     "test/unit/inline-images-review.test.ts": "6978669ebf03b9de96957e5eda11da352b7c8366c36cf708acf659662da7ed77",
     "test/unit/inline-images.test.ts": "1d29f0c0f4d738128d033f3af6d18203fe102adcfd7918db39e0c9c9008ee371",
     "test/unit/knowledge.test.ts": "33eb6c2d3fe1de9f9e5d0223de39447ba3b7922dd00f9afad0f9b6cb7ab97cc7",

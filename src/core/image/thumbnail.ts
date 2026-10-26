@@ -57,6 +57,8 @@ export const MAX_GENERATIONS_PER_ARTICLE = 6;
  * step「サムネイルを作る」の 5 分の時間切れに近づかないよう、これを過ぎたら次の1枚は作らない
  */
 export const THUMB_RUN_BUDGET_MS = 150_000;
+/** 1枚あたりの費用の目安（生成 約5〜6円＋確認 約1円）。不合格の案内の「約○円」に使う */
+export const COST_PER_ATTEMPT_YEN = 6.5;
 /** 1日に作れる枚数の既定。1枚 約6〜9円なので、最大でも1日 約90円 */
 export const DEFAULT_DAILY_LIMIT = 10;
 /** 選択肢。0（無制限）は用意しない。止めたいときは自動生成をオフにする */
@@ -206,38 +208,85 @@ export function composeThumbPrompt(o: {
 }
 
 // ── 検品（生成した画像を LLM の画像入力で見る）─────────────────
-const InspectResult = z.object({
-  pass: z.boolean(),
-  titleExact: z.boolean().nullable().optional(),
-  issues: z.array(z.string().max(300)).max(10).default([]),
+/**
+ * ★2026-10-27 V5: 合否は AI に決めさせない。AI は「指摘」と「重さ（blocker / minor）」だけを返し、
+ *   合否はコードの judgeInspection 1か所で決める（pass の値は受け取っても使わない）。
+ *   きっかけ: 顧客ルールの構図・余白の指定（「上下の端から8%以内に置かない」など）まで厳密に判定して落とし、
+ *   別の指定（「上半身〜膝上を大きく」）と両立しないため、毎回同じ理由で不合格になって上限を使い切った。
+ *   検品の目的は「描き損じを止める」こと。構図・余白・大きさ・配置・色・雰囲気は、描き直しても満たせるとは限らない
+ */
+const InspectIssue = z.object({
+  text: z.string().max(300),
+  severity: z.enum(['blocker', 'minor']),
 });
+const InspectResult = z.object({
+  /** 受け取っても判定には使わない（古い形の出力でも読めるように残す） */
+  pass: z.boolean().optional(),
+  titleExact: z.boolean().nullable().optional(),
+  issues: z.array(InspectIssue).max(10).default([]),
+});
+export type InspectIssue = z.infer<typeof InspectIssue>;
 
-export const INSPECT_SYSTEM = `あなたは note 記事のサムネイル画像の検品係です。渡された画像1枚を見て、公開してよいかを判定します。
+export const INSPECT_SYSTEM = `あなたは note 記事のサムネイル画像の検品係です。目的は「描き損じを止める」ことです。渡された画像1枚を見て、気づいた点を重さつきで挙げます。合否はあなたが決めません。
 
-【確認すること】
-1. 文字: 指定された文字の扱いを守っているか（題名が指定されていれば、一字一句同じか。抜け・誤字・余計な文字がないか）
-2. 余計な文字: 題名以外の文字・文字のような模様（看板・服・肩・背景の読めない文字風の模様を含む）
+【blocker（必ず直す描き損じ）にするのは、次の5つだけ】
+1. 題名が指定されていれば、題名が一字一句違う・抜けている・誤字がある
+2. 題名以外の余計な文字・文字のような模様（看板・服・肩・背景の読めない文字風の模様を含む）
 3. 実在のブランドのロゴ・商標に見える模様（靴・服・道具など）
-4. 体・手・顔・道具の崩れ（指の数、ねじれ、溶けたような形、道具の形が壊れている）
-5. 顧客の画像ルールに書かれた禁止事項に当たるもの
+4. 体・手・顔・道具の明らかな崩れ（指の数、ねじれ、溶けたような形、道具の形が壊れている）
+5. 顧客の画像ルールで「禁止」「描かない」と明記された、描いてはいけない物が描かれている（例: 禁止されている用具）
 
-問題が1つでもあれば pass=false。issues には、次に描き直すときに直すべき点を日本語で短く（1件40字程度、最大5件）。
-問題がなければ pass=true、issues は空。
-JSON: {"pass": true, "titleExact": true, "issues": []}`;
+【minor（気づいても blocker にしない）】
+構図・余白（%などの数値の指定を含む）・キャラクターの大きさ・配置・比率・色・雰囲気・画風の細かな好み、
+顧客ルールの「〜すること」「〜にする」型の指定に合っていない点。これらは描き直しても必ず満たせるとは限らないため、
+気づいても必ず minor にする。
+
+【出力】
+issues には、気づいた点を日本語で短く（1件40字程度、最大5件）。それぞれに severity（"blocker" か "minor"）を付ける。
+気づいた点がなければ issues は空。titleExact には、題名が指定されているときだけ一致したか（true/false）、指定がなければ null。
+JSON: {"titleExact": true, "issues": [{"text": "...", "severity": "minor"}]}`;
 
 export function buildInspectUser(o: { titleMode: TitleMode; title: string; rules: string | null }): string {
   return [
     o.titleMode === 'title'
       ? `【題名（この文字列が一字一句そのまま入っていること。titleExact に一致したかを入れる）】「${o.title.replace(/[\r\n]+/g, ' ').trim()}」`
       : '【文字】画像に文字は入っていないこと（短い英単語2語までは可）。titleExact は null',
-    o.rules ? `【この顧客の画像ルール（禁止事項の確認に使う）】\n${o.rules}` : '',
+    o.rules
+      ? `【この顧客の画像ルール（禁止事項の確認だけに使う。構図・余白・大きさ・配置の指定を理由に blocker にしない）】\n${o.rules}`
+      : '',
   ].filter(Boolean).join('\n\n');
 }
 
 export type InspectVerdict =
-  | { verdict: 'pass'; issues: string[] }
-  | { verdict: 'fail'; issues: string[] }
-  | { verdict: 'unchecked'; reason: string; issues: string[] };
+  | { verdict: 'pass'; issues: InspectIssue[] }
+  | { verdict: 'fail'; issues: InspectIssue[] }
+  | { verdict: 'unchecked'; reason: string; issues: InspectIssue[] };
+
+/** 題名が一致しなかったときに足す指摘（AI が題名の指摘を書かなかった場合） */
+export const TITLE_MISMATCH_ISSUE = '題名の文字が指定と一字一句一致していない';
+
+/**
+ * ★合否の判定（ここ1か所）。blocker が1つでもある、または題名モードで titleExact が true でない → 不合格。
+ *   minor だけなら合格。AI の pass の値は見ない
+ */
+export function judgeInspection(data: { titleExact?: boolean | null; issues: InspectIssue[] }, titleMode: TitleMode): {
+  verdict: 'pass' | 'fail'; issues: InspectIssue[];
+} {
+  const issues = data.issues
+    .map((x) => ({ text: x.text.replace(/\s+/g, ' ').trim(), severity: x.severity }))
+    .filter((x) => x.text)
+    .slice(0, 5);
+  const titleOk = titleMode !== 'title' || data.titleExact === true;
+  if (!titleOk && !issues.some((x) => x.severity === 'blocker' && x.text.includes('題名'))) {
+    issues.unshift({ text: TITLE_MISMATCH_ISSUE, severity: 'blocker' });
+  }
+  return { verdict: issues.some((x) => x.severity === 'blocker') ? 'fail' : 'pass', issues };
+}
+
+/** blocker の指摘の文だけ（作り直しの指示・LINE の通知に使う。minor は渡さない） */
+export function blockerTexts(issues: InspectIssue[]): string[] {
+  return issues.filter((x) => x.severity === 'blocker').map((x) => x.text);
+}
 
 /**
  * 1枚を検品する。例外は投げない。
@@ -257,11 +306,7 @@ export async function inspectThumbnail(
       user: buildInspectUser(o),
       images: [{ bytes: img.bytes, mime: img.contentType }],
     });
-    const issues = data.issues.map((x) => x.trim()).filter(Boolean).slice(0, 5);
-    const titleOk = o.titleMode !== 'title' || data.titleExact === true;
-    if (data.pass && titleOk) return { verdict: 'pass', issues: [] };
-    if (!titleOk && !issues.some((x) => x.includes('題名'))) issues.unshift('題名の文字が指定と一字一句一致していない');
-    return { verdict: 'fail', issues: issues.length ? issues : ['公開に向かない点がある'] };
+    return judgeInspection(data, o.titleMode);
   } catch (e) {
     const reason = e instanceof LlmError ? (e.kind ?? 'llm') : 'unknown';
     // ★画像・ルール本文はログに出さない（理由の種類だけ）
@@ -460,12 +505,16 @@ export async function ensureThumbnail(
       if (!inspectOn) { adopted = { img, prompt, attempt, inspected: 'off' }; break; }
 
       const v = await inspectThumbnail(llm, img, { titleMode, title, rules: rules?.body || null });
+      // ★診断のため、指摘の文（重さつき・最大5件・各60字）を残す。画像・ルール本文は入れない
       await db.audit(article.tenant_id, AUDIT_INSPECTED, 'system', articleId, 'ok', {
-        run: runId, attempt, result: v.verdict, reason: v.verdict === 'unchecked' ? v.reason : null, issues: v.issues.length,
+        run: runId, attempt, result: v.verdict, reason: v.verdict === 'unchecked' ? v.reason : null,
+        blockers: blockerTexts(v.issues).length,
+        issues: v.issues.slice(0, 5).map((x) => ({ text: x.text.slice(0, 60), severity: x.severity })),
       });
       if (v.verdict !== 'fail') { adopted = { img, prompt, attempt, inspected: v.verdict }; break; }
-      lastIssues = v.issues;
-      feedback = v.issues;
+      // ★作り直しの指示と LINE の通知に渡すのは blocker だけ（minor は直さなくてよい）
+      lastIssues = blockerTexts(v.issues);
+      feedback = blockerTexts(v.issues);
     }
 
     if (!adopted) {
@@ -478,7 +527,9 @@ export async function ensureThumbnail(
           (stopped === 'daily' ? `\n（きょうのサムネの上限（${settings.dailyLimit}枚）に達したため、作り直しを止めました）` : '') +
           (stopped === 'article' ? `\n（この記事で作れるサムネの合計（${MAX_GENERATIONS_PER_ARTICLE}枚）に達したため、作り直しを止めました）` : '') +
           (stopped === 'time' ? '\n（時間がかかりすぎたため、作り直しを止めました）' : '') +
-          '\n「サムネを作り直す」を押すか、ご自身の写真を送ってサムネにしてください。',
+          '\n「サムネを作り直す」を押すか、ご自身の写真を送ってサムネにしてください。' +
+          `\n作り直しは1回で最大${maxAttempts}枚・約${Math.round(maxAttempts * COST_PER_ATTEMPT_YEN)}円ぶんかかります（ご自身の OpenAI アカウント）。` +
+          '\n同じ理由が続くときは、運用側にご連絡ください。',
       };
     }
     const img = adopted.img;
