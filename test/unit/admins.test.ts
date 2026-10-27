@@ -361,6 +361,12 @@ describe('V7: 4者（持ち主・管理者・投稿者・ゲスト）で同じ�
     expect(await f.send('admin1', { text: 'セットアップ' })).toContain('セットアップ画面で使うコード');
   });
 
+  it('セットアップのコードの返信に、タップで開ける /setup のリンクが付く（届いたリクエストの origin から作る）', async () => {
+    const { send } = await webhookEnv();
+    const r = await send('owner', { text: 'セットアップ' });
+    expect(r).toMatch(/https?:\/\/[^"\s\\]+\/setup/);
+  });
+
   it('管理者の機密性の高い操作（連携解除・投稿設定・ナレッジの削除）に role:admin が残る', async () => {
     const { send, sqlite, db } = await webhookEnv();
     await db.saveContext(DEFAULT_TENANT_ID, '・一つ目\n・二つ目', null, 'x');

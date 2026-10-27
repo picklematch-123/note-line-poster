@@ -133,14 +133,14 @@ export async function handleLineWebhook(
 
   // LINE は 200 を速く返さないと再送してくるので、処理は待たない
   ctx.waitUntil(
-    Promise.all(events.map((e) => handleEvent(e, env).catch((err) => {
+    Promise.all(events.map((e) => handleEvent(e, env, new URL(req.url).origin).catch((err) => {
       log.error('イベント処理でエラー', String(err));
     }))),
   );
   return new Response('ok');
 }
 
-async function handleEvent(event: LineEvent, env: Env): Promise<void> {
+async function handleEvent(event: LineEvent, env: Env, origin?: string): Promise<void> {
   const userId = event.source?.userId;
   if (!userId) return;
 
@@ -249,7 +249,7 @@ async function handleEvent(event: LineEvent, env: Env): Promise<void> {
       return;
 
     case 'message':
-      if (event.message?.type === 'text') return guard(event, line, () => handleText(event, env, line, d, userId));
+      if (event.message?.type === 'text') return guard(event, line, () => handleText(event, env, line, d, userId, origin));
       if (event.message?.type === 'image') return guard(event, line, () => handleImage(event, env, line, d, userId));
       return;
 
@@ -517,7 +517,7 @@ async function rejectMember(
 
 // ── テキスト ────────────────────────────────────────────
 async function handleText(
-  event: LineEvent, env: Env, line: LineClient, d: ServiceDeps, userId: string,
+  event: LineEvent, env: Env, line: LineClient, d: ServiceDeps, userId: string, origin?: string,
 ): Promise<void> {
   const body = (event.message?.text ?? '').trim();
   const replyToken = event.replyToken!;
@@ -558,7 +558,7 @@ async function handleText(
   // ★ここから下の3つは持ち主だけ（投稿者を足したので、入口の判定だけでは足りない）
   if (COMMANDS.setupCode.test(cmd)) {
     if (!power(d, userId)) return ownerOnly(line, replyToken);
-    await sendSetupCode(env, line, replyToken, isAdminUser(d, userId) ? 'admin' : 'owner');
+    await sendSetupCode(env, line, replyToken, isAdminUser(d, userId) ? 'admin' : 'owner', origin);
     // ★管理者が出したときは、記録に残し、持ち主にも1行知らせる（失敗しても止めない）
     await auditIfAdmin(d, userId, 'setup.code_issued');
     await notifyOwnerByAdmin(line, d, userId, 'setup');
@@ -1907,14 +1907,17 @@ async function saveSetting(
  * セットアップ画面用の使い捨てコードを出す。
  * ★ここに来る時点で「持ち主または管理者」のチェックは済んでいる（呼び出し側の power）。
  */
-async function sendSetupCode(env: Env, line: LineClient, replyToken: string, issuer: 'owner' | 'admin' = 'owner'): Promise<void> {
+async function sendSetupCode(env: Env, line: LineClient, replyToken: string, issuer: 'owner' | 'admin' = 'owner', origin?: string): Promise<void> {
   // ★発行した人の立場を記録する（持ち主のリセットは持ち主のコードでだけ通すため。V7）
   const { display, expiresAt } = await issueSetupCode(env.KV, issuer);
   await line.reply(replyToken, [text(
     'セットアップ画面で使うコードです。\n\n' +
     `　${display}\n\n` +
     '10分で使えなくなります。1回だけ使えます。\n' +
-    'システムのURLの末尾に /setup を付けて開き、この番号を貼ってください。'
+    // ★届いたリクエストの origin から作る（決め打ちにしない）。LINE は URL を自動でタップできるリンクにする
+    (origin
+      ? '下のリンクをタップして開き、この番号を貼ってください。\n\n' + `${origin}/setup`
+      : 'システムのURLの末尾に /setup を付けて開き、この番号を貼ってください。')
   )]);
   log.info('セットアップ用コードを発行しました', { expiresAt });
 }
