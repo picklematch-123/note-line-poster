@@ -140,3 +140,72 @@ describe('投稿する場所の表示', () => {
     expect(footer).toContain('パスワードは読み取りません');
   });
 });
+
+// ── 接続先の保存（許可の確認で画面が閉じる） ──────────────
+/**
+ * ★2026-10-27 に実機で見つかった不具合:
+ *   「保存する」を押すと許可の確認が出て、**拡張の画面（ポップアップ）が閉じる**。
+ *   許可しても保存の続きが走らず、接続先が保存されなかった（もう一度保存して初めて反映）。
+ *   → 先に書き留め、次に開いたとき許可が下りていれば確定する。
+ */
+describe('接続先の保存', () => {
+  it('★許可の確認で画面が閉じても、次に開いたときに接続先が確定する', async () => {
+    const vm = await import('node:vm');
+    const store: Record<string, any> = {};
+    let granted = false;
+    const handlers: Record<string, () => Promise<void>> = {};
+    const mkCtx = (closeOnRequest: boolean) => {
+      const els: Record<string, any> = {};
+      const mk = (id: string) => ({
+        textContent: '', className: '', value: '', hidden: true, focus() {},
+        addEventListener(_t: string, fn: () => Promise<void>) { handlers[id] = fn; },
+      });
+      const ctx: any = {
+        document: { getElementById: (id: string) => (els[id] ??= mk(id)) },
+        chrome: {
+          storage: { local: {
+            get: async (k: any) => {
+              const keys = Array.isArray(k) ? k : [k];
+              return Object.fromEntries(keys.filter((x: string) => x in store).map((x: string) => [x, store[x]]));
+            },
+            set: async (o: any) => { Object.assign(store, o); },
+            remove: async (k: string) => { delete store[k]; },
+          } },
+          runtime: { sendMessage: async () => {} },
+          cookies: { get: async () => null, getAll: async () => [] },
+          permissions: {
+            // 画面が閉じる＝この Promise は二度と返らない（許可そのものは下りる）
+            request: () => closeOnRequest ? new Promise(() => { granted = true; }) : Promise.resolve(true),
+            contains: async () => granted,
+          },
+          tabs: { create() {} },
+        },
+        fetch: async () => ({ ok: true, json: async () => ({ ok: true, checks: {} }) }),
+        navigator: { userAgent: 'test' },
+        console: { error() {}, warn() {}, log() {} },
+        setTimeout, URL,
+      };
+      ctx.globalThis = ctx;
+      vm.createContext(ctx);
+      vm.runInContext(popup, ctx);
+      return { ctx, els };
+    };
+
+    // 1回目: 保存を押す → 許可の確認で画面が閉じる（続きは走らない）
+    const first = mkCtx(true);
+    first.els['endpoint'] ??= {};
+    first.els['endpoint'].value = 'https://c.example.workers.dev/';
+    void handlers['save-endpoint']();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(store.endpoint).toBeUndefined();
+    expect(store.pendingEndpoint).toBe('https://c.example.workers.dev');
+
+    // 2回目: 開き直す → 許可が下りているので確定する
+    const second = mkCtx(false);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(store.endpoint).toBe('https://c.example.workers.dev');
+    expect(store.pendingEndpoint).toBeUndefined();
+    expect(second.els['endpoint'].value).toBe('https://c.example.workers.dev');
+  });
+});
+

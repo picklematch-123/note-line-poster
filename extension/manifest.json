@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "note連携ツール",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "LINE で作った記事を note へ投稿します。接続先は設定画面で指定します。",
   "permissions": [
     "cookies",

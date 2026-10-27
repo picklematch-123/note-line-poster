@@ -169,6 +169,9 @@ el.saveEndpoint.addEventListener('click', async () => {
     return;
   }
 
+  // ★許可の確認が出ると、この画面（ポップアップ）が閉じてしまい、このあとの処理が走らない（実機で確認）。
+  //   先に「保存したい接続先」を書き留めておき、次に開いたときに許可が下りていれば確定する。
+  await chrome.storage.local.set({ pendingEndpoint: value });
   try {
     const granted = await chrome.permissions.request({ origins: [origin] });
     if (!granted) {
@@ -182,8 +185,24 @@ el.saveEndpoint.addEventListener('click', async () => {
   }
 
   await chrome.storage.local.set({ endpoint: value });
+  await chrome.storage.local.remove('pendingEndpoint');
   showResult('ok', '接続先を保存しました。');
 });
+
+/** 許可の確認で画面が閉じたときの続き。許可が下りていれば、書き留めた接続先を確定する。 */
+async function commitPendingEndpoint() {
+  try {
+    const { pendingEndpoint } = await chrome.storage.local.get('pendingEndpoint');
+    if (!pendingEndpoint) return;
+    const origin = `${new URL(pendingEndpoint).origin}/*`;
+    if (await chrome.permissions.contains({ origins: [origin] })) {
+      await chrome.storage.local.set({ endpoint: pendingEndpoint });
+    }
+    await chrome.storage.local.remove('pendingEndpoint');
+  } catch (e) {
+    // 確定できなくても、画面は止めない（もう一度保存すれば済む）
+  }
+}
 
 // ── このパソコンとサーバーの連携状態 ─────────────────
 /**
@@ -254,6 +273,7 @@ async function showLinkState() {
 
 // ── 起動時 ───────────────────────────────────────────
 (async () => {
+  await commitPendingEndpoint();
   el.endpoint.value = await getEndpoint();
   await Promise.all([checkLogin(), showLinkState()]);
   // 開いたついでに、待っている仕事がないか見に行く
