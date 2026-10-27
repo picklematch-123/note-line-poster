@@ -43,7 +43,8 @@ describe('実行してよいかの判定', () => {
     const kv = fakeKv();
     await markSetupCompleted(kv);
     const { display } = await issueSetupCode(kv);
-    expect(await mayRun(kv, display)).toEqual({ allowed: true, reason: 'valid_code' });
+    // V7: 使ったコードを発行した人の立場も返す（監査ログの actor に使う）
+    expect(await mayRun(kv, display)).toEqual({ allowed: true, reason: 'valid_code', issuer: 'owner' });
   });
 
   it('★同じコードは2回使えない', async () => {

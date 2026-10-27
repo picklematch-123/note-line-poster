@@ -52,12 +52,15 @@ import { loadImageRulesSummary } from '../../core/image/rules';
 import { getResearchSettings, applyResearchSetting } from '../../core/research/settings';
 import { canRedoResearch } from '../../core/research/run';
 import { createResearchLlm } from '../../ports/llm';
-import { canUse, isOwner, roleOf, NOT_OWNER_MESSAGE, OWNER_ONLY_MESSAGE } from '../../core/line/access';
+import { canUse, isOwner, hasOwnerPower, roleOf, NOT_OWNER_MESSAGE, OWNER_ONLY_MESSAGE } from '../../core/line/access';
 import {
-  openInvite, peekInvite, closeInvite, MAX_STAFF,
+  openInvite, peekInvite, closeInvite, MAX_STAFF, MAX_ADMINS,
   savePending, getPending, deletePending, listPending, decideTypedMemberCommand,
   buildInviteOpened, buildWelcomeStaff, buildStaffAddedNotice,
   buildApprovalRequest, buildWaitingForApproval,
+  buildAdminInviteOpened, buildAdminApprovalRequest, buildWelcomeAdmin, buildAdminAddedNotice,
+  buildSetupOpenedByAdminNotice, buildNoteCodeByAdminNotice, ADMIN_CANNOT_BE_OWNER_MESSAGE,
+  type InviteKind, type PendingMember,
 } from '../../core/line/members';
 import { otherWorkInProgress } from '../../core/article/ownership';
 import { buildProvisionalSnippet } from '../../core/generation/context';
@@ -148,6 +151,18 @@ async function handleEvent(event: LineEvent, env: Env): Promise<void> {
   // env に設定があればそれを使い、無ければ「最初に話しかけた人」を登録する。
   // ユーザーIDを手で転記させないための仕組み。
   await d.db.ensureTenant(DEFAULT_TENANT_ID);
+  // ★持ち主が未登録（リセット直後など）のとき、管理者は持ち主にならない（V7 源蔵レビュー必須1）。
+  //   ここで止めないと、リセットの直後に管理者が1通送っただけで持ち主になり、元の顧客が取り戻せない。
+  //   管理者の一覧が読めないときは空（＝管理者はいない前提で、従来どおり最初の人が持ち主になる）
+  if (!env.LINE_OWNER_USER_ID && !(await d.db.getOwnerLineUserId(DEFAULT_TENANT_ID))) {
+    if ((await d.db.listAdminIds(DEFAULT_TENANT_ID)).includes(userId)) {
+      if (event.replyToken && (event.type === 'message' || event.type === 'postback')) {
+        await line.reply(event.replyToken, [text(ADMIN_CANNOT_BE_OWNER_MESSAGE)]);
+      }
+      log.info('持ち主が未登録のため、管理者からの操作を断りました');
+      return;
+    }
+  }
   const { ownerId, justRegistered } = env.LINE_OWNER_USER_ID
     ? { ownerId: env.LINE_OWNER_USER_ID, justRegistered: false }
     : await d.db.resolveOwnerLineUserId(DEFAULT_TENANT_ID, userId);
@@ -165,37 +180,54 @@ async function handleEvent(event: LineEvent, env: Env): Promise<void> {
   //   公開だけを守っていたが、記事生成は毎回 Claude を呼ぶ＝顧客の残高が減る。
   //   ナレッジを書き換えられると、以後の記事すべてに影響が残る。
   //   友だち追加さえすれば誰でもできる状態だった。
+  // ★staffLineUserIds は「記事を承認できる人」＝投稿者と管理者の両方（承認・自動公開の判定と同じ一覧）
   d.staffLineUserIds = await d.db.listStaffIds(DEFAULT_TENANT_ID);
+  // ★管理者（V7）。読めないときは空（＝持ち主だけが設定できる）に倒れる
+  setAdmins(d, await d.db.listAdminIds(DEFAULT_TENANT_ID));
+  const role = roleOf(d.ownerLineUserId, userId, d.staffLineUserIds, admins(d));
 
-  // ★投稿者の受付（持ち主が「投稿者を追加」と送ってから10分間だけ開く）。
-  //   持ち主でも投稿者でもない人が話しかけてきたら、窓口を閉じて**持ち主に確認を送る**。
-  //   話しかけただけでは投稿者にしない（源蔵レビュー条件2: メニューを1回押しただけで登録される事故を防ぐ）。
-  //   友だち追加（follow）だけでは受け付けない。本人が話しかけたときに限る。
-  if (roleOf(d.ownerLineUserId, userId, d.staffLineUserIds) === 'guest'
-      && (event.type === 'message' || event.type === 'postback')) {
-    if (await getPending(env.KV, DEFAULT_TENANT_ID, userId)) {
-      if (event.replyToken) await line.reply(event.replyToken, [text(buildWaitingForApproval())]);
-      return;
-    }
-    const invite = await peekInvite(env.KV, DEFAULT_TENANT_ID);
-    if (invite) {
-      await closeInvite(env.KV, DEFAULT_TENANT_ID);
-      // ★窓口を開けた人が、いまも持ち主であること（その後に持ち主が変わっていたら無効）
-      if (invite.by === d.ownerLineUserId) {
-        const profile = await line.getProfile(userId);
-        const name = profile?.displayName ?? null;
-        await savePending(env.KV, DEFAULT_TENANT_ID, {
-          userId, displayName: name, invitedBy: invite.by, requestedAt: new Date().toISOString(),
-        });
-        await d.db.audit(DEFAULT_TENANT_ID, 'member.requested', `line:${userId}`, null, 'ok', { displayName: name });
+  if (event.type === 'message' || event.type === 'postback') {
+    // ★管理者の受付（持ち主が「管理者を追加」と送ってから10分間だけ開く）。
+    //   投稿者として登録済みの人も受け付ける（承認されたら管理者に上げる）。ゲスト・投稿者だけが対象
+    if (role === 'guest' || role === 'staff') {
+      const waitingAdmin = await getPending(env.KV, DEFAULT_TENANT_ID, userId, 'admin');
+      if (waitingAdmin && role === 'guest') {
         if (event.replyToken) await line.reply(event.replyToken, [text(buildWaitingForApproval())]);
-        await line.push(invite.by, [approvalMessage(name, userId)]);
         return;
+      }
+      const adminInvite = waitingAdmin ? null : await peekInvite(env.KV, DEFAULT_TENANT_ID, 'admin');
+      if (adminInvite) {
+        await closeInvite(env.KV, DEFAULT_TENANT_ID, 'admin');
+        // ★管理者の窓口は持ち主だけが開ける。開けた人が、いまも持ち主であること
+        if (adminInvite.by === d.ownerLineUserId) {
+          await requestApproval(env, line, d, event.replyToken, userId, adminInvite.by, 'admin', { currentlyStaff: role === 'staff' });
+          return;
+        }
+      }
+    }
+
+    // ★投稿者の受付（持ち主・管理者が「投稿者を追加」と送ってから10分間だけ開く）。
+    //   持ち主でも投稿者でもない人が話しかけてきたら、窓口を閉じて**開けた人に確認を送る**。
+    //   話しかけただけでは投稿者にしない（源蔵レビュー条件2: メニューを1回押しただけで登録される事故を防ぐ）。
+    //   友だち追加（follow）だけでは受け付けない。本人が話しかけたときに限る。
+    if (role === 'guest') {
+      if (await getPending(env.KV, DEFAULT_TENANT_ID, userId)) {
+        if (event.replyToken) await line.reply(event.replyToken, [text(buildWaitingForApproval())]);
+        return;
+      }
+      const invite = await peekInvite(env.KV, DEFAULT_TENANT_ID);
+      if (invite) {
+        await closeInvite(env.KV, DEFAULT_TENANT_ID);
+        // ★窓口を開けた人が、いまも持ち主か管理者であること（その後に外れていたら無効）
+        if (hasOwnerPower(d.ownerLineUserId, admins(d), invite.by)) {
+          await requestApproval(env, line, d, event.replyToken, userId, invite.by, 'staff');
+          return;
+        }
       }
     }
   }
 
-  if (!canUse(d.ownerLineUserId, userId, d.staffLineUserIds)) {
+  if (!canUse(d.ownerLineUserId, userId, d.staffLineUserIds, admins(d))) {
     log.warn('持ち主以外からの操作を断りました');
     const token = event.replyToken;
     if (token && (event.type === 'message' || event.type === 'postback')) {
@@ -252,6 +284,7 @@ async function guard(
 
 /** 「自分の作業中の記事」を探すときの指定。担当者が空の古い記事は持ち主のもの */
 function me(d: ServiceDeps, userId: string) {
+  // ★isOwner のまま（管理者にしない）: 担当者が空の古い記事は「持ち主のもの」。管理者の作業中の記事に数えない
   return { userId, isOwner: isOwner(d.ownerLineUserId, userId) };
 }
 
@@ -268,11 +301,133 @@ async function ownerOnly(line: LineClient, replyToken: string): Promise<void> {
   await line.reply(replyToken, [text(OWNER_ONLY_MESSAGE)]);
 }
 
-/** 投稿者の受付を開く（持ち主だけ） */
+// ── 管理者（V7）の小道具 ────────────────────────────────
+/** 管理者の一覧は ServiceDeps に入れず、webhook の中だけで持つ（承認・公開の判定は投稿者と同じ一覧で足りるため） */
+const ADMINS = new WeakMap<ServiceDeps, readonly string[]>();
+function setAdmins(d: ServiceDeps, ids: readonly string[]): void { ADMINS.set(d, ids); }
+function admins(d: ServiceDeps): readonly string[] { return ADMINS.get(d) ?? []; }
+
+/** 持ち主の力を使ってよいか（持ち主・管理者）。★判定は access.ts の hasOwnerPower 1か所 */
+function power(d: ServiceDeps, userId: string): boolean {
+  return hasOwnerPower(d.ownerLineUserId, admins(d), userId);
+}
+function isAdminUser(d: ServiceDeps, userId: string): boolean {
+  return roleOf(d.ownerLineUserId, userId, d.staffLineUserIds, admins(d)) === 'admin';
+}
+
+/**
+ * 管理者が行った機密性の高い操作を記録する（★持ち主の操作は既存の記録のまま）。
+ * 記録に失敗しても操作は止めない（ログに残す）
+ */
+async function auditIfAdmin(d: ServiceDeps, userId: string, action: string, detail: Record<string, unknown> = {}): Promise<void> {
+  if (!isAdminUser(d, userId)) return;
+  try {
+    await d.db.audit(DEFAULT_TENANT_ID, action, `line:${userId}`, null, 'ok', { role: 'admin', ...detail });
+  } catch (e) {
+    log.warn('管理者の操作の記録に失敗しました', String(e).slice(0, 120));
+  }
+}
+
+/** 確認待ちとして記録し、窓口を開けた人に承認のお知らせを送る（投稿者・管理者で共通） */
+async function requestApproval(
+  env: Env, line: LineClient, d: ServiceDeps, replyToken: string | undefined, userId: string, invitedBy: string, kind: InviteKind,
+  opts: { currentlyStaff?: boolean } = {},
+): Promise<void> {
+  const profile = await line.getProfile(userId);
+  const name = profile?.displayName ?? null;
+  await savePending(env.KV, DEFAULT_TENANT_ID, {
+    userId, displayName: name, invitedBy, requestedAt: new Date().toISOString(),
+  }, kind);
+  await d.db.audit(DEFAULT_TENANT_ID, kind === 'admin' ? 'member.admin_requested' : 'member.requested', `line:${userId}`, null, 'ok', { displayName: name });
+  if (replyToken) await line.reply(replyToken, [text(buildWaitingForApproval())]);
+  await line.push(invitedBy, [kind === 'admin' ? adminApprovalMessage(name, userId, opts) : approvalMessage(name, userId)]);
+}
+
+/** 管理者の受付を開く（★持ち主だけ） */
+async function startAdminInvite(
+  env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
+): Promise<void> {
+  if (admins(d).length >= MAX_ADMINS) {
+    await line.reply(replyToken, [text(
+      `管理者は${MAX_ADMINS}人までです。\n「投稿者一覧」から管理者を外してから、もう一度お試しください。`,
+    )]);
+    return;
+  }
+  await openInvite(env.KV, DEFAULT_TENANT_ID, userId, 'admin');
+  await line.reply(replyToken, [text(buildAdminInviteOpened())]);
+}
+
+/** 持ち主への確認のお知らせ（管理者・ボタンつき） */
+function adminApprovalMessage(displayName: string | null, uid: string, opts: { currentlyStaff?: boolean } = {}): LineMessage {
+  return textWithActions(buildAdminApprovalRequest(displayName, opts), [
+    { label: '管理者にする', data: `action=admin_approve&uid=${uid}` },
+    { label: '断る', data: `action=admin_reject&uid=${uid}` },
+  ]);
+}
+
+const ADMIN_PENDING_GONE_MESSAGE =
+  'この確認は、期限が切れたか、すでに済んでいます。\n' +
+  '追加する場合は、もう一度「管理者を追加」と送ってください。';
+
+/** 管理者にする（★持ち主だけ。確認待ちの記録がある人にしか効かない） */
+async function approveAdmin(
+  env: Env, line: LineClient, d: ServiceDeps, replyToken: string, ownerId: string, uid: string,
+): Promise<void> {
+  const pending = await getPending(env.KV, DEFAULT_TENANT_ID, uid, 'admin');
+  if (!pending) {
+    await line.reply(replyToken, [text(ADMIN_PENDING_GONE_MESSAGE)]);
+    return;
+  }
+  const result = await d.db.addAdmin(DEFAULT_TENANT_ID, uid, pending.displayName, ownerId, MAX_ADMINS);
+  if (result === 'full') {
+    await line.reply(replyToken, [text(
+      `管理者は${MAX_ADMINS}人までです。\n「投稿者一覧」から管理者を外してから、もう一度「管理者にする」を押してください。`,
+    )]);
+    return;
+  }
+  await deletePending(env.KV, DEFAULT_TENANT_ID, uid, 'admin');
+  if (result === 'exists') {
+    await line.reply(replyToken, [text('この方は、すでに管理者です。')]);
+    return;
+  }
+  // ★持ち主への知らせ（持ち主自身が押したので返信で伝える）
+  await line.reply(replyToken, [text(buildAdminAddedNotice(pending.displayName, result === 'promoted'))]);
+  await line.push(uid, [text(buildWelcomeAdmin())]).catch((e) => log.warn('管理者への案内を送れませんでした', String(e)));
+}
+
+async function rejectAdmin(
+  env: Env, line: LineClient, d: ServiceDeps, replyToken: string, ownerId: string, uid: string,
+): Promise<void> {
+  const pending = await getPending(env.KV, DEFAULT_TENANT_ID, uid, 'admin');
+  await deletePending(env.KV, DEFAULT_TENANT_ID, uid, 'admin');
+  if (pending) {
+    await d.db.audit(DEFAULT_TENANT_ID, 'member.admin_rejected', `line:${ownerId}`, null, 'ok', { userId: uid, role: 'admin' });
+  }
+  await line.reply(replyToken, [text(pending ? '管理者に登録しませんでした。' : 'この確認は、すでに済んでいます。')]);
+}
+
+/** 管理者がセットアップ・note 連携のコードを出したことを、持ち主に1行で知らせる（★失敗しても止めない） */
+async function notifyOwnerByAdmin(line: LineClient, d: ServiceDeps, userId: string, what: 'setup' | 'note_code'): Promise<void> {
+  if (!isAdminUser(d, userId) || !d.ownerLineUserId) return;
+  try {
+    const name = (await line.getProfile(userId))?.displayName ?? null;
+    await line.push(d.ownerLineUserId, [text(what === 'setup' ? buildSetupOpenedByAdminNotice(name) : buildNoteCodeByAdminNotice(name))]);
+  } catch (e) {
+    log.warn('持ち主への知らせを送れませんでした（コードは発行済み）', String(e).slice(0, 120));
+  }
+}
+
+/** 記録に足す項目（管理者なら role:'admin'） */
+function roleDetail(d: ServiceDeps, userId: string): Record<string, unknown> {
+  return isAdminUser(d, userId) ? { role: 'admin' } : {};
+}
+
+/** 投稿者の受付を開く（持ち主・管理者） */
 async function startMemberInvite(
   env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
 ): Promise<void> {
-  if ((d.staffLineUserIds ?? []).length >= MAX_STAFF) {
+  // ★上限は投稿者だけで数える（管理者は別の上限）
+  if ((d.staffLineUserIds ?? []).filter((id) => !admins(d).includes(id)).length >= MAX_STAFF) {
     await line.reply(replyToken, [text(
       `投稿者は${MAX_STAFF}人までです。\n「投稿者一覧」から誰かを外してから、もう一度お試しください。`,
     )]);
@@ -282,20 +437,30 @@ async function startMemberInvite(
   await line.reply(replyToken, [text(buildInviteOpened())]);
 }
 
-/** 投稿者の一覧と、外すボタン（持ち主だけ） */
-async function showMembers(line: LineClient, d: ServiceDeps, replyToken: string): Promise<void> {
-  const staff = await d.db.listStaff(DEFAULT_TENANT_ID);
-  if (staff.length === 0) {
+/**
+ * 投稿者の一覧と、外すボタン（持ち主・管理者）。
+ * ★管理者は持ち主にだけ見せる（役割つき・外すボタンも持ち主だけ）。管理者には投稿者だけを見せる
+ */
+async function showMembers(line: LineClient, d: ServiceDeps, replyToken: string, ownerView: boolean): Promise<void> {
+  const all = await d.db.listStaff(DEFAULT_TENANT_ID);
+  const list = ownerView ? all : all.filter((m) => m.role !== 'admin');
+  if (list.length === 0) {
     await line.reply(replyToken, [text(
       '投稿者はまだいません。\n\n「投稿者を追加」と送ると、追加の受付を始めます。',
     )]);
     return;
   }
+  const label = (role: string) => (role === 'admin' ? '管理者' : '投稿者');
+  const staffCount = list.filter((m) => m.role !== 'admin').length;
+  const adminCount = list.length - staffCount;
   await line.reply(replyToken, [textWithActions(
-    `【投稿者】${staff.length}人\n\n` +
-    staff.map((m, i) => `${i + 1}. ${m.display_name ?? '（名前なし）'}`).join('\n') +
+    (ownerView && adminCount > 0 ? `【投稿者・管理者】投稿者${staffCount}人・管理者${adminCount}人\n\n` : `【投稿者】${list.length}人\n\n`) +
+    list.map((m, i) => `${i + 1}. ${m.display_name ?? '（名前なし）'}${ownerView ? `（${label(m.role)}）` : ''}`).join('\n') +
     '\n\n外したい人の番号を押してください。',
-    staff.slice(0, 12).map((m, i) => ({ label: `${i + 1}を外す`, data: `action=member_remove&uid=${m.line_user_id}` })),
+    list.slice(0, 12).map((m, i) => ({
+      label: `${i + 1}を外す`,
+      data: m.role === 'admin' ? `action=admin_remove&uid=${m.line_user_id}` : `action=member_remove&uid=${m.line_user_id}`,
+    })),
   )]);
 }
 
@@ -321,7 +486,7 @@ async function approveMember(
     await line.reply(replyToken, [text(PENDING_GONE_MESSAGE)]);
     return;
   }
-  const result = await d.db.addStaff(DEFAULT_TENANT_ID, uid, pending.displayName, ownerId, MAX_STAFF);
+  const result = await d.db.addStaff(DEFAULT_TENANT_ID, uid, pending.displayName, ownerId, MAX_STAFF, roleDetail(d, ownerId));
   if (result === 'full') {
     await line.reply(replyToken, [text(
       `投稿者は${MAX_STAFF}人までです。\n「投稿者一覧」から誰かを外してから、もう一度「投稿者にする」を押してください。`,
@@ -344,7 +509,7 @@ async function rejectMember(
   const pending = await getPending(env.KV, DEFAULT_TENANT_ID, uid);
   await deletePending(env.KV, DEFAULT_TENANT_ID, uid);
   if (pending) {
-    await d.db.audit(DEFAULT_TENANT_ID, 'member.rejected', `line:${ownerId}`, null, 'ok', { userId: uid });
+    await d.db.audit(DEFAULT_TENANT_ID, 'member.rejected', `line:${ownerId}`, null, 'ok', { userId: uid, ...roleDetail(d, ownerId) });
   }
   // ★断られた本人には知らせない（何が動いているかを教えない）
   await line.reply(replyToken, [text(pending ? '登録しませんでした。' : 'この確認は、すでに済んでいます。')]);
@@ -392,28 +557,88 @@ async function handleText(
   }
   // ★ここから下の3つは持ち主だけ（投稿者を足したので、入口の判定だけでは足りない）
   if (COMMANDS.setupCode.test(cmd)) {
-    if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
-    return sendSetupCode(env, line, replyToken);
+    if (!power(d, userId)) return ownerOnly(line, replyToken);
+    await sendSetupCode(env, line, replyToken, isAdminUser(d, userId) ? 'admin' : 'owner');
+    // ★管理者が出したときは、記録に残し、持ち主にも1行知らせる（失敗しても止めない）
+    await auditIfAdmin(d, userId, 'setup.code_issued');
+    await notifyOwnerByAdmin(line, d, userId, 'setup');
+    return;
   }
+  // ★持ち主のリセットは持ち主だけ（管理者にも渡さない＝管理者が持ち主を外せない）
   if (COMMANDS.ownerReset.test(cmd)) {
     if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
     return resetOwner(env, line, d, replyToken, userId);
   }
   if (COMMANDS.memberAdd.test(cmd)) {
-    if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+    if (!power(d, userId)) return ownerOnly(line, replyToken);
     return startMemberInvite(env, line, d, replyToken, userId);
   }
   if (COMMANDS.memberList.test(cmd)) {
+    if (!power(d, userId)) return ownerOnly(line, replyToken);
+    return showMembers(line, d, replyToken, isOwner(d.ownerLineUserId, userId));
+  }
+  // ★管理者の追加は持ち主だけ（管理者は管理者を増やせない）
+  if (COMMANDS.adminAdd.test(cmd)) {
     if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
-    return showMembers(line, d, replyToken);
+    return startAdminInvite(env, line, d, replyToken, userId);
+  }
+  // ★「管理者にする」を文字で送ったとき（持ち主だけ。管理者が送っても効かない）
+  if (COMMANDS.adminApprove.test(cmd) && power(d, userId)) {
+    if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+    const decision = decideTypedMemberCommand({
+      isOwner: true,
+      approving: true,
+      pendings: await listPending(env.KV, DEFAULT_TENANT_ID, 'admin'),
+      inviteOpen: (await peekInvite(env.KV, DEFAULT_TENANT_ID, 'admin')) !== null,
+    });
+    switch (decision.kind) {
+      case 'approve':
+        return approveAdmin(env, line, d, replyToken, userId, decision.userId);
+      case 'ask':
+        await line.reply(replyToken, [
+          text(`確認待ちの方が${decision.total}人います。人違いを防ぐため、1人ずつ確認します。`),
+          adminApprovalMessage(decision.pending.displayName, decision.pending.userId),
+        ]);
+        return;
+      case 'not_yet':
+        await line.reply(replyToken, [text(
+          'まだ誰からも届いていません。\n追加したい担当者がこのアカウントへ1通送ると、確認のお知らせが届きます。',
+        )]);
+        return;
+      default:
+        await line.reply(replyToken, [text(ADMIN_PENDING_GONE_MESSAGE)]);
+        return;
+    }
+  }
+  // ★文字の「断る」: 持ち主には投稿者・管理者の両方の確認待ちを、管理者には投稿者の確認待ちだけを見る
+  if (COMMANDS.memberReject.test(cmd) && power(d, userId)) {
+    const owner = isOwner(d.ownerLineUserId, userId);
+    const all: Array<{ p: PendingMember; kind: InviteKind }> = [
+      ...(await listPending(env.KV, DEFAULT_TENANT_ID)).map((p) => ({ p, kind: 'staff' as const })),
+      ...(owner ? (await listPending(env.KV, DEFAULT_TENANT_ID, 'admin')).map((p) => ({ p, kind: 'admin' as const })) : []),
+    ].sort((a, b) => a.p.requestedAt.localeCompare(b.p.requestedAt));
+    if (all.length === 1) {
+      const { p, kind } = all[0];
+      return kind === 'admin'
+        ? rejectAdmin(env, line, d, replyToken, userId, p.userId)
+        : rejectMember(env, line, d, replyToken, userId, p.userId);
+    }
+    if (all.length > 1) {
+      const { p, kind } = all[0];
+      await line.reply(replyToken, [
+        text(`確認待ちの方が${all.length}人います。人違いを防ぐため、1人ずつ確認します。`),
+        kind === 'admin' ? adminApprovalMessage(p.displayName, p.userId) : approvalMessage(p.displayName, p.userId),
+      ]);
+      return;
+    }
+    // 確認待ちが無いときの「断る」は、ふつうのメッセージとして下へ流す
   }
   // ★「投稿者にする」「断る」が、ボタンの合図ではなく文字で届くことがある（2026-09-15 実際に発生）。
   //   確認待ちが1人だけなら、その人のこととして扱う。2人以上なら取り違えないようボタンを出し直す。
-  if (isOwner(d.ownerLineUserId, userId)
-      && (COMMANDS.memberApprove.test(cmd) || COMMANDS.memberReject.test(cmd))) {
+  if (power(d, userId) && COMMANDS.memberApprove.test(cmd)) {
     const decision = decideTypedMemberCommand({
       isOwner: true,
-      approving: COMMANDS.memberApprove.test(cmd),
+      approving: true,
       pendings: await listPending(env.KV, DEFAULT_TENANT_ID),
       inviteOpen: (await peekInvite(env.KV, DEFAULT_TENANT_ID)) !== null,
     });
@@ -448,11 +673,11 @@ async function handleText(
     return showMoreSettings(line, d, replyToken, userId);
   }
   if (COMMANDS.aiSettings.test(cmd)) {
-    if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+    if (!power(d, userId)) return ownerOnly(line, replyToken);
     return showAiSettings(env, line, d, replyToken);
   }
   if (COMMANDS.thumbSettings.test(cmd)) {
-    if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+    if (!power(d, userId)) return ownerOnly(line, replyToken);
     return showThumbSettings(env, line, d, replyToken);
   }
 
@@ -738,18 +963,50 @@ async function handlePostback(
     case 'menu_profile':
       return showContext(env, line, d, replyToken, userId);
 
-    case 'member_approve':
+    // ★管理者の承認・外しは持ち主だけ（管理者は管理者を増やせない・外せない）
+    case 'admin_approve':
       if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      return approveAdmin(env, line, d, replyToken, userId, params.get('uid') ?? '');
+
+    case 'admin_reject':
+      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      return rejectAdmin(env, line, d, replyToken, userId, params.get('uid') ?? '');
+
+    case 'admin_remove': {
+      // 外す前の確認
+      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      const uid = params.get('uid') ?? '';
+      const target = (await d.db.listStaff(DEFAULT_TENANT_ID)).find((m) => m.line_user_id === uid && m.role === 'admin');
+      if (!target) return line.reply(replyToken, [text('その人は、すでに管理者ではありません。')]);
+      await line.reply(replyToken, [textWithActions(
+        `「${target.display_name ?? '名前なし'}」を管理者から外しますか？\n外すと、このアカウントを操作できなくなります（投稿者にも戻りません）。`,
+        [{ label: '外す', data: `action=admin_remove_yes&uid=${uid}` }, { label: 'やめる', data: 'action=menu_cancel' }],
+      )]);
+      return;
+    }
+
+    case 'admin_remove_yes': {
+      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      const uid = params.get('uid') ?? '';
+      const removed = uid ? await d.db.removeAdmin(DEFAULT_TENANT_ID, uid, `line:${userId}`) : false;
+      await line.reply(replyToken, [text(removed
+        ? '管理者から外しました。\nこの人は、このアカウントを操作できなくなりました。'
+        : 'その人は、すでに管理者ではありません。')]);
+      return;
+    }
+
+    case 'member_approve':
+      if (!power(d, userId)) return ownerOnly(line, replyToken);
       return approveMember(env, line, d, replyToken, userId, params.get('uid') ?? '');
 
     case 'member_reject':
-      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      if (!power(d, userId)) return ownerOnly(line, replyToken);
       return rejectMember(env, line, d, replyToken, userId, params.get('uid') ?? '');
 
     case 'member_remove': {
-      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      if (!power(d, userId)) return ownerOnly(line, replyToken);
       const uid = params.get('uid') ?? '';
-      const removed = uid ? await d.db.removeStaff(DEFAULT_TENANT_ID, uid, `line:${userId}`) : false;
+      const removed = uid ? await d.db.removeStaff(DEFAULT_TENANT_ID, uid, `line:${userId}`, roleDetail(d, userId)) : false;
       await line.reply(replyToken, [text(removed
         ? '投稿者から外しました。\nこの人は、このアカウントで記事を作ったり公開したりできなくなります。\n' +
           '作りかけの記事があれば、「過去記事一覧」から続きを操作できます。'
@@ -775,7 +1032,7 @@ async function handlePostback(
       return;
 
     case 'ctx_replace':
-      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      if (!power(d, userId)) return ownerOnly(line, replyToken);
       await setMode(env.KV, DEFAULT_TENANT_ID, userId, { kind: 'ctx_new' });
       await line.reply(replyToken, [textWithActions(
         '新しい内容を送ってください。いまの設定は置き換わります。',
@@ -789,14 +1046,15 @@ async function handlePostback(
       return;
 
     case 'ctx_clear':
-      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      if (!power(d, userId)) return ownerOnly(line, replyToken);
       await clearMode(env.KV, DEFAULT_TENANT_ID, userId);
       await d.db.clearContext(DEFAULT_TENANT_ID);
+      await auditIfAdmin(d, userId, 'knowledge.cleared');
       await line.reply(replyToken, [text('設定を消しました。今後は前提なしで記事を書きます。')]);
       return;
 
     case 'ctx_delete': {
-      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      if (!power(d, userId)) return ownerOnly(line, replyToken);
       const current = await d.db.getActiveContext(DEFAULT_TENANT_ID);
       const entries = current ? listEntries(current.raw_text) : [];
       if (entries.length === 0) {
@@ -837,12 +1095,12 @@ async function handlePostback(
 
     // ★サムネの設定は費用に直結するので持ち主だけ
     case 'thumb_auto': {
-      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      if (!power(d, userId)) return ownerOnly(line, replyToken);
       await setThumbAuto(d.db, params.get('on') === '1', `line:${userId}`);
       return showThumbSettings(env, line, d, replyToken);
     }
     case 'thumb_limit': {
-      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      if (!power(d, userId)) return ownerOnly(line, replyToken);
       const n = Number(params.get('n'));
       if (!(DAILY_LIMIT_OPTIONS as readonly number[]).includes(n)) return; // 読めない値は何も変えない
       await setThumbDailyLimit(d.db, n, `line:${userId}`);
@@ -863,7 +1121,7 @@ async function handlePostback(
     case 'ai_ilimit_set':
     // ★画像のルール（2026-10-26）も持ち主だけ（設定画面への入り口なので）
     case 'ai_imgrules':
-      if (!isOwner(d.ownerLineUserId, userId)) return ownerOnly(line, replyToken);
+      if (!power(d, userId)) return ownerOnly(line, replyToken);
       return handleAiSettingsPostback(action, params, env, line, d, replyToken, userId);
 
     case 'cfg_daily':
@@ -965,7 +1223,7 @@ async function handlePostback(
         await line.reply(replyToken, [text('いまはサムネを作り直せない状態です。')]);
         return;
       }
-      if (!isOwner(d.ownerLineUserId, userId) && a.requested_by !== userId) {
+      if (!power(d, userId) && a.requested_by !== userId) {
         return line.reply(replyToken, [text('この記事を作った人か、持ち主だけが作り直せます。')]);
       }
       if (!env.OPENAI_API_KEY) {
@@ -991,7 +1249,7 @@ async function handlePostback(
         await line.reply(replyToken, [text('いまは文中の画像を作り直せない状態です。')]);
         return;
       }
-      if (!isOwner(d.ownerLineUserId, userId) && a.requested_by !== userId) {
+      if (!power(d, userId) && a.requested_by !== userId) {
         return line.reply(replyToken, [text('この記事を作った人か、持ち主だけが作り直せます。')]);
       }
       if (!hasImageKey(env.OPENAI_API_KEY)) {
@@ -1028,7 +1286,7 @@ async function handlePostback(
         await line.reply(replyToken, [text('いまは調べ直せない状態です。')]);
         return;
       }
-      if (!isOwner(d.ownerLineUserId, userId) && a.requested_by !== userId) {
+      if (!power(d, userId) && a.requested_by !== userId) {
         return line.reply(replyToken, [text('この記事を作った人か、持ち主だけが調べ直せます。')]);
       }
       if (!(await canRedoResearch(d.db, a, Boolean(createResearchLlm(env))))) {
@@ -1347,7 +1605,7 @@ async function showContext(env: Env, line: LineClient, d: ServiceDeps, replyToke
     return;
   }
 
-  await line.reply(replyToken, [buildKnowledgeList(current.raw_text, isOwner(d.ownerLineUserId, userId))]);
+  await line.reply(replyToken, [buildKnowledgeList(current.raw_text, power(d, userId))]);
 }
 
 /** LINE の1通の上限に収まるよう、長い文章を切り分ける。 */
@@ -1378,6 +1636,7 @@ async function deleteContextEntry(
 
   const removed = entries[index - 1];
   const rest = removeEntry(current.raw_text, index);
+  await auditIfAdmin(d, userId, 'knowledge.deleted', { index });
 
   if (rest.trim() === '') {
     await d.db.clearContext(DEFAULT_TENANT_ID);
@@ -1475,16 +1734,18 @@ async function saveContext(
 async function startNoteConnect(
   env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
 ): Promise<void> {
-  if (d.ownerLineUserId && userId !== d.ownerLineUserId) {
+  if (!power(d, userId)) {
     await line.reply(replyToken, [text('この操作はアカウントの持ち主だけが行えます。')]);
     return;
   }
 
   const existing = await loadNoteSession(env.DB, DEFAULT_TENANT_ID, (await resolveMasterKey(env)).key);
   const { display } = await issuePairingCode(env.KV, DEFAULT_TENANT_ID, userId);
-  await d.db.audit(DEFAULT_TENANT_ID, 'session.code_issued', `line:${userId}`, null, 'ok');
+  const extra = roleDetail(d, userId);
+  await d.db.audit(DEFAULT_TENANT_ID, 'session.code_issued', `line:${userId}`, null, 'ok', Object.keys(extra).length ? extra : undefined);
 
   await line.reply(replyToken, [buildConnectGuide(display, existing === null)]);
+  await notifyOwnerByAdmin(line, d, userId, 'note_code');
 }
 
 /** いまの連携状況を見せる。 */
@@ -1504,7 +1765,7 @@ async function showConnectStatus(env: Env, line: LineClient, replyToken: string)
 async function doDisconnect(
   env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
 ): Promise<void> {
-  if (d.ownerLineUserId && userId !== d.ownerLineUserId) {
+  if (!power(d, userId)) {
     await line.reply(replyToken, [text('この操作はアカウントの持ち主だけが行えます。')]);
     return;
   }
@@ -1512,7 +1773,7 @@ async function doDisconnect(
   // ★端末も無効にする。ここを忘れると、解除したはずの拡張が仕事を取りに来られる
   const devices = await revokeDevices(env.DB, DEFAULT_TENANT_ID);
   await d.db.audit(DEFAULT_TENANT_ID, 'session.disconnected', `line:${userId}`, null,
-    removed || devices > 0 ? 'ok' : 'denied', { devices });
+    removed || devices > 0 ? 'ok' : 'denied', { devices, ...(isAdminUser(d, userId) ? { role: 'admin' } : {}) });
   await line.reply(replyToken, [text(
     removed || devices > 0
       ? 'note の連携を解除しました。\n' +
@@ -1539,9 +1800,12 @@ async function settingsView(env: Env, d: ServiceDeps): Promise<SettingsView> {
  * ★ボタンは「文字を送る」形にして、ふだん打つコマンドと同じ経路を通す（持ち主チェックも同じ）。
  */
 async function showMoreSettings(line: LineClient, d: ServiceDeps, replyToken: string, userId: string): Promise<void> {
-  const owner = isOwner(d.ownerLineUserId, userId);
+  const owner = power(d, userId);
+  // ★「管理者を追加」は持ち主にだけ出す（投稿者・管理者には「管理者」という言葉を見せない）
   const labels = owner
-    ? [['連携状況', '連携状況'], ['投稿者一覧', '投稿者一覧'], ['投稿者を追加', '投稿者を追加'], ['設定画面を開く', 'セットアップ'], ['使い方', 'メニュー']]
+    ? [['連携状況', '連携状況'], ['投稿者一覧', '投稿者一覧'], ['投稿者を追加', '投稿者を追加'],
+      ...(isOwner(d.ownerLineUserId, userId) ? [['管理者を追加', '管理者を追加']] : []),
+      ['設定画面を開く', 'セットアップ'], ['使い方', 'メニュー']]
     : [['使い方', 'メニュー']];
   await line.reply(replyToken, [{
     type: 'text',
@@ -1588,7 +1852,7 @@ async function handleAiSettingsPostback(
     case 'ai_ilimit_set': {
       // ★持ち主・キーの有無・値の読み取りは core 側で判定する（キーが無い環境では有効にしない）
       const r = await applyInlineSetting(d.db, {
-        isOwner: isOwner(d.ownerLineUserId, userId),
+        isOwner: power(d, userId),
         hasKey: hasImageKey(env.OPENAI_API_KEY),
         action,
         value: params.get('n'),
@@ -1601,7 +1865,7 @@ async function handleAiSettingsPostback(
   }
   // ★持ち主・キーの有無・値の読み取りは core 側で判定する（キーが無い環境では有効にしない）
   const result = await applyResearchSetting(d.db, {
-    isOwner: isOwner(d.ownerLineUserId, userId),
+    isOwner: power(d, userId),
     hasKey: Boolean(createResearchLlm(env)),
     action,
     value: params.get(action === 'ai_rlimit_set' ? 'n' : 'v'),
@@ -1629,21 +1893,23 @@ async function saveSetting(
   kind: 'daily' | 'interval' | 'mode',
   patch: Parameters<ServiceDeps['db']['updateTenantSettings']>[1],
 ): Promise<void> {
-  if (d.ownerLineUserId && userId !== d.ownerLineUserId) {
+  if (!power(d, userId)) {
     await line.reply(replyToken, [text('この操作はアカウントの持ち主だけが行えます。')]);
     return;
   }
   await d.db.updateTenantSettings(DEFAULT_TENANT_ID, patch, `line:${userId}`);
+  await auditIfAdmin(d, userId, 'settings.changed', { kind });
   await line.reply(replyToken, [buildSettingsSaved(kind, await settingsView(env, d))]);
 }
 
 
 /**
  * セットアップ画面用の使い捨てコードを出す。
- * ★ここに来る時点で持ち主チェックは済んでいる（handleEvent の入口で弾いている）。
+ * ★ここに来る時点で「持ち主または管理者」のチェックは済んでいる（呼び出し側の power）。
  */
-async function sendSetupCode(env: Env, line: LineClient, replyToken: string): Promise<void> {
-  const { display, expiresAt } = await issueSetupCode(env.KV);
+async function sendSetupCode(env: Env, line: LineClient, replyToken: string, issuer: 'owner' | 'admin' = 'owner'): Promise<void> {
+  // ★発行した人の立場を記録する（持ち主のリセットは持ち主のコードでだけ通すため。V7）
+  const { display, expiresAt } = await issueSetupCode(env.KV, issuer);
   await line.reply(replyToken, [text(
     'セットアップ画面で使うコードです。\n\n' +
     `　${display}\n\n` +
@@ -1673,7 +1939,8 @@ async function resetOwner(
   }
 
   const cleared = await d.db.clearOwnerLineUserId(DEFAULT_TENANT_ID, `line:${userId}`);
-  const hasStaff = (d.staffLineUserIds ?? []).length > 0;
+  const hasAdmins = admins(d).length > 0;
+  const hasStaff = (d.staffLineUserIds ?? []).some((id) => !admins(d).includes(id));
   await line.reply(replyToken, [text(cleared
     ? '持ち主の登録をやめました。\n\n' +
       '★次にこのトークへ話しかけた人が、新しい持ち主になります。\n' +
@@ -1681,6 +1948,9 @@ async function resetOwner(
       (hasStaff
         ? '\n\n★投稿者がいます。投稿者が先に話しかけると、その人が持ち主になります。\n' +
           '引き継ぐ相手に、すぐ話しかけてもらってください。'
+        : '') +
+      (hasAdmins
+        ? '\n\n★管理者がいます（持ち主ご本人が先に話しかけてください）。管理者は持ち主にはなりません。'
         : '')
     : '持ち主はもともと登録されていませんでした。')]);
   log.info('持ち主の登録をやめました', { cleared });

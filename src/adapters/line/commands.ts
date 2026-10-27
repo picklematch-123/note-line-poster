@@ -72,6 +72,13 @@ export const COMMANDS = {
    */
   memberApprove: /^(投稿者にする)$/,
   memberReject: /^(断る)$/,
+
+  /**
+   * 管理者（持ち主の代わりに設定を手伝う担当者。2026-10-27 V7）を追加する。★持ち主だけ（管理者は管理者を増やせない）
+   */
+  adminAdd: /^(管理者を追加|管理者追加|管理者を増やす)$/,
+  /** 確認待ちの管理者を文字で承認する（持ち主だけ）。断るのは memberReject と共通 */
+  adminApprove: /^(管理者にする)$/,
 } as const;
 
 export type CommandName = keyof typeof COMMANDS;

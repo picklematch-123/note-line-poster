@@ -246,12 +246,80 @@ export class Db {
     }
   }
 
-  async listStaff(tenantId: string): Promise<Array<{ line_user_id: string; display_name: string | null; created_at: string }>> {
+  /**
+   * 投稿者・管理者の一覧（役割つき）。
+   * ★listStaffIds は「持ち主と同じく記事を承認できる人」＝投稿者と管理者の両方を返す（承認・自動公開の判定に使う）。
+   *   役割で分けたいときはこちらの role を見る
+   */
+  async listStaff(tenantId: string): Promise<Array<{ line_user_id: string; display_name: string | null; created_at: string; role: string }>> {
     const r = await this.d1
-      .prepare('SELECT line_user_id, display_name, created_at FROM line_members WHERE tenant_id = ? ORDER BY created_at')
+      .prepare('SELECT line_user_id, display_name, created_at, role FROM line_members WHERE tenant_id = ? ORDER BY created_at')
       .bind(tenantId)
-      .all<{ line_user_id: string; display_name: string | null; created_at: string }>();
+      .all<{ line_user_id: string; display_name: string | null; created_at: string; role: string }>();
     return r.results ?? [];
+  }
+
+  // ── 管理者（2026-10-27 V7）────────────────────────────────
+  /**
+   * 管理者（持ち主の代わりに設定を手伝う担当者）の userId 一覧。
+   * ★読めないとき（表が無い・一時障害）は**空**に倒す。管理者は権限を増やす側の立場なので、
+   *   分からないときは「いない」として扱う（投稿者として使える範囲は listStaffIds が決める）
+   */
+  async listAdminIds(tenantId: string): Promise<string[]> {
+    try {
+      const r = await this.d1
+        .prepare(`SELECT line_user_id FROM line_members WHERE tenant_id = ? AND role = 'admin' ORDER BY created_at`)
+        .bind(tenantId)
+        .all<{ line_user_id: string }>();
+      return (r.results ?? []).map((row) => row.line_user_id);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * 管理者にする（持ち主が承認したときだけ呼ぶ）。すでに投稿者なら役割を管理者に上げる。
+   * @returns added=新しく登録 / promoted=投稿者から上げた / exists=すでに管理者 / full=上限
+   */
+  async addAdmin(
+    tenantId: string, userId: string, displayName: string | null, addedBy: string, max: number,
+  ): Promise<'added' | 'promoted' | 'exists' | 'full'> {
+    // ★上限の判定は厳しく読む（読めなければ例外＝登録しない）。一時障害で上限を超えて増えないように
+    const admins = ((await this.d1
+      .prepare(`SELECT line_user_id FROM line_members WHERE tenant_id = ? AND role = 'admin'`)
+      .bind(tenantId)
+      .all<{ line_user_id: string }>()).results ?? []).map((r) => r.line_user_id);
+    if (admins.includes(userId)) return 'exists';
+    if (admins.length >= max) return 'full';
+    const row = await this.d1
+      .prepare('SELECT role FROM line_members WHERE tenant_id = ? AND line_user_id = ?')
+      .bind(tenantId, userId)
+      .first<{ role: string }>();
+    if (row) {
+      await this.d1
+        .prepare(`UPDATE line_members SET role = 'admin', display_name = COALESCE(?, display_name), added_by = ? WHERE tenant_id = ? AND line_user_id = ?`)
+        .bind(displayName, addedBy, tenantId, userId)
+        .run();
+    } else {
+      await this.d1
+        .prepare(`INSERT INTO line_members (tenant_id, line_user_id, role, display_name, added_by, created_at)
+                  VALUES (?, ?, 'admin', ?, ?, ?)`)
+        .bind(tenantId, userId, displayName, addedBy, nowIso())
+        .run();
+    }
+    await this.audit(tenantId, 'member.admin_added', `line:${addedBy}`, null, 'ok', { userId, displayName, role: 'admin', promoted: Boolean(row) });
+    return row ? 'promoted' : 'added';
+  }
+
+  /** 管理者を外す（登録ごと消す。投稿者には戻さない）。★呼べるのは持ち主だけ（呼び出し側で判定） */
+  async removeAdmin(tenantId: string, userId: string, actor: string): Promise<boolean> {
+    const res = await this.d1
+      .prepare(`DELETE FROM line_members WHERE tenant_id = ? AND line_user_id = ? AND role = 'admin'`)
+      .bind(tenantId, userId)
+      .run();
+    const removed = (res.meta?.changes ?? 0) > 0;
+    if (removed) await this.audit(tenantId, 'member.admin_removed', actor, null, 'ok', { userId, role: 'admin' });
+    return removed;
   }
 
   /**
@@ -260,26 +328,31 @@ export class Db {
    */
   async addStaff(
     tenantId: string, userId: string, displayName: string | null, addedBy: string, max: number,
+    /** 記録に足す項目（管理者が承認したときの { role: 'admin' } など） */
+    detailExtra: Record<string, unknown> = {},
   ): Promise<'added' | 'exists' | 'full'> {
     const current = await this.listStaffIds(tenantId);
     if (current.includes(userId)) return 'exists';
-    if (current.length >= max) return 'full';
+    // ★上限は投稿者だけで数える（管理者は別の上限。V7）
+    const admins = await this.listAdminIds(tenantId);
+    if (current.filter((id) => !admins.includes(id)).length >= max) return 'full';
     await this.d1
       .prepare(`INSERT OR IGNORE INTO line_members (tenant_id, line_user_id, role, display_name, added_by, created_at)
                 VALUES (?, ?, 'staff', ?, ?, ?)`)
       .bind(tenantId, userId, displayName, addedBy, nowIso())
       .run();
-    await this.audit(tenantId, 'member.added', `line:${addedBy}`, null, 'ok', { userId, displayName });
+    await this.audit(tenantId, 'member.added', `line:${addedBy}`, null, 'ok', { userId, displayName, ...detailExtra });
     return 'added';
   }
 
-  async removeStaff(tenantId: string, userId: string, actor: string): Promise<boolean> {
+  /** 投稿者を外す。★管理者はここでは外せない（管理者を外せるのは持ち主だけ。removeAdmin を使う） */
+  async removeStaff(tenantId: string, userId: string, actor: string, detailExtra: Record<string, unknown> = {}): Promise<boolean> {
     const res = await this.d1
-      .prepare('DELETE FROM line_members WHERE tenant_id = ? AND line_user_id = ?')
+      .prepare(`DELETE FROM line_members WHERE tenant_id = ? AND line_user_id = ? AND role != 'admin'`)
       .bind(tenantId, userId)
       .run();
     const removed = (res.meta?.changes ?? 0) > 0;
-    if (removed) await this.audit(tenantId, 'member.removed', actor, null, 'ok', { userId });
+    if (removed) await this.audit(tenantId, 'member.removed', actor, null, 'ok', { userId, ...detailExtra });
     return removed;
   }
 

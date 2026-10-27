@@ -22,7 +22,7 @@ import { Hono } from 'hono';
 import type { Env } from '../../env';
 import { Db, DEFAULT_TENANT_ID } from '../../ports/storage/db';
 import { ensureMasterKey, resolveMasterKey } from '../../core/setup/masterkey';
-import { mayRun, markSetupCompleted, isSetupCompleted } from '../../core/setup/state';
+import { mayRun, markSetupCompleted, isSetupCompleted, webActor, type RunPermission } from '../../core/setup/state';
 import { provisionLine, type Step } from '../../core/line/provision';
 import {
   DAILY_LIMIT_OPTIONS, INTERVAL_OPTIONS, RATE_RISK_NOTE,
@@ -40,6 +40,25 @@ import {
 import { MAX_GENERATIONS_PER_ARTICLE } from '../../core/image/thumbnail';
 
 export const setupRouter = new Hono<{ Bindings: Env }>();
+
+/** 記録に使う actor（web:owner / web:admin / web:first_run）。断られた場合は 'web' */
+function actorOf(p: RunPermission): string {
+  return p.allowed ? webActor(p) : 'web';
+}
+
+/**
+ * /setup の書き込みを記録する（V7 源蔵レビュー必須2: 管理者の操作を後から追えるように）。
+ * ★ルール本文・画像・鍵は入れない（何の操作か・誰の立場のコードか・件数だけ）。記録に失敗しても操作は止めない
+ */
+async function auditWeb(env: Env, p: RunPermission, op: string, extra: Record<string, unknown> = {}): Promise<void> {
+  if (!p.allowed) return;
+  try {
+    await new Db(env.DB).audit(DEFAULT_TENANT_ID, 'setup.write', webActor(p), null, 'ok',
+      { role: p.reason === 'first_run' ? 'first_run' : p.issuer, op, ...extra });
+  } catch (e) {
+    log.warn('設定画面の操作を記録できませんでした', String(e).slice(0, 120));
+  }
+}
 
 /** 画面に出す状態。★秘密は一切入れない */
 interface Status {
@@ -298,7 +317,8 @@ ${imageRulesSection(status)}
 
 <h2>持ち主を変える</h2>
 <div class="note">
- 「最初にトークへ話しかけた人」が持ち主になります。<b>間違った人が持ち主になってしまったとき</b>や、
+ 「最初にトークへ話しかけた人」が持ち主になります。<b>持ち主ご本人が受け取ったコードが必要です。</b><br>
+ <b>間違った人が持ち主になってしまったとき</b>や、
  <b>担当者を引き継ぐとき</b>は、ここで登録をやめてください。<br>
  やめたあと、<b>次に話しかけた人</b>が新しい持ち主になります。
 </div>
@@ -360,10 +380,11 @@ setupRouter.post('/setup/run', async (c) => {
   }
 
   const allOk = steps.every((s) => s.ok);
+  await auditWeb(c.env, permission, 'run', { ok: allOk });
   if (allOk) {
     await markSetupCompleted(c.env.KV);
     try {
-      await new Db(c.env.DB).audit(DEFAULT_TENANT_ID, 'setup.completed', 'web', null, 'ok', null);
+      await new Db(c.env.DB).audit(DEFAULT_TENANT_ID, 'setup.completed', actorOf(permission), null, 'ok', null);
     } catch { /* 監査に失敗しても本体は止めない */ }
   }
 
@@ -378,13 +399,12 @@ setupRouter.post('/setup/reset-owner', async (c) => {
 
   const form = await c.req.formData().catch(() => null);
   const code = (form?.get('code') as string | null) ?? null;
-  const permission = await mayRun(c.env.KV, code, status.requiresCode);
+  // ★持ち主のリセットは、持ち主が発行したコードでだけ通す（管理者は持ち主を外せない。V7）。
+  //   管理者のコードなら断り、コードは消費しない
+  const permission = await mayRun(c.env.KV, code, status.requiresCode, { ownerOnly: true });
 
   if (!permission.allowed) {
-    const msg = permission.reason === 'code_required'
-      ? 'コードが必要です。LINE で「セットアップ」と送ると届きます。'
-      : 'コードが違うか、期限が切れています。LINE で取り直してください。';
-    return c.html(page(status, [], msg), 403);
+    return c.html(page(status, [], deniedMessage(permission.reason)), 403);
   }
 
   // ★環境変数で固定されている場合は、ここからは変えられない。黙って成功と言わない
@@ -396,7 +416,8 @@ setupRouter.post('/setup/reset-owner', async (c) => {
     }]), 409);
   }
 
-  const cleared = await new Db(c.env.DB).clearOwnerLineUserId(DEFAULT_TENANT_ID, 'web');
+  const cleared = await new Db(c.env.DB).clearOwnerLineUserId(DEFAULT_TENANT_ID, actorOf(permission));
+  await auditWeb(c.env, permission, 'reset_owner', { cleared });
   return c.html(page(await readStatus(c), [{
     label: '持ち主の登録をやめる', ok: true,
     detail: cleared
@@ -444,7 +465,8 @@ setupRouter.post('/setup/settings', async (c) => {
     await new Db(c.env.DB).updateTenantSettings(DEFAULT_TENANT_ID, {
       ...(daily !== null ? { daily_post_limit: daily } : {}),
       ...(interval !== null ? { min_interval_sec: interval } : {}),
-    }, 'web');
+    }, actorOf(permission));
+    await auditWeb(c.env, permission, 'settings', { daily, interval });
   } catch (e) {
     log.warn('投稿の設定を保存できませんでした', String(e));
     return c.html(page(status, [{
@@ -466,11 +488,16 @@ setupRouter.post('/setup/settings', async (c) => {
 
 // ── 画像のルール（2026-10-26）─────────────────────────────
 /** 断ったときの文言（ほかの書き込みと同じ） */
-function deniedMessage(reason: 'code_required' | 'code_invalid'): string {
+function deniedMessage(reason: 'code_required' | 'code_invalid' | 'owner_code_required'): string {
+  if (reason === 'owner_code_required') return OWNER_CODE_REQUIRED;
   return reason === 'code_required'
     ? 'コードが必要です。LINE で「セットアップ」と送ると届きます。'
     : 'コードが違うか、期限が切れています。LINE で取り直してください。';
 }
+
+/** 管理者が発行したコードで、持ち主のリセットをしようとしたとき（V7） */
+export const OWNER_CODE_REQUIRED =
+  'この操作は持ち主だけが行えます。持ち主ご本人が『セットアップ』と送って受け取ったコードをお使いください。';
 
 /**
  * ★画像のルールの書き込みは、初回（コード無しで通る状態）でも断る（2026-10-26 源蔵レビュー必須2）。
@@ -541,13 +568,14 @@ setupRouter.post('/setup/image-rules', async (c) => {
       clearBody: form?.get('thumb_clear') === '1',
       titleMode: form?.get('thumb_title_mode') ?? undefined,
       inspectRetries: form?.get('thumb_inspect') ?? undefined,
-      by: 'web',
+      by: actorOf(permission),
     });
     const inline = await saveImageRules(db, DEFAULT_TENANT_ID, 'inline', {
       body: form?.get('inline_body') ?? undefined,
       clearBody: form?.get('inline_clear') === '1',
-      by: 'web',
+      by: actorOf(permission),
     });
+    await auditWeb(c.env, permission, 'image_rules');
     const label = (r: typeof thumb, name: string): Step => r.ok
       ? { label: name, ok: true, detail: r.saved ? '保存しました' : '登録なしのまま（今までどおり）' }
       : { label: name, ok: false, detail: r.reason === 'too_long' ? `${RULE_BODY_MAX}字を超えています。短くしてください。` : '選べない値でした。もう一度お試しください。' };
@@ -592,8 +620,9 @@ setupRouter.post('/setup/image-refs', async (c) => {
 
   try {
     const r = await addImageRef(new Db(c.env.DB), new KvImageStore(c.env.KV), DEFAULT_TENANT_ID, {
-      name: form?.get('name'), bytes, by: 'web',
+      name: form?.get('name'), bytes, by: actorOf(permission),
     });
+    await auditWeb(c.env, permission, 'image_refs.add', { ok: r.ok });
     if (!r.ok) return c.html(page(status, [{ label: '参考画像', ok: false, detail: REF_REJECT_NOTE[r.reason] }]), 400);
   } catch (e) {
     log.warn('参考画像を保存できませんでした', String(e).slice(0, 120));
@@ -615,7 +644,8 @@ setupRouter.post('/setup/image-refs/delete', async (c) => {
     return c.html(page(status, [], deny), 403);
   }
   const id = String(form?.get('id') ?? '');
-  const ok = id ? await deleteImageRef(new Db(c.env.DB), new KvImageStore(c.env.KV), DEFAULT_TENANT_ID, id, 'web').catch(() => false) : false;
+  const ok = id ? await deleteImageRef(new Db(c.env.DB), new KvImageStore(c.env.KV), DEFAULT_TENANT_ID, id, actorOf(permission)).catch(() => false) : false;
+  await auditWeb(c.env, permission, 'image_refs.delete', { ok });
   return c.html(page(await readStatus(c), [{
     label: '参考画像を消す', ok, detail: ok ? '消しました' : '見つかりませんでした（すでに消えているかもしれません）',
   }]), ok ? 200 : 404);
@@ -668,7 +698,8 @@ setupRouter.post('/setup/image-rules/all', async (c) => {
   }
 
   try {
-    const r = await applyImageSettingsBatch(db, new KvImageStore(c.env.KV), DEFAULT_TENANT_ID, v.batch, 'web');
+    const r = await applyImageSettingsBatch(db, new KvImageStore(c.env.KV), DEFAULT_TENANT_ID, v.batch, actorOf(permission));
+    await auditWeb(c.env, permission, 'image_rules.all', { added: r.added, deleted: r.deleted, deleteFailed: r.deleteFailed });
     const after = await readStatus(c);
     const steps: Step[] = [
       { label: 'サムネ用のルール', ok: true, detail: r.thumb.ok && r.thumb.saved ? '保存しました' : '登録なしのまま（今までどおり）' },

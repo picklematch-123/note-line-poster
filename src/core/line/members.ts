@@ -30,7 +30,16 @@ export const MAX_STAFF = 5;
  */
 export const STAFF_MANUAL_URL = 'https://claude.ai/code/artifact/f39c3d14-435f-4c55-8804-37f0e06ca36b';
 
-const inviteKey = (tenantId: string) => `member:invite:${tenantId}`;
+/**
+ * 窓口の種類。★管理者（V7）は投稿者と別の鍵に置く（同時に開かない・確認待ちが混ざらない）
+ */
+export type InviteKind = 'staff' | 'admin';
+const prefix = (kind: InviteKind) => (kind === 'admin' ? 'admin' : 'member');
+
+/** 管理者の上限（持ち主は数えない）。投稿者の上限（MAX_STAFF）とは別に数える */
+export const MAX_ADMINS = 2;
+
+const inviteKey = (tenantId: string, kind: InviteKind = 'staff') => `${prefix(kind)}:invite:${tenantId}`;
 
 export interface Invite {
   /** 窓口を開けた持ち主 */
@@ -38,18 +47,20 @@ export interface Invite {
   openedAt: string;
 }
 
-export async function openInvite(kv: KVNamespace, tenantId: string, by: string): Promise<void> {
+/** 窓口を開く。★もう一方の種類の窓口は閉じる（投稿者と管理者の窓口を同時に開かない） */
+export async function openInvite(kv: KVNamespace, tenantId: string, by: string, kind: InviteKind = 'staff'): Promise<void> {
   const invite: Invite = { by, openedAt: new Date().toISOString() };
-  await kv.put(inviteKey(tenantId), JSON.stringify(invite), { expirationTtl: INVITE_TTL_SEC });
+  await closeInvite(kv, tenantId, kind === 'admin' ? 'staff' : 'admin');
+  await kv.put(inviteKey(tenantId, kind), JSON.stringify(invite), { expirationTtl: INVITE_TTL_SEC });
 }
 
 /**
  * 開いている窓口を返す。
  * ★読めないときは「開いていない」に倒す。間違えて誰かを投稿者にするより安全。
  */
-export async function peekInvite(kv: KVNamespace, tenantId: string): Promise<Invite | null> {
+export async function peekInvite(kv: KVNamespace, tenantId: string, kind: InviteKind = 'staff'): Promise<Invite | null> {
   try {
-    const raw = await kv.get(inviteKey(tenantId));
+    const raw = await kv.get(inviteKey(tenantId, kind));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<Invite>;
     return parsed.by ? { by: parsed.by, openedAt: parsed.openedAt ?? '' } : null;
@@ -59,8 +70,8 @@ export async function peekInvite(kv: KVNamespace, tenantId: string): Promise<Inv
   }
 }
 
-export async function closeInvite(kv: KVNamespace, tenantId: string): Promise<void> {
-  await kv.delete(inviteKey(tenantId)).catch(() => {});
+export async function closeInvite(kv: KVNamespace, tenantId: string, kind: InviteKind = 'staff'): Promise<void> {
+  await kv.delete(inviteKey(tenantId, kind)).catch(() => {});
 }
 
 // ── 持ち主の確認待ち ─────────────────────────────────────
@@ -68,18 +79,18 @@ export async function closeInvite(kv: KVNamespace, tenantId: string): Promise<vo
 /** 持ち主が気づいて押すまでの猶予 */
 export const PENDING_TTL_SEC = 24 * 60 * 60;
 
-const pendingKey = (tenantId: string, userId: string) => `member:pending:${tenantId}:${userId}`;
+const pendingKey = (tenantId: string, userId: string, kind: InviteKind = 'staff') => `${prefix(kind)}:pending:${tenantId}:${userId}`;
 
 /**
  * 確認待ちの人の userId 一覧。
  * ★持ち主が「投稿者にする」を**文字で**送ったとき、誰のことかを探すために持つ（2026-09-15）。
  *   KV の list() は書き込みの反映が遅く、申請の直後に打つと「誰もいない」と答えてしまうため使わない。
  */
-const pendingIndexKey = (tenantId: string) => `member:pendings:${tenantId}`;
+const pendingIndexKey = (tenantId: string, kind: InviteKind = 'staff') => `${prefix(kind)}:pendings:${tenantId}`;
 
-async function readPendingIndex(kv: KVNamespace, tenantId: string): Promise<string[]> {
+async function readPendingIndex(kv: KVNamespace, tenantId: string, kind: InviteKind = 'staff'): Promise<string[]> {
   try {
-    const raw = await kv.get(pendingIndexKey(tenantId));
+    const raw = await kv.get(pendingIndexKey(tenantId, kind));
     const parsed = raw ? JSON.parse(raw) : [];
     return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string' && x !== '') : [];
   } catch (e) {
@@ -96,11 +107,11 @@ export interface PendingMember {
   requestedAt: string;
 }
 
-export async function savePending(kv: KVNamespace, tenantId: string, pending: PendingMember): Promise<void> {
-  await kv.put(pendingKey(tenantId, pending.userId), JSON.stringify(pending), { expirationTtl: PENDING_TTL_SEC });
-  const ids = await readPendingIndex(kv, tenantId);
+export async function savePending(kv: KVNamespace, tenantId: string, pending: PendingMember, kind: InviteKind = 'staff'): Promise<void> {
+  await kv.put(pendingKey(tenantId, pending.userId, kind), JSON.stringify(pending), { expirationTtl: PENDING_TTL_SEC });
+  const ids = await readPendingIndex(kv, tenantId, kind);
   if (!ids.includes(pending.userId)) {
-    await kv.put(pendingIndexKey(tenantId), JSON.stringify([...ids, pending.userId]), { expirationTtl: PENDING_TTL_SEC });
+    await kv.put(pendingIndexKey(tenantId, kind), JSON.stringify([...ids, pending.userId]), { expirationTtl: PENDING_TTL_SEC });
   }
 }
 
@@ -108,9 +119,9 @@ export async function savePending(kv: KVNamespace, tenantId: string, pending: Pe
  * いま確認待ちの人を、申請の古い順に返す。
  * ★期限切れで本体が消えた人は含めない（一覧に名前だけ残っていても対象にしない）。
  */
-export async function listPending(kv: KVNamespace, tenantId: string): Promise<PendingMember[]> {
-  const ids = await readPendingIndex(kv, tenantId);
-  const found = await Promise.all(ids.map((id) => getPending(kv, tenantId, id)));
+export async function listPending(kv: KVNamespace, tenantId: string, kind: InviteKind = 'staff'): Promise<PendingMember[]> {
+  const ids = await readPendingIndex(kv, tenantId, kind);
+  const found = await Promise.all(ids.map((id) => getPending(kv, tenantId, id, kind)));
   return found.filter((p): p is PendingMember => p !== null);
 }
 
@@ -118,10 +129,10 @@ export async function listPending(kv: KVNamespace, tenantId: string): Promise<Pe
  * 確認待ちを返す。
  * ★読めないときは「確認待ちは無い」に倒す。持ち主の「投稿者にする」は、ここに記録がある人にしか効かない。
  */
-export async function getPending(kv: KVNamespace, tenantId: string, userId: string): Promise<PendingMember | null> {
+export async function getPending(kv: KVNamespace, tenantId: string, userId: string, kind: InviteKind = 'staff'): Promise<PendingMember | null> {
   if (!userId) return null;
   try {
-    const raw = await kv.get(pendingKey(tenantId, userId));
+    const raw = await kv.get(pendingKey(tenantId, userId, kind));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<PendingMember>;
     return parsed.userId === userId && parsed.invitedBy
@@ -164,15 +175,15 @@ export function decideTypedMemberCommand(input: {
   return inviteOpen ? { kind: 'not_yet' } : { kind: 'gone' };
 }
 
-export async function deletePending(kv: KVNamespace, tenantId: string, userId: string): Promise<void> {
+export async function deletePending(kv: KVNamespace, tenantId: string, userId: string, kind: InviteKind = 'staff'): Promise<void> {
   if (!userId) return;
-  await kv.delete(pendingKey(tenantId, userId)).catch(() => {});
-  const ids = await readPendingIndex(kv, tenantId);
+  await kv.delete(pendingKey(tenantId, userId, kind)).catch(() => {});
+  const ids = await readPendingIndex(kv, tenantId, kind);
   if (!ids.includes(userId)) return;
   const rest = ids.filter((id) => id !== userId);
   await (rest.length > 0
-    ? kv.put(pendingIndexKey(tenantId), JSON.stringify(rest), { expirationTtl: PENDING_TTL_SEC })
-    : kv.delete(pendingIndexKey(tenantId))
+    ? kv.put(pendingIndexKey(tenantId, kind), JSON.stringify(rest), { expirationTtl: PENDING_TTL_SEC })
+    : kv.delete(pendingIndexKey(tenantId, kind))
   ).catch(() => {});
 }
 
@@ -221,3 +232,59 @@ export function buildStaffAddedNotice(displayName: string | null): string {
     'ご本人に使い方のご案内を送りました。\n\n' +
     '外したくなったら、「投稿者一覧」と送ってください。';
 }
+
+// ── 管理者（2026-10-27 V7）──────────────────────────────
+/** 「管理者」の説明（持ち主にだけ見せる文面で使う） */
+export const ADMIN_DESCRIPTION = 'あなたの代わりに設定を手伝う担当者（提供元など）。いつでも外せます';
+
+/** 持ち主が管理者の窓口を開けたとき */
+export function buildAdminInviteOpened(): string {
+  return '管理者を追加する受付を始めました。\n' +
+    `（管理者＝${ADMIN_DESCRIPTION}）\n\n` +
+    '★これから10分以内に、追加したい担当者に\n' +
+    '　このアカウントへ何か1通送ってもらってください。\n\n' +
+    '最初に送ってきた1人について、あなたに確認のお知らせが届きます。\n' +
+    '「管理者にする」を押すまで、その人は何もできません。\n\n' +
+    '※ 管理者は、設定・連携・投稿者の出し入れなどを、あなたと同じように行えます。\n' +
+    '　持ち主の変更と、管理者の出し入れは、あなただけができます。';
+}
+
+/** 持ち主へ（この人を管理者にしてよいか） */
+export function buildAdminApprovalRequest(displayName: string | null, opts: { currentlyStaff?: boolean } = {}): string {
+  return `「${displayName ?? '名前を取得できなかった方'}」から、管理者として登録してほしいと届きました。\n` +
+    (opts.currentlyStaff ? '★この方は現在、投稿者です（管理者にすると、投稿者から管理者に変わります）。\n' : '') +
+    `（管理者＝${ADMIN_DESCRIPTION}）\n\n` +
+    '★その人の LINE の名前が、追加したい担当者の名前と同じか確かめてから押してください。\n' +
+    '　（名前は誰でも変えられます。心配なら本人に、いま送ったか聞いてください）\n\n' +
+    '★心当たりが無ければ「断る」を押してください。押すまで、この人は何もできません。\n\n' +
+    '※ ボタンが見当たらないときは、「管理者にする」「断る」と文字で送っても大丈夫です。';
+}
+
+/** 管理者になった人へ */
+export function buildWelcomeAdmin(): string {
+  return '管理者として登録しました。\n' +
+    '持ち主の方の代わりに、設定・連携・投稿者の出し入れなどを行えます。\n' +
+    '（持ち主の変更と、管理者の出し入れはできません）\n\n' +
+    '画面の下のメニューから操作できます。';
+}
+
+/** 持ち主へ（管理者に登録した） */
+export function buildAdminAddedNotice(displayName: string | null, promoted: boolean): string {
+  return `「${displayName ?? '名前を取得できなかった方'}」を管理者に登録しました${promoted ? '（投稿者から変更）' : ''}。\n` +
+    `${ADMIN_DESCRIPTION}。\n\n` +
+    '外したくなったら、「投稿者一覧」と送ってください（管理者もそこに並びます）。';
+}
+
+/** 管理者がセットアップ画面のコードを出したとき、持ち主へ送る1行 */
+export function buildSetupOpenedByAdminNotice(displayName: string | null): string {
+  return `運用担当の${displayName ? `${displayName}さん` : '管理者'}がセットアップを開きました。`;
+}
+
+/** 管理者が note 連携のコードを出したとき、持ち主へ送る1行 */
+export function buildNoteCodeByAdminNotice(displayName: string | null): string {
+  return `運用担当の${displayName ? `${displayName}さん` : '管理者'}が note 連携のコードを出しました。`;
+}
+
+/** 持ち主が未登録のとき、管理者が先に話しかけてきたら返す（★管理者は持ち主にならない） */
+export const ADMIN_CANNOT_BE_OWNER_MESSAGE =
+  'いまは持ち主が登録されていません。持ち主ご本人に、先にこのアカウントへ話しかけてもらってください。';
