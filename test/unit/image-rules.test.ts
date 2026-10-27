@@ -171,14 +171,17 @@ describe('指示文の組み立て', () => {
     expect(PLAN_SYSTEM_TITLE).toContain('余白');
     // 安全の禁止は残る
     expect(PLAN_SYSTEM_TITLE).toContain('ロゴ');
-    expect(PLAN_SYSTEM_TITLE).toContain('生肉');
+    expect(PLAN_SYSTEM_TITLE).toContain('既存の作品のキャラクター');
+    // V6: 特定の業態由来の既定の禁止は外した
+    expect(PLAN_SYSTEM_TITLE).not.toContain('\u751f\u8089');
   });
 
   it('ルールは「最優先」として渡し、固定の安全ルールはルールより優先と明記する', () => {
     const sys = buildPlanSystem({ titleMode: 'none', hasRules: true, hasRefs: false });
     expect(sys).toContain('この顧客の画像ルール');
     expect(sys).toContain('安全ルールは顧客の画像ルールよりも優先');
-    for (const w of ['実在の人物', 'ロゴ', '生肉', '記事に書かれていない']) expect(sys).toContain(w);
+    for (const w of ['実在の人物', 'ロゴ', '記事に書かれていない']) expect(sys).toContain(w);
+    expect(sys).not.toContain('\u751f\u8089');
     const user = buildPlanUser({ title: 'T', metaDescription: '', headings: [], excerpt: 'E', knowledge: null, rules: '水彩風で描く' });
     expect(user).toContain('【この顧客の画像ルール（最優先）】\n水彩風で描く');
   });
@@ -195,10 +198,12 @@ describe('指示文の組み立て', () => {
     expect(titleClause('A\nB')).toContain('「A B」');
   });
 
-  it('参考画像の固定文は、見た目だけ使い、ポーズを写さない', () => {
-    for (const w of ['見た目（顔・髪・服・体型・小物）だけ', 'ポーズ・構図・差し出す手', '新しいポーズ', 'キャラクターシート']) {
+  it('参考画像の固定文は、種類に依らず見た目をそろえるためだけに使い、構図・配置・ポーズを写さない（V6）', () => {
+    for (const w of ['人物なら顔・髪・服・体型', '物なら形・色・質感・雰囲気・配色・レイアウト', '構図・配置・ポーズをそのまま写さず',
+      '記事に合う新しい場面', '説明用の一覧図や見本の枠']) {
       expect(REFERENCE_CLAUSE).toContain(w);
     }
+    for (const w of ['キャラクターシート', '新しいポーズ', '登場させる']) expect(REFERENCE_CLAUSE).not.toContain(w);
   });
 });
 
@@ -1003,13 +1008,13 @@ describe('B. /setup の画像のルールを、1回のコードでまとめて�
     const res = await postAll(env, batchForm({
       code: display, thumb_body: 'サムネのルール', thumb_title_mode: 'title', thumb_inspect: '2',
       inline_body: '挿絵のルール', ref_random: '1', delete_ref: old.id,
-    }, [{ n: 1, name: '主役（主役）', bytes: PNG() }, { n: 3, name: '相棒', bytes: JPEG(), type: 'image/jpeg' }]));
+    }, [{ n: 1, name: '店主', bytes: PNG() }, { n: 3, name: '看板メニュー', bytes: JPEG(), type: 'image/jpeg' }]));
     expect(res.status).toBe(200);
     expect(await getImageRules(db, DEFAULT_TENANT_ID, 'thumbnail')).toMatchObject({ body: 'サムネのルール', titleMode: 'title', inspectRetries: 2 });
     expect(await getImageRules(db, DEFAULT_TENANT_ID, 'inline')).toMatchObject({ body: '挿絵のルール' });
     expect(await getRefRandom(db)).toBe(true);
     const refs = await db.listImageRefs(DEFAULT_TENANT_ID);
-    expect(refs.map((r) => r.name)).toEqual(['主役（主役）', '相棒']);
+    expect(refs.map((r) => r.name)).toEqual(['店主', '看板メニュー']);
     expect(refs.find((r) => r.id === old.id)).toBeUndefined();
     // コードは使い切り
     expect((await postAll(env, batchForm({ code: display, thumb_body: '上書き' }))).status).toBe(403);
@@ -1113,7 +1118,12 @@ describe('B. /setup の画像のルールを、1回のコードでまとめて�
     const html = await (await setupRouter.request('/setup', {}, env)).text();
     expect(html).toContain('action="/setup/image-rules/all"');
     expect(html).toContain('enctype="multipart/form-data"');
-    expect(html).toContain('（主役）');
+    expect(html).toContain('「看板メニュー」');
+    expect(html).toContain('参考画像（見た目や雰囲気をそろえたい画像）');
+    expect(html).toContain('参考画像の使い方');
+    // V6: 参考画像の節に、キャラクター前提の言い方を出さない
+    const section = html.slice(html.indexOf('<h2>参考画像'), html.indexOf('code_all'));
+    for (const w of ['主役', 'ライバル', 'キャラクターの使い方', 'キャラクターの見た目', '1人か2人']) expect(section).not.toContain(w);
     expect(html).toContain('name="ref_random"');
     expect(html).toContain('「セットアップ」</b> と送ると届きます');
     expect(html).not.toContain('社外秘の本文');
@@ -1139,13 +1149,13 @@ describe('C. 参考画像のランダム選択', () => {
   });
 
   it('どの画像が誰かを書く文（名前は登録した文字列そのまま）', () => {
-    expect(refNamesClause(['主役', 'ライバル'])).toBe('参考画像は2枚。1枚目は「主役」、2枚目は「ライバル」。この画像に登場させるキャラクターは、この2人だけ。');
-    expect(refNamesClause(['主役'])).toContain('この1人だけ');
+    expect(refNamesClause(['店主', '看板メニュー'])).toBe('この画像で参考にするのは次の画像だけ: 1枚目は「店主」、2枚目は「看板メニュー」。');
+    expect(refNamesClause(['サムネの見本'])).toBe('この画像で参考にするのは次の画像だけ: 1枚目は「サムネの見本」。');
   });
 
   async function withRefs(n: number) {
     const ctx = await setup();
-    for (const name of ['キャラA（主役）', 'キャラB（ライバル）', 'キャラC（親友）'].slice(0, n)) {
+    for (const name of ['画像A', '画像B', '画像C'].slice(0, n)) {
       await addImageRef(ctx.db, ctx.images, DEFAULT_TENANT_ID, { name, bytes: PNG(), by: 't' });
     }
     return ctx;
@@ -1157,7 +1167,7 @@ describe('C. 参考画像のランダム選択', () => {
     expect((await ensureThumbnail({ ...deps, random: () => { throw new Error('呼ばれない'); } }, article.id)).status).toBe('created');
     expect(net.edit[0].getAll('image[]')).toHaveLength(3);
     expect(String(net.edit[0].get('prompt'))).not.toContain('枚目は');
-    expect(net.plans[0].input).not.toContain('この画像に登場させるキャラクター');
+    expect(net.plans[0].input).not.toContain('この画像で参考にするのは');
   });
 
   it('★オン: サムネは選んだ組だけを渡し、どの画像が誰かを指示に書く。指示文づくりにも名前を渡す', async () => {
@@ -1167,10 +1177,10 @@ describe('C. 参考画像のランダム選択', () => {
     expect((await ensureThumbnail({ ...deps, random: () => 0.99 }, article.id)).status).toBe('created');   // 6通りの最後＝[B, C]
     expect(net.edit[0].getAll('image[]')).toHaveLength(2);
     const prompt = String(net.edit[0].get('prompt'));
-    expect(prompt).toContain('1枚目は「キャラB（ライバル）」、2枚目は「キャラC（親友）」');
+    expect(prompt).toContain('1枚目は「画像B」、2枚目は「画像C」');
     expect(prompt).toContain(REFERENCE_CLAUSE);
-    expect(net.plans[0].input).toContain('この画像に登場させるキャラクター（この2人だけを描く）】キャラB（ライバル）、キャラC（親友）');
-    expect(net.plans[0].input).not.toContain('キャラA');
+    expect(net.plans[0].input).toContain('【この画像で参考にするのは次の画像だけ（ほかの参考画像は使わない）】画像B、画像C');
+    expect(net.plans[0].input).not.toContain('画像A');
   });
 
   it('★検品のやり直しでも、最初に選んだ組を使い続ける（乱数は1回だけ使う）', async () => {
@@ -1183,7 +1193,7 @@ describe('C. 参考画像のランダム選択', () => {
     expect(net.edit).toHaveLength(2);
     for (const f of net.edit) {
       expect(f.getAll('image[]')).toHaveLength(1);
-      expect(String(f.get('prompt'))).toContain('1枚目は「キャラA（主役）」');
+      expect(String(f.get('prompt'))).toContain('1枚目は「画像A」');
     }
     expect(rng.calls()).toBe(1);
   });
@@ -1200,7 +1210,7 @@ describe('C. 参考画像のランダム選択', () => {
     net = mockOpenAi();
     await ensureThumbnail({ ...two.deps, random: () => 0.9 }, two.article.id);   // 3通りの最後＝[A, B]
     expect(net.edit[0].getAll('image[]')).toHaveLength(2);
-    expect(String(net.edit[0].get('prompt'))).toContain('1枚目は「キャラA（主役）」、2枚目は「キャラB（ライバル）」');
+    expect(String(net.edit[0].get('prompt'))).toContain('1枚目は「画像A」、2枚目は「画像B」');
   });
 
   it('★文中画像も画像ごとに選ぶ。指示文づくりに画像ごとの登場キャラを渡し、描くときは選んだ組だけ', async () => {
@@ -1211,13 +1221,13 @@ describe('C. 参考画像のランダム選択', () => {
     const plan = await prepareInlinePlan({ ...deps, random: seq(0.05, 0.75) }, article.id);   // slot1=[A]・slot2=[A, C]
     expect(plan.status).toBe('ok');
     if (plan.status !== 'ok') return;
-    expect(net.plans[0].input).toContain('- slot 1: キャラA（主役）');
-    expect(net.plans[0].input).toContain('- slot 2: キャラA（主役）、キャラC（親友）');
+    expect(net.plans[0].input).toContain('- slot 1: 画像A');
+    expect(net.plans[0].input).toContain('- slot 2: 画像A、画像C');
     expect(plan.items[0].refIds).toHaveLength(1);
     expect(plan.items[1].refIds).toHaveLength(2);
     await ensureInlineImage(deps, article.id, plan.items[1]);
     expect(net.edit[0].getAll('image[]')).toHaveLength(2);
-    expect(String(net.edit[0].get('prompt'))).toContain('1枚目は「キャラA（主役）」、2枚目は「キャラC（親友）」');
+    expect(String(net.edit[0].get('prompt'))).toContain('1枚目は「画像A」、2枚目は「画像C」');
   });
 
   it('文中画像もオフなら従来どおり（refIds なし・全部渡す・名前の文なし）', async () => {
@@ -1398,7 +1408,7 @@ describe('前倒し4・5', () => {
   });
 
   it('5: 参考画像の名前から「」を取り除く（40字のまま）', () => {
-    expect(normalizeRefName('主役」。ほかの指示「')).toBe('主役。ほかの指示');
+    expect(normalizeRefName('店主」。ほかの指示「')).toBe('店主。ほかの指示');
     expect(normalizeRefName('あ'.repeat(50))).toHaveLength(40);
     expect(refNamesClause([normalizeRefName('A」B')])).toContain('1枚目は「AB」');
   });
@@ -1475,5 +1485,73 @@ describe('V5: 検品の合否は severity だけで決める', () => {
     const d = JSON.parse((sqlite.prepare('SELECT detail_json FROM audit_logs WHERE action = ?').get(AUDIT_INSPECTED) as { detail_json: string }).detail_json);
     expect(d.issues).toHaveLength(5);
     for (const x of d.issues) expect(x.text.length).toBeLessThanOrEqual(60);
+  });
+});
+
+
+// ── V6: 参考画像の種類に依らない（人物でない参考画像でも同じ流れ）────────────
+describe('V6: 参考画像は人物・キャラクターに限らない', () => {
+  it('★商品写真・見本など人物でない参考画像でも、ランダム選択・名前の文・再生成での固定は同じ流れで動く', async () => {
+    const ctx = await setup();
+    for (const name of ['商品写真（定番品）', 'お店の外観', 'サムネの配色見本']) {
+      await addImageRef(ctx.db, ctx.images, DEFAULT_TENANT_ID, { name, bytes: PNG(), by: 't' });
+    }
+    await setRefRandom(ctx.db, true, 't');
+    await saveImageRules(ctx.db, DEFAULT_TENANT_ID, 'thumbnail', { inspectRetries: 1, body: '禁止: 実在のロゴ', by: 't' });
+    const net = mockOpenAi([{ issues: ['形が崩れている'] }, { issues: [] }]);
+    const rng = seq(0.6, 0.1);   // 6通りの4番目＝[1枚目, 2枚目]
+    expect((await ensureThumbnail({ ...ctx.deps, random: rng }, ctx.article.id)).status).toBe('created');
+    expect(rng.calls()).toBe(1);
+    for (const f of net.edit) {
+      expect(f.getAll('image[]')).toHaveLength(2);
+      const prompt = String(f.get('prompt'));
+      expect(prompt).toContain('この画像で参考にするのは次の画像だけ: 1枚目は「商品写真（定番品）」、2枚目は「お店の外観」。');
+      expect(prompt).toContain(REFERENCE_CLAUSE);
+      expect(prompt).not.toContain('キャラクター');
+    }
+    expect(net.plans[0].instructions).toContain('人物・キャラクター・商品・お店の雰囲気');
+    expect(net.plans[0].instructions).toContain('顧客が登録したものなので描いてよい');
+  });
+
+  it('★参考画像が無いときの指示文づくりには、参考画像の文を足さない（今までどおり）', () => {
+    const sys = buildPlanSystem({ titleMode: 'none', hasRules: false, hasRefs: false });
+    expect(sys).toBe(PLAN_SYSTEM);
+    expect(sys).not.toContain('【参考画像】');
+    expect(composeThumbPrompt({ planPrompt: PLAN_PROMPT, titleMode: 'none', title: TITLE, hasRefs: false })).toBe(PLAN_PROMPT);
+    expect(buildInlinePlanSystem({ hasRules: false, hasRefs: false })).toBe(INLINE_PLAN_SYSTEM);
+  });
+
+  it('既定の指示（サムネ・文中画像・検品）に、特定の業態由来の既定の禁止を入れない。汎用の安全ルールは残す', () => {
+    // ★業態の語そのものを配布物に残さないよう、\u 表記で書いている（特定の食べ物の名前）
+    for (const sys of [PLAN_SYSTEM, PLAN_SYSTEM_TITLE, INLINE_PLAN_SYSTEM, INSPECT_SYSTEM,
+      buildPlanSystem({ titleMode: 'none', hasRules: true, hasRefs: true })]) {
+      for (const w of ['\u751f\u8089', '\u751f\u98df', '\u523a\u8eab', '\u305f\u305f\u304d', '\u713c\u9ce5']) expect(sys).not.toContain(w);
+    }
+    for (const sys of [PLAN_SYSTEM, INLINE_PLAN_SYSTEM]) {
+      for (const w of ['実在の人物', 'ロゴ・商標', '記事の本文・ナレッジに書かれたものだけを描く']) expect(sys).toContain(w);
+    }
+  });
+});
+
+
+describe('V6 源蔵レビュー必須: ロゴは参考画像にあっても再現しない／権利の注意', () => {
+  it('★REFS_SYSTEM・REFERENCE_CLAUSE・RULES_PRIORITY_SYSTEM がそろって「ロゴは再現しない」（人物の例外は維持）', () => {
+    const refs = buildPlanSystem({ titleMode: 'none', hasRules: false, hasRefs: true });
+    expect(refs).toContain('ロゴ・商標・ブランド名・文字は参考画像にあっても再現しない');
+    expect(REFERENCE_CLAUSE).toContain('参考画像の中のロゴや文字は描かない');
+    const rules = buildPlanSystem({ titleMode: 'none', hasRules: true, hasRefs: true });
+    expect(rules).toContain('実在のロゴ・商標・ブランド名を描かない（参考画像の中にあっても描かない）');
+    expect(rules).toContain('参考画像として渡された人物は除く');
+    expect(rules).not.toContain('参考画像として渡された人物・物は除く');
+    expect(INSPECT_SYSTEM).toContain('ロゴ・商標');
+  });
+
+  it('★/setup の参考画像の節に、権利の注意が出る', async () => {
+    const { env } = await runningEnv();
+    const html = await (await setupRouter.request('/setup', {}, env)).text();
+    const section = html.slice(html.indexOf('<h2>参考画像'), html.indexOf('code_all'));
+    expect(section).toContain('ご自身や自社に権利がある画像だけを登録してください');
+    expect(section).toContain('他人の顔写真・有名人・他社の商品やロゴ・アニメなどのキャラクターは不可');
+    expect(section).toContain('画像の中のロゴや文字は再現しません');
   });
 });

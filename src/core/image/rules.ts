@@ -234,9 +234,12 @@ export async function loadReferenceImages(db: Db, images: ImageStore, tenantId: 
   return out;
 }
 
-/** 参考画像つきの指示に必ず足す固定文（設計書 2: ポーズのコピーを防ぐ） */
+/**
+ * 参考画像つきの指示に必ず足す固定文（設計書 2: 構図・ポーズのコピーを防ぐ）。
+ * ★2026-10-27 V6: 参考画像の種類（人物・キャラクター・商品・お店の雰囲気・見本など）に依らない書き方にした
+ */
 export const REFERENCE_CLAUSE =
-  '参考画像は見た目（顔・髪・服・体型・小物）だけに使う。参考画像のポーズ・構図・差し出す手などは写さず、題名に合う新しいポーズを描く。キャラクターシートのような説明画像にしない。';
+  '参考画像は、見た目（人物なら顔・髪・服・体型、物なら形・色・質感・雰囲気・配色・レイアウト）をそろえるためだけに使う。参考画像の構図・配置・ポーズをそのまま写さず、記事に合う新しい場面を描く。参考画像そのもの（説明用の一覧図や見本の枠）を再現しない。参考画像の中のロゴや文字は描かない。';
 
 /** 題名モードで、記事タイトルを機械的に入れる文（★LLM に言い換えさせない。ここで一字一句そのまま入れる） */
 export function titleClause(title: string): string {
@@ -246,7 +249,7 @@ export function titleClause(title: string): string {
 
 // ── 参考画像のランダム選択（2026-10-27）─────────────────────
 /**
- * 「記事ごとに、登録したキャラクターからランダムに選んで使う」設定。system_flags の数値（0/1）。
+ * 「画像ごとに、登録した参考画像からランダムに選んで使う」設定。system_flags の数値（0/1）。
  * ★既定 0（今までどおり、登録した参考画像を全部渡す）。読めないときも 0 側に倒す
  */
 export const FLAG_REF_RANDOM = 'image_ref_random';
@@ -289,13 +292,13 @@ export function selectRefs<T>(refs: T[], rng: () => number = Math.random): T[] {
 }
 
 /**
- * どの参考画像が誰か（名前は顧客が登録した文字列そのまま）。ランダム選択のときに指示に足す。
- * 例: 「参考画像は2枚。1枚目は「〇〇」、2枚目は「△△」。この画像に登場させるのは、この2人だけ。」
+ * どの参考画像が何か（名前は顧客が登録した文字列そのまま）。ランダム選択のときに指示に足す。
+ * 例: 「この画像で参考にするのは次の画像だけ: 1枚目は「〇〇」、2枚目は「△△」。」
  */
 export function refNamesClause(names: string[]): string {
   if (!names.length) return '';
   const each = names.map((n, i) => `${i + 1}枚目は「${n.replace(/[\r\n]+/g, ' ')}」`).join('、');
-  return `参考画像は${names.length}枚。${each}。この画像に登場させるキャラクターは、${names.length === 1 ? 'この1人' : `この${names.length}人`}だけ。`;
+  return `この画像で参考にするのは次の画像だけ: ${each}。`;
 }
 
 // ── 画面から、まとめて保存する（1回のコードで。2026-10-27）──────────
@@ -338,7 +341,7 @@ export function validateImageSettingsBatch(input: ImageSettingsBatchInput, curre
   if (input.refRandom !== undefined && input.refRandom !== null) {
     if (input.refRandom === '1' || input.refRandom === 1) refRandom = true;
     else if (input.refRandom === '0' || input.refRandom === 0) refRandom = false;
-    else errors.push('キャラクターの選び方が読めませんでした');
+    else errors.push('参考画像の使い方が読めませんでした');
   }
   const deleteIds = [...new Set(input.deleteIds)];
   for (const id of deleteIds) if (!currentRefIds.includes(id)) errors.push('消す参考画像が見つかりませんでした（画面を開き直してください）');
@@ -449,7 +452,7 @@ export async function applyImageSettingsBatch(db: Db, images: ImageStore, tenant
         : db.raw.prepare('DELETE FROM image_rules WHERE tenant_id = ? AND kind = ?').bind(tenantId, kind).run());
     }
     const f = before.refRandom;
-    await attempt('キャラクターの使い方', () => f
+    await attempt('参考画像の使い方', () => f
       ? db.raw.prepare(`INSERT INTO system_flags (key, value, reason, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)
                         ON CONFLICT(key) DO UPDATE SET value = excluded.value, reason = excluded.reason,
                           updated_by = excluded.updated_by, updated_at = excluded.updated_at`)

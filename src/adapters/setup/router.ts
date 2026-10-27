@@ -190,7 +190,7 @@ ${status.hasImageKey ? '' : '<div class="note">OpenAI の API キーが未登録
  <tr><td>確認と作り直し</td><td>${r.thumbnail.registered ? esc(inspectLabel(r.thumbnail.inspectRetries)) : '確認しない（今までどおり）'}</td></tr>
  <tr><td>文中の画像用のルール</td><td>${r.inline.registered && r.inline.chars ? `登録済み（${r.inline.chars}字）` : '未登録'}</td></tr>
  <tr><td>参考画像</td><td>${r.refs.length} / ${REF_MAX_COUNT} 枚</td></tr>
- <tr><td>キャラクターの使い方</td><td>${r.refRandom ? '画像ごとにランダムに選ぶ' : '全部使う（今までどおり）'}</td></tr>
+ <tr><td>参考画像の使い方</td><td>${r.refRandom ? '画像ごとにランダムに選ぶ' : '全部使う（今までどおり）'}</td></tr>
 </table>
 <form method="post" action="/setup/image-rules/all" enctype="multipart/form-data">
  <div class="note">この欄は<b>まとめて1回で保存</b>します（確認コードは1つで足ります）。変えない欄は空のままで構いません。</div>
@@ -215,17 +215,18 @@ ${status.hasImageKey ? '' : '<div class="note">OpenAI の API キーが未登録
   placeholder="空のまま保存すると、いまの内容を残します"></textarea>
  <label style="margin-top:.4rem"><input type="checkbox" name="inline_clear" value="1" style="width:auto"> 文中の画像用のルールを消す</label>
 
- <h2>参考画像（キャラクターの見た目）</h2>
- <div class="note">登録すると、サムネと文中の画像の両方で、見た目（顔・髪・服など）の参考に使います。
+ <h2>参考画像（見た目や雰囲気をそろえたい画像）</h2>
+ <div class="note">登録すると、サムネと文中の画像の両方で、見た目や雰囲気をそろえる参考に使います。人物・キャラクター、商品、お店の雰囲気、過去のサムネの見本など、なんでも登録できます。<br>
+ <b>ご自身や自社に権利がある画像だけを登録してください（他人の顔写真・有名人・他社の商品やロゴ・アニメなどのキャラクターは不可）。</b>画像の中のロゴや文字は再現しません。
  PNG・JPEG・WebP、1枚 ${REF_MAX_BYTES / 1024 / 1024}MB まで・合わせて ${REF_MAX_COUNT} 枚まで。画像そのものはこの画面に表示しません。</div>
  ${r.refs.length ? `<ul>${refRows}</ul>` : '<p class="lead">まだ登録されていません。</p>'}
- <label for="ref_random" style="margin-top:1rem">キャラクターの使い方</label>
+ <label for="ref_random" style="margin-top:1rem">参考画像の使い方</label>
  <select id="ref_random" name="ref_random">
   <option value="0"${r.refRandom ? '' : ' selected'}>登録した参考画像を全部使う（今までどおり）</option>
-  <option value="1"${r.refRandom ? ' selected' : ''}>画像ごとにランダムに選ぶ（1人か2人）</option>
+  <option value="1"${r.refRandom ? ' selected' : ''}>画像ごとにランダムに選ぶ（1枚か2枚）</option>
  </select>
- <p class="d" style="margin-left:0">「ランダムに選ぶ」にすると、サムネ・文中の画像の1枚ごとに、登録したキャラクターから1人または2人を選んで描きます。</p>
- ${[1, 2, 3].map((n) => `<label for="ref_name_${n}" style="margin-top:1rem">追加する画像 ${n} の名前（例: 「〇〇（主役）」「△△（ライバル）」・${REF_NAME_MAX}字まで）</label>
+ <p class="d" style="margin-left:0">ランダムにすると、サムネ・文中の画像の1枚ごとに、登録した参考画像から1枚または2枚を選んで使います（例: 登場人物を毎回変えたい、見本を使い分けたい）。</p>
+ ${[1, 2, 3].map((n) => `<label for="ref_name_${n}" style="margin-top:1rem">追加する画像 ${n} の名前（何の画像か。例: 「店主」「看板メニュー」「サムネの見本」・${REF_NAME_MAX}字まで）</label>
  <input id="ref_name_${n}" name="ref_name_${n}" maxlength="${REF_NAME_MAX}" autocomplete="off">
  <input id="ref_file_${n}" name="ref_file_${n}" type="file" accept="image/png,image/jpeg,image/webp" style="margin-top:.4rem">`).join('')}
  ${code('code_all')}
@@ -621,7 +622,7 @@ setupRouter.post('/setup/image-refs/delete', async (c) => {
 });
 
 /**
- * 画像のルール・参考画像・キャラクターの使い方を、**1回のコードでまとめて**保存する（multipart。2026-10-27）。
+ * 画像のルール・参考画像・参考画像の使い方を、**1回のコードでまとめて**保存する（multipart。2026-10-27）。
  * ★遠隔で使う顧客に「セットアップ」を何度も送ってもらわないため。
  * ★全部を検査してから書く。1つでもだめなら、何も保存せず、コードも使わない。
  * ★初回（コード無しで通る状態）は断る・コード無し／不正は 403（ほかの画像の書き込みと同じ）
@@ -674,7 +675,7 @@ setupRouter.post('/setup/image-rules/all', async (c) => {
       { label: '文中の画像用のルール', ok: true, detail: r.inline.ok && r.inline.saved ? '保存しました' : '登録なしのまま（今までどおり）' },
       { label: '参考画像', ok: r.deleteFailed === 0,
         detail: `追加 ${r.added} 枚・削除 ${r.deleted} 枚（いま ${after.imageRules.refs.length} 枚）${r.deleteFailed ? `。${r.deleteFailed} 枚は消せませんでした` : ''}` },
-      { label: 'キャラクターの使い方', ok: true, detail: after.imageRules.refRandom ? '画像ごとにランダムに選ぶ' : '全部使う（今までどおり）' },
+      { label: '参考画像の使い方', ok: true, detail: after.imageRules.refRandom ? '画像ごとにランダムに選ぶ' : '全部使う（今までどおり）' },
     ];
     // ★削除だけ失敗した場合も、ほかは保存済み。事実どおり「保存しました（N枚は消せませんでした）」と言う
     return c.html(page(after, steps, r.deleteFailed

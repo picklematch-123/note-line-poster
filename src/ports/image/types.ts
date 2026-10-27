@@ -13,7 +13,7 @@ export interface GeneratedImage {
   usage?: { inputTokens: number; outputTokens: number };
 }
 
-/** 参考画像（キャラクターの見た目など）。中身はログに出さない */
+/** 参考画像（見た目や雰囲気をそろえるための画像。人物・商品・見本など）。中身はログに出さない */
 export interface ReferenceImage {
   bytes: ArrayBuffer;
   mime: string;
