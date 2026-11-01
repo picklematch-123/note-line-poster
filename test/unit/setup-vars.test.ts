@@ -35,7 +35,7 @@ describe('セットアップで点検する値', () => {
     expect(validateOpenAiKey('sk-short')).toMatch(/短すぎ/);
     expect(validateOpenAiKey('sk-proj-abcdefghij klmnopqrstu')).toMatch(/空白/);
     // ★Claude のキーを OpenAI の欄に貼る取り違え
-    expect(validateOpenAiKey('sk-ant-api03-abcdefghijklmnopqrstu')).toMatch(/Claude/);
+    expect(validateOpenAiKey('sk-ant-' + 'api03-abcdefghijklmnopqrstu')).toMatch(/Claude/);
   });
 
   it('Claude 系の形は、値が入っているときだけ見る', () => {

@@ -24,14 +24,19 @@ export const ARTICLE_STATES = [
 export type ArticleState = (typeof ARTICLE_STATES)[number];
 
 /** 許可された遷移だけを列挙する。ここに無い遷移は起こしてはいけない。 */
+// ★「…, 'published', 'drafted'」が付いている状態は、note に一度出た記事の修正を「やめる」で
+//   元に戻すための遷移（core/article/cancel.ts の revertOrCancel だけが使う。2026-11 顧客環境の不具合）。
+//   これが無いと、公開済み記事の修正をやめただけで記事ごと取りやめ（cancelled）になり、一覧から消えていた。
+//   公開そのものの関所は遷移表ではなく policy（承認ゲート）にある。
 const TRANSITIONS: Record<ArticleState, readonly ArticleState[]> = {
   received: ['generating', 'cancelled', 'expired'],
-  generating: ['preview_ready', 'failed', 'cancelled', 'expired'],
-  preview_ready: ['awaiting_approval', 'failed', 'cancelled', 'expired'],
-  awaiting_approval: ['editing', 'blocked', 'publishing', 'saving_draft', 'awaiting_agent', 'cancelled', 'expired'],
-  editing: ['awaiting_approval', 'generating', 'saving_draft', 'cancelled', 'failed', 'expired'],
-  blocked: ['publishing', 'awaiting_agent', 'cancelled', 'expired', 'awaiting_session'],
-  awaiting_session: ['publishing', 'awaiting_agent', 'blocked', 'cancelled', 'expired'],
+  generating: ['preview_ready', 'failed', 'cancelled', 'expired', 'published', 'drafted'],
+  preview_ready: ['awaiting_approval', 'failed', 'cancelled', 'expired', 'published', 'drafted'],
+  awaiting_approval: ['editing', 'blocked', 'publishing', 'saving_draft', 'awaiting_agent', 'cancelled', 'expired',
+                      'published', 'drafted'],
+  editing: ['awaiting_approval', 'generating', 'saving_draft', 'cancelled', 'failed', 'expired', 'published', 'drafted'],
+  blocked: ['publishing', 'awaiting_agent', 'cancelled', 'expired', 'awaiting_session', 'published', 'drafted'],
+  awaiting_session: ['publishing', 'awaiting_agent', 'blocked', 'cancelled', 'expired', 'published', 'drafted'],
   // 拡張（顧客のブラウザ）が実行する。実行そのものは向こうで完結するので、
   // ★成功すればここから直接 published / drafted へ進む。
   //   ここに published を入れ忘れると、投稿は成功しているのに
@@ -45,8 +50,8 @@ const TRANSITIONS: Record<ArticleState, readonly ArticleState[]> = {
   // 公開済みでも修正して再公開できる（note は記事の上書き更新に対応している）
   published: ['editing'],
   cancelled: [],
-  // 再試行するか、あきらめるか
-  failed: ['generating', 'cancelled', 'expired'],
+  // 再試行するか、あきらめるか（note に出ている記事の修正の失敗なら、元に戻すこともできる）
+  failed: ['generating', 'cancelled', 'expired', 'published', 'drafted'],
   expired: [],
 };
 
@@ -59,6 +64,21 @@ export const MUST_ALLOW_CANCEL: readonly ArticleState[] = [
   'received', 'generating', 'preview_ready', 'awaiting_approval',
   'editing', 'blocked', 'awaiting_session', 'awaiting_agent', 'saving_draft', 'drafted', 'failed',
 ];
+
+/**
+ * 「やめる」で元に戻せる状態（note に一度出た記事の修正中）。
+ * ★saving_draft / publishing は note と通信している最中なので含めない（やめても従来どおり）。
+ */
+export const REVERTIBLE_STATES: readonly ArticleState[] = [
+  'generating', 'preview_ready', 'awaiting_approval', 'editing', 'failed',
+  'blocked', 'awaiting_session', 'awaiting_agent',
+];
+
+/**
+ * 生成の結果を書き込んではいけない状態（「やめる」の後）。
+ * ★生成中に取りやめた・元の版に戻した記事を、後から届いた生成結果で上書きしない（2026-11）。
+ */
+export const WITHDRAWN_STATES: readonly ArticleState[] = ['cancelled', 'expired', 'published', 'drafted'];
 
 /** 終端状態（もう動かない）。published は修正のため再開できるので含めない。 */
 export const TERMINAL_STATES: readonly ArticleState[] = ['cancelled', 'expired'];

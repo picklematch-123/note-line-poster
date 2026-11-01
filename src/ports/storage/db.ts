@@ -384,6 +384,17 @@ export class Db {
   }
 
   /**
+   * 記事が最後に「note に出ている状態（published / drafted）」を離れたときの記録。
+   * ★修正を「やめる」で元に戻すときに、戻り先と戻す中身（修正開始時の控え）をここから読む（core/article/cancel.ts）。
+   */
+  async getLastExitFromNote(id: string): Promise<{ from_state: ArticleState; to_state: ArticleState; detail_json: string | null } | null> {
+    return this.d1.prepare(`SELECT from_state, to_state, detail_json FROM article_events
+      WHERE article_id = ? AND from_state IN ('published', 'drafted')
+      ORDER BY created_at DESC, rowid DESC LIMIT 1`)
+      .bind(id).first<{ from_state: ArticleState; to_state: ArticleState; detail_json: string | null }>();
+  }
+
+  /**
    * 本人の判断を待っている記事を1件返す。
    * ★これがある間は新しい記事を作らせない（誤って別記事が生まれるのを防ぐ）。
    */

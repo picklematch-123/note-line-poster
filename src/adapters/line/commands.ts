@@ -82,3 +82,68 @@ export const COMMANDS = {
 } as const;
 
 export type CommandName = keyof typeof COMMANDS;
+
+// ── 確認待ちの記事への返事（公開・下書き・やめる）────────────────
+/**
+ * ★2026-11 顧客環境で「公開しない」と送ったら note に公開された（取り消せない事故）。
+ *   以前は先頭一致（/^(公開|OK|はい|投稿)/）だったため、「公開しない」「投稿しないで」
+ *   「はい、でもタイトル直して」も公開の合図になっていた。
+ *   ここでは**決まった短い言葉と完全に一致したときだけ**合図とみなす。
+ *   それ以外（否定・長い文）は合図ではない＝呼び出し側で修正指示として扱う。
+ */
+export function normalizeReply(input: string): string {
+  return input
+    .normalize('NFKC')                         // 全角英数（ＯＫ）・全角空白をならす
+    .replace(/\s+/g, '')                       // 空白は全部落とす
+    // 末尾の句点・感嘆符・伸ばし棒は吸収する。
+    // ★「?」「？」は吸収しない（「公開？」「OK？」は質問であって承認ではない・2026-11 源蔵レビュー必須1）
+    .replace(/[。.!！〜~ー、,♪]+$/, '')
+    .toLowerCase();                            // OK / ok / Ok
+}
+
+/** 公開してよい、はっきりした承認の言葉（★完全一致のみ。足すときも否定を含む言葉は入れない） */
+const PUBLISH_WORDS = new Set([
+  '公開', '公開する', '公開して', '公開します', '公開でお願いします', '公開してください', '公開お願いします',
+  '投稿', '投稿する', '投稿して', '投稿します', '投稿でお願いします', '投稿してください', '投稿お願いします',
+  'ok', 'okです', 'はい',
+  // ★「お願いします」単独は入れない（何をお願いしているのか分からない＝修正の依頼のこともある・源蔵レビュー必須1）
+]);
+
+/** 下書きに保存する合図（★完全一致のみ） */
+const DRAFT_WORDS = new Set([
+  '下書き', '下書きに保存', '下書きに保存する', '下書きに保存して', '下書きに保存します', '下書き保存',
+  '下書きにする', '下書きにして', '下書きでお願いします', '下書きに保存してください', 'したがき',
+]);
+
+/** 記事（または修正）をやめる合図（★完全一致のみ。「やめないで」で消さない） */
+const CANCEL_WORDS = new Set([
+  'やめ', 'やめる', 'やめて', 'やめます', 'やめたい', 'やめとく', 'やめておく', 'やめておきます',
+  'この記事をやめる', '修正をやめる', '修正をやめます', '修正をやめて', '取りやめ', '取りやめる', '取りやめます',
+  'キャンセル', 'キャンセルする', 'キャンセルします', '中止', '中止する', '中止します',
+  // ★「いいえ」は入れない（「公開しますか」への「いいえ」は、やめるではなく保留＝isHoldRequest）
+]);
+
+export function isPublishApproval(text: string): boolean {
+  return PUBLISH_WORDS.has(normalizeReply(text));
+}
+
+export function isDraftRequest(text: string): boolean {
+  return DRAFT_WORDS.has(normalizeReply(text));
+}
+
+export function isCancelRequest(text: string): boolean {
+  return CANCEL_WORDS.has(normalizeReply(text));
+}
+
+/**
+ * 「公開しない」「まだ待って」のような、**公開を止めるだけの短い返事**か。
+ * ★これを修正指示に回すと、意味の無い書き直し（＝顧客の AI 費用）が走ってしまう。
+ *   長い文（「公開しないでタイトルを直して」など）は修正指示として扱うので、ここでは短いものだけ拾う。
+ */
+export function isHoldRequest(text: string): boolean {
+  const t = normalizeReply(text);
+  if (t.length === 0 || t.length > 16) return false;
+  if (/^(まだ|待って|まって|ちょっと待って|ちょっとまって|保留|ストップ|stop|ng|だめ|ダメ|いや|いいえ|no)$/.test(t)) return true;
+  return /(公開|投稿|アップ)/.test(t) && /(しない|しません|せず|やめ|待っ|まって|まだ|ダメ|だめ|ng|不要|保留|止め|とめ|なし)/.test(t);
+}
+

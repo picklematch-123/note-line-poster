@@ -1625,10 +1625,17 @@
     <label class="step">
       <input type="checkbox" class="step__check" data-step="s7-5">
       <div class="step__body">
-        <h3 class="step__title">プレビュー用のアドレスを塞ぐ（推奨） <span class="tag tag--manual">手でやる</span></h3>
+        <h3 class="step__title">プレビュー用のアドレスを塞ぐ（任意・飛ばして構いません） <span class="tag tag--manual">手でやる</span></h3>
         <p>配備のたびに、<strong>一時的なアドレス</strong>が増えていきます。
         中身は本番と同じものが動いていて、<strong>知っている人は誰でも開けます</strong>。
-        使う予定が無いので、塞いでおきます。</p>
+        使う予定が無いので、塞いでおくこともできます（<strong>必須ではありません。迷ったら飛ばしてください</strong>）。</p>
+        <div class="note note--alarm">
+          <span class="note__label">★Cloudflare を作ったばかりだと、プランの選択画面が出ます</span>
+          <p>初めて押すと、<strong>「Choose a plan」（Zero Trust のプラン選択）の画面</strong>に進むことがあります。
+          <strong>何も選ばず、右上の「Cancel and exit」で閉じてください。</strong>
+          プランを選ぶと、契約や支払い方法の入力に進む場合があります。
+          このシステムの動作には、不要です。</p>
+        </div>
         <ol>
           <li>Cloudflare の画面 → <strong>Workers &amp; Pages</strong> → お使いの Worker</li>
           <li><strong>「ドメイン」タブ</strong>を開く</li>
@@ -1643,7 +1650,8 @@
         <div class="note">
           <span class="note__label">飛ばしても動きます</span>
           <p>これは「余計な入口を減らす」ための作業です。
-          設定画面そのものは、使い捨てコードで守られています。</p>
+          設定画面そのものは、使い捨てコードで守られています。
+          飛ばした場合も、あとの手順に影響はありません。</p>
         </div>
       </div>
     </label>

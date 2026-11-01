@@ -11,6 +11,7 @@
 import type { Db } from '../ports/storage/db';
 import type { LineClient } from '../adapters/line/client';
 import { log } from '../lib/mask';
+import { WITHDRAWN_STATES } from '../core/article/state';
 import type { ThumbnailOutcome } from '../core/image/thumbnail';
 
 export interface GenerationFailure {
@@ -39,9 +40,13 @@ export async function runGenerationStep<R extends { ok: boolean }>(
 
 /** 失敗を記録し、LINE で知らせる（記事を「生成中」のまま残さない） */
 export async function notifyGenerationFailure(
-  deps: { db: Pick<Db, 'markFailed'>; line: Pick<LineClient, 'push'> },
+  deps: { db: Pick<Db, 'markFailed'> & Partial<Pick<Db, 'getArticle'>>; line: Pick<LineClient, 'push'> },
   articleId: string, lineUserId: string, userMessage: string,
 ): Promise<void> {
+  // ★生成の最中に「やめる」が押されていた（取りやめ・note に出ている版へ戻した）なら、何もしない。
+  //   ここで failed に落とすと、元に戻した公開済みの記事が「失敗」になり一覧から消える（2026-11）
+  const current = await deps.db.getArticle?.(articleId);
+  if (current && WITHDRAWN_STATES.includes(current.state)) return;
   await deps.db.markFailed(articleId, 'system', { reason: userMessage });
   await deps.line.push(lineUserId, [{
     type: 'text',

@@ -13,7 +13,7 @@ import { Db } from '../ports/storage/db';
 import { LineClient } from '../adapters/line/client';
 import { buildPreview } from '../adapters/line/messages/preview';
 import { buildThumbnailResult } from '../adapters/line/messages/thumbnail';
-import { generateArticle, markAwaitingApproval } from '../core/article/service';
+import { generateArticle, markAwaitingApproval, GenerationWithdrawnError } from '../core/article/service';
 import { LlmError } from '../ports/llm/types';
 import { KvImageStore } from '../ports/storage/images';
 import { resolveNoteSession } from '../core/session/resolve';
@@ -149,6 +149,11 @@ export class GenerateArticleWorkflow extends WorkflowEntrypoint<Env, GeneratePar
           ) ?? null,
         };
       } catch (e) {
+        // ★「やめる」が押されていた。失敗ではないので、記録も通知もしない
+        if (e instanceof GenerationWithdrawnError) {
+          log.info('生成の途中で記事が取りやめられたため、結果を捨てます', { articleId, state: e.state });
+          return { ok: false as const, withdrawn: true as const, userMessage: '' };
+        }
         const userMessage = e instanceof LlmError
           ? e.userMessage
           : '記事の生成に失敗しました。もう一度お試しください。';
@@ -159,6 +164,7 @@ export class GenerateArticleWorkflow extends WorkflowEntrypoint<Env, GeneratePar
 
     // 3. 結果を LINE へ返す（生成に1〜3分かかるので Push）
     if (!result.ok) {
+      if ('withdrawn' in result && result.withdrawn) return;
       const { userMessage } = result;
       await step.do('失敗を通知する', async () => {
         await notifyGenerationFailure({ db, line }, articleId, lineUserId, userMessage);
@@ -196,6 +202,11 @@ export class GenerateArticleWorkflow extends WorkflowEntrypoint<Env, GeneratePar
 
     await step.do('プレビューを送る', async () => {
       const current = await db.getArticle(articleId);
+      // ★画像を作っている間に「やめる」が押されていたら、プレビューを送らない（取りやめた記事を生き返らせない）
+      if (current && current.state !== 'preview_ready') {
+        log.info('プレビューの前に記事が取りやめられたため、送りません', { articleId, state: current.state });
+        return;
+      }
       await line.push(lineUserId, [buildPreview({
         articleId,
         title: result.title,

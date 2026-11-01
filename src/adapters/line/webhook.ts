@@ -28,7 +28,8 @@ import { buildPreview } from './messages/preview';
 import { buildFullText } from './messages/fulltext';
 import { buildMenu, buildArticleList, buildArticleActions } from './messages/menu';
 import { setMode, getMode, clearMode, parseIndex, normalizeCommand } from './mode';
-import { COMMANDS } from './commands';
+import { COMMANDS, isPublishApproval, isDraftRequest, isCancelRequest, isHoldRequest, normalizeReply } from './commands';
+import { revertOrCancel, cancelReplyText, notReadyToPublishMessage } from '../../core/article/cancel';
 import { resolveNoteSession, persistRefreshedCookie } from '../../core/session/resolve';
 import { issuePairingCode } from '../../core/session/pairing';
 import { loadNoteSession, disconnectNoteSession } from '../../core/session/store';
@@ -759,10 +760,14 @@ async function handleText(
 
   // 生成に失敗した記事があるなら、この発言は「やり直しの指示」
   if (active && active.state === 'failed') {
-    if (/^(やめ|キャンセル|中止|いいえ|新し)/.test(body)) {
-      await withdrawJobs(d, active.id);
-      await d.db.setState(active.id, 'failed', 'cancelled', `line:${userId}`);
-      await line.reply(replyToken, [text('前の記事は取りやめました。新しいネタを送ってください。')]);
+    if (isCancelRequest(body) || /^新しい?(ネタ|記事)/.test(normalizeReply(body))) {
+      const msg = await cancelOrRevert(d, active.id, userId, '前の記事は取りやめました。新しいネタを送ってください。');
+      await line.reply(replyToken, [text(msg)]);
+      return;
+    }
+    // 「いいえ」「まだ」だけの返事で作り直しを走らせない（AI の費用がかかるため）
+    if (isHoldRequest(body)) {
+      await line.reply(replyToken, [text('そのままにしておきます。\nもう一度作る場合は指示をそのまま送り、新しいネタにする場合は「やめる」と送ってください。')]);
       return;
     }
     await requestRewrite(d, active.id, body);
@@ -788,10 +793,9 @@ async function handleText(
       await line.reply(replyToken, [text('サムネイルの指定を外しました。')]);
       return;
     }
-    if (/^(やめ|キャンセル|中止)/.test(body)) {
-      await withdrawJobs(d, active.id);
-      await d.db.setState(active.id, active.state, 'cancelled', `line:${userId}`);
-      await line.reply(replyToken, [text('作成中の記事を取りやめました。新しいネタを送ってください。')]);
+    if (isCancelRequest(body)) {
+      const msg = await cancelOrRevert(d, active.id, userId, '作成中の記事を取りやめました。新しいネタを送ってください。');
+      await line.reply(replyToken, [text(msg)]);
       return;
     }
     // ★新しいネタとして扱わない。いま作っている記事の続きを待たせる
@@ -806,11 +810,27 @@ async function handleText(
 
   // 承認待ちの記事があるなら、この発言は「承認」か「修正指示」
   if (active && (active.state === 'awaiting_approval' || active.state === 'editing')) {
-    if (/^(公開|OK|ok|はい|投稿)/.test(body)) {
+    // ★公開は取り消せないので、はっきりした承認の言葉と完全に一致したときだけ（commands.ts の isPublishApproval）。
+    //   以前の先頭一致では「公開しない」でも公開されていた（2026-11 顧客環境）
+    if (isPublishApproval(body)) {
       return publishAfterAiImageReview(active.id, env, line, d, userId, replyToken);
     }
-    if (/^(下書き|したがき)/.test(body)) {
+    if (isDraftRequest(body)) {
       return doSaveDraft(active.id, line, d, userId, replyToken);
+    }
+    // 「公開しない」「まだ」だけの返事は、書き直しに回さない（意味の無い書き直しで AI の費用を使わない）
+    if (isHoldRequest(body)) {
+      await line.reply(replyToken, [textWithActions(
+        '公開はしていません。記事はこのまま預かっています。\n\n' +
+        '直したいところがあれば、そのまま文章で送ってください。\n' +
+        '公開するときは「公開する」、やめるときは「やめる」と送ってください。',
+        [
+          { label: '公開する', data: `action=publish&id=${active.id}` },
+          { label: '下書きに保存する', data: `action=savedraft&id=${active.id}` },
+          { label: 'やめる', data: `action=cancel&id=${active.id}` },
+        ],
+      )]);
+      return;
     }
     if (/^(全文|本文|ぜんぶん|読みたい|見せて)/.test(body)) {
       await line.reply(replyToken, buildFullText({
@@ -823,9 +843,9 @@ async function handleText(
       }));
       return;
     }
-    if (/^(やめ|キャンセル|中止|いいえ)/.test(body)) {
-      await d.db.setState(active.id, active.state, 'cancelled', `line:${userId}`);
-      await line.reply(replyToken, [text('この記事は取りやめました。')]);
+    if (isCancelRequest(body)) {
+      const msg = await cancelOrRevert(d, active.id, userId, 'この記事は取りやめました。');
+      await line.reply(replyToken, [text(msg)]);
       return;
     }
     return handleRevision(active.id, body, env, line, d, replyToken, userId);
@@ -857,6 +877,17 @@ function buildPendingNotice(a: { id: string; title: string | null; state: string
       { label: 'やめる', data: `action=cancel&id=${a.id}` },
     ],
   );
+}
+
+/**
+ * 「やめる」。note に一度出た記事（公開済み・下書き保存済み）の修正なら、取りやめずに元の状態と中身に戻す。
+ * 新しく作っている記事は取りやめ（cancelledText で返事）。
+ * ★拡張に渡した仕事も引き上げる。放っておくと後から勝手に投稿される
+ */
+async function cancelOrRevert(d: ServiceDeps, articleId: string, userId: string, cancelledText: string): Promise<string> {
+  await withdrawJobs(d, articleId);
+  const outcome = await revertOrCancel(d, articleId, `line:${userId}`);
+  return outcome.kind === 'cancelled' ? cancelledText : cancelReplyText(outcome);
 }
 
 /** 記事のネタ入力を待つ状態にする。 */
@@ -1167,11 +1198,8 @@ async function handlePostback(
     }
 
     case 'cancel': {
-      const a = await d.db.getArticle(articleId);
-      // ★拡張に渡した仕事も引き上げる。放っておくと後から勝手に投稿される
-      await withdrawJobs(d, articleId);
-      if (a) await d.db.setState(articleId, a.state, 'cancelled', `line:${userId}`);
-      await line.reply(replyToken, [text('この記事は取りやめました。')]);
+      const msg = await cancelOrRevert(d, articleId, userId, 'この記事は取りやめました。');
+      await line.reply(replyToken, [text(msg)]);
       return;
     }
 
@@ -1369,6 +1397,15 @@ async function publishAfterAiImageReview(
 async function doPublish(
   articleId: string, env: Env, line: LineClient, d: ServiceDeps, userId: string, replyToken: string,
 ): Promise<void> {
+  // ★書き直しの最中に古いプレビューの「公開する」が押されたら、何が起きているかを伝える
+  //   （以前は「まだ公開できる状態ではありません」だけで、理由が分からなかった）
+  {
+    const notReady = notReadyToPublishMessage((await d.db.getArticle(articleId))?.state);
+    if (notReady) {
+      await line.reply(replyToken, [text(notReady)]);
+      return;
+    }
+  }
   // ★承認できるのはオーナーだけ
   const approval = await approve(d, articleId, userId);
   if (!approval.allowed) {
@@ -1567,6 +1604,10 @@ async function handleRevision(
   }
 
   // 本文の書き直しが必要なものは再生成に回す
+  // ★「先程追加したナレッジを元に修正」「ライン公式などのリンクを追加して」のような本文の直しは、
+  //   分類の指示文（classifyRevision）を補強して regenerate_all に入るようにした（2026-11 顧客環境）。
+  //   unknown を一律に書き直しへ回すと「ありがとう」「公開されましたか」でも AI の費用が走るので、unknown は聞き返す
+  //   （2026-11 源蔵レビュー必須2）
   if (intent.action === 'regenerate_all' || intent.action === 'rewrite_section' || intent.action === 'change_title') {
     // ★状態は awaiting_approval → editing を通す（generating へ直接飛ばすと遷移表に弾かれる）
     await requestRewrite(d, articleId, instruction);
@@ -1577,9 +1618,12 @@ async function handleRevision(
     return;
   }
 
-  await line.reply(replyToken, [textWithActions(
-    '指示の内容が分かりませんでした。もう少し具体的に教えてください。',
-    [{ label: 'このまま公開する', data: `action=publish&id=${articleId}` }],
+  // ★「このまま公開する」ボタンは付けない（分からなかった返事の横に、取り消せない操作を置かない・源蔵レビュー必須2）
+  await line.reply(replyToken, [text(
+    '指示の内容が分かりませんでした。直したいところを、もう少し具体的に教えてください。\n\n' +
+    '例:\n・■2をもっと具体的に書き直して\n・タイトルを別の案にして\n・文末にLINE公式のリンクを追加して\n' +
+    '・登録したナレッジに合わせて書き直して\n・画像2を■3の下に移して\n\n' +
+    '公開するときは「公開する」、やめるときは「やめる」と送ってください。',
   )]);
 }
 

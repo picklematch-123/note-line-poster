@@ -15,7 +15,8 @@ import { parseResearch, researchForGeneration } from '../research/run';
 import { finalizeArticle } from '../research/finalize';
 import { findUnverifiedTerms, findMiscitedTerms, mergeVerifyResults } from '../research/verify';
 import { canPublish, nextJstMorning, type PolicyDecision, type PolicyContext } from '../policy';
-import { assertTransition } from './state';
+import { assertTransition, WITHDRAWN_STATES, type ArticleState } from './state';
+import { REOPEN_REASON, snapshotOf } from './cancel';
 import { parseHeadings, move, swap, remove, splitGeneratedPlaceholders, placeholderToken, type PlaceholderKind } from './placeholders';
 import { precheckArticleLinks, assertArticleHtmlLinks, DisallowedLinksError, listPlacedGeneratedImages, GENERATED_SLOT_OFFSET } from './links';
 import { composeArticleMarkdown, type GeneratedFill } from './compose';
@@ -62,6 +63,8 @@ export async function generateArticle(deps: ServiceDeps, articleId: string): Pro
   const article = await deps.db.getArticle(articleId);
   if (!article) throw new Error('記事が見つかりません');
 
+  // ★生成を待つ間に「やめる」が押されていたら、何もせずに終わる（失敗として扱わない）
+  if (WITHDRAWN_STATES.includes(article.state)) throw new GenerationWithdrawnError(article.state);
   assertTransition(article.state, 'generating');
   await deps.db.setState(articleId, article.state, 'generating', 'system');
 
@@ -112,6 +115,12 @@ export async function generateArticle(deps: ServiceDeps, articleId: string): Pro
     .filter(([k]) => Number(k) >= 1 && Number(k) <= images.length));
   // ★修正で作り直したときは、前回の AI 画像を使い回す（見出しが同じものはその画像、残りは順番どおり）。
   //   足りない分だけ、この後の Workflow の step で新しく作る。余りは消す（二重課金を避ける・設計書 18-7）
+  // ★書き込む直前にもう一度確かめる。生成の最中に「やめる」が押された（取りやめ・元の版に戻した）なら、
+  //   結果を捨てる。ここで書くと、戻した本文を上書きし、取りやめた記事を生き返らせてしまう（2026-11）
+  {
+    const now = await deps.db.getArticle(articleId);
+    if (now && now.state !== 'generating') throw new GenerationWithdrawnError(now.state);
+  }
   await reuseGeneratedImages(deps.db, deps.images, articleId, bodyMd);
 
   if (research) {
@@ -143,6 +152,17 @@ export async function generateArticle(deps: ServiceDeps, articleId: string): Pro
 
   const updated = (await deps.db.getArticle(articleId))!;
   return { article: updated, charCount: bodyMd.replace(/\[(?:AI)?画像\d+\]/g, '').length };
+}
+
+/**
+ * 生成を待つ間・生成の最中に「やめる」が押された（取りやめ・note に出ている版へ戻した）。
+ * ★失敗ではない。Workflow はこれを受けたら、失敗の記録も LINE への通知もせずに静かに終わる。
+ */
+export class GenerationWithdrawnError extends Error {
+  constructor(readonly state: ArticleState) {
+    super(`生成の途中で記事が取りやめられました（いまの状態: ${state}）`);
+    this.name = 'GenerationWithdrawnError';
+  }
 }
 
 /**
@@ -264,16 +284,21 @@ export async function saveArticleAsDraft(deps: ServiceDeps, articleId: string): 
 }
 
 /**
- * 公開済みの記事を修正モードに戻す。
+ * 公開済み（または下書き保存済み）の記事を修正モードに戻す。
  * 再公開すると note 上の同じ記事が上書きされる（新しい記事は増えない）。
+ *
+ * ★修正を始める前の中身を、状態の記録に控えとして残す。
+ *   途中で「やめる」と、記事を取りやめにせず、この控えに戻す（core/article/cancel.ts・2026-11 顧客環境の不具合）。
+ * ★以前は published だけを開いていた。下書き保存済み（drafted）の「修正する」は状態が変わらず、
+ *   続けて送った指示が新しい記事のネタになっていた。同じ作りで開く。
  */
 export async function reopenPublished(deps: ServiceDeps, articleId: string): Promise<void> {
   const a = await deps.db.getArticle(articleId);
   if (!a) throw new Error('記事が見つかりません');
-  if (a.state !== 'published') return;
+  if (a.state !== 'published' && a.state !== 'drafted') return;
   // 再公開には改めて承認が必要
   await deps.db.updateArticle(articleId, { approved_at: null, approved_by: null });
-  await deps.db.setState(articleId, 'published', 'editing', 'system');
+  await deps.db.setState(articleId, a.state, 'editing', 'system', { reason: REOPEN_REASON, restore: snapshotOf(a) });
 }
 
 /** プレビュー送信後に承認待ちへ。 */
