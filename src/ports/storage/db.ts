@@ -723,7 +723,16 @@ export class Db {
       .first<{ id: string; raw_text: string; prompt_snippet: string | null }>();
   }
 
-  async saveContext(tenantId: string, rawText: string, structured: unknown, promptSnippet: string): Promise<string> {
+  /** 設定画面（/setup）でナレッジを見せるとき用。最終更新日時も返す */
+  async getActiveContextDetail(tenantId: string): Promise<{ id: string; raw_text: string; prompt_snippet: string | null; updated_at: string } | null> {
+    return this.d1
+      .prepare('SELECT id, raw_text, prompt_snippet, updated_at FROM tenant_context WHERE tenant_id = ? AND is_active = 1 ORDER BY updated_at DESC LIMIT 1')
+      .bind(tenantId)
+      .first<{ id: string; raw_text: string; prompt_snippet: string | null; updated_at: string }>();
+  }
+
+  /** @param by 監査ログの actor（LINE からは 'line'、設定画面からは 'web:owner' など） */
+  async saveContext(tenantId: string, rawText: string, structured: unknown, promptSnippet: string, by = 'line'): Promise<string> {
     const id = newId();
     const now = nowIso();
     // 過去のものは残すが無効化する（履歴として追える）
@@ -734,7 +743,7 @@ export class Db {
                 VALUES (?, ?, ?, ?, ?, 1, ?, ?)`)
       .bind(id, tenantId, rawText, JSON.stringify(structured), promptSnippet, now, now)
       .run();
-    await this.audit(tenantId, 'context.saved', 'line', null, 'ok');
+    await this.audit(tenantId, 'context.saved', by, null, 'ok');
     return id;
   }
 

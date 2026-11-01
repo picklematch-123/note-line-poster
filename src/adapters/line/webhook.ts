@@ -1720,7 +1720,8 @@ function buildKnowledgeList(rawText: string, canEdit = true): LineMessage {
       lines.join('\n') +
       (entries.length > shown.length ? `\n\n（ほか ${entries.length - shown.length} 件）` : '') +
       '\n\n────────\n' +
-      'そのまま送ると書き足します。',
+      'そのまま送ると書き足します。' +
+      (canEdit ? '\n全文の確認・修正は、設定画面でもできます（LINE で「セットアップ」と送るとリンクと確認コードが届きます）。' : ''),
     quickReply: {
       items: [
         { type: 'action', action: { type: 'postback', label: '書き足す', data: 'action=ctx_append', displayText: '書き足す' } },

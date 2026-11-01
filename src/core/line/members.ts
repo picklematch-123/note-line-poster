@@ -277,7 +277,7 @@ export function buildAdminAddedNotice(displayName: string | null, promoted: bool
 
 /** 管理者がセットアップ画面のコードを出したとき、持ち主へ送る1行 */
 export function buildSetupOpenedByAdminNotice(displayName: string | null): string {
-  return `運用担当の${displayName ? `${displayName}さん` : '管理者'}がセットアップを開きました。`;
+  return `運用担当の${displayName ? `${displayName}さん` : '管理者'}がセットアップを開きました（設定画面では、ナレッジの閲覧・修正もできます）。`;
 }
 
 /** 管理者が note 連携のコードを出したとき、持ち主へ送る1行 */

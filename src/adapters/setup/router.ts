@@ -14,6 +14,10 @@
  *
  * ★書き込みは「初回だけ」無認証。以後は LINE で受け取ったコードが要る（条件3）。
  *
+ * ★2026-11-01「ナレッジ」節を追加（core/knowledge/edit.ts）。
+ *   ナレッジは顧客の機密なので、**見るのにも確認コードが要る**（画面を開いただけでは出さない）。
+ *   1回のコードで「開く → 保存」まで（保存は短命・1回きりの編集用トークン）。
+ *
  * ★2026-10-26「画像のルール」節を追加（設計書 docs/design-image-rules-2026-10-26.md 3-3）。
  *   保存・参考画像の追加・削除は、ほかの書き込みと同じ入場口（mayRun）を通す。
  *   この画面は誰でも開けるので、登録済みのルール本文と参考画像そのものは出さない（文字数・名前・サイズだけ）。
@@ -38,8 +42,28 @@ import {
   type ImageRulesSummary, type BatchUpload,
 } from '../../core/image/rules';
 import { MAX_GENERATIONS_PER_ARTICLE } from '../../core/image/thumbnail';
+import {
+  issueKnowledgeEditToken, peekKnowledgeEditToken, isKnowledgeEditTokenShape, consumeKnowledgeEditToken, checkKnowledgeText, saveKnowledgeText,
+  KNOWLEDGE_TEXT_NOTE, KNOWLEDGE_WEB_MAX, KNOWLEDGE_EDIT_TTL_SEC,
+} from '../../core/knowledge/edit';
+import { ensureContextUrls } from '../../core/generation/context';
+import { formatJst } from '../../lib/time';
 
 export const setupRouter = new Hono<{ Bindings: Env }>();
+
+/**
+ * ★/setup はどの画面もよそのページに埋め込ませない（2026-11-01 源蔵レビュー）。
+ *   ナレッジ（顧客の機密）を表示し、確認コードを入力させる画面なので、
+ *   透明な枠に重ねて押させる・入力させる手口（クリックジャッキング）を防ぐ。
+ *   ★ルートより先に登録すること（Hono は登録順に通す）
+ */
+setupRouter.use('/setup', frameDeny);
+setupRouter.use('/setup/*', frameDeny);
+async function frameDeny(c: { header: (k: string, v: string) => void }, next: () => Promise<void>): Promise<void> {
+  await next();
+  c.header('X-Frame-Options', 'DENY');
+  c.header('Content-Security-Policy', "frame-ancestors 'none'");
+}
 
 /** 記録に使う actor（web:owner / web:admin / web:first_run）。断られた場合は 'web' */
 function actorOf(p: RunPermission): string {
@@ -121,8 +145,8 @@ async function readStatus(c: { env: Env; req: { url: string } }): Promise<Status
   };
 }
 
-const esc = (s: string) => s.replace(/[&<>"]/g, (ch) =>
-  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]!));
+const esc = (s: string) => s.replace(/[&<>"']/g, (ch) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]!));
 
 /** 選択欄。いまの値が選択肢に無くても消えないよう、必ず1つは選ばれた状態にする */
 function options(list: readonly number[], current: number, label: (n: number) => string): string {
@@ -254,7 +278,88 @@ ${status.hasImageKey ? '' : '<div class="note">OpenAI の API キーが未登録
 `;
 }
 
-function page(status: Status, steps: Step[] = [], message = ''): string {
+/**
+ * 「ナレッジ」節（閉じた状態）。★中身は出さない。確認コードを入れて開いたときだけ出す
+ */
+function knowledgeSection(status: Status): string {
+  if (!status.requiresCode) {
+    return `<h2 id="knowledge">ナレッジ（記事の前提メモ）</h2>
+<div class="note">${esc(KNOWLEDGE_NEED_SETUP_FIRST)}</div>`;
+  }
+  return `<h2 id="knowledge">ナレッジ（記事の前提メモ）</h2>
+<div class="note">
+ LINE の「ナレッジ」で覚えさせた内容を、<b>全文で確認・修正</b>できます。<br>
+ この画面は誰でも開けるため、確認コードを入れたときだけ中身を表示します。
+ <b>開いてから${KNOWLEDGE_EDIT_TTL_SEC / 60}分以内なら、同じコードのまま保存まで</b>できます。
+</div>
+<form method="post" action="/setup/knowledge/open">
+ ${codeField('code_knowledge')}
+ <button type="submit">ナレッジを開く</button>
+</form>
+`;
+}
+
+interface KnowledgeView {
+  /** いま有効な行（無ければ null） */
+  current: { raw_text: string; prompt_snippet: string | null; updated_at: string } | null;
+  /** 保存用の合言葉 */
+  token: string;
+  /** 編集欄に入れる文字（無ければ current の原文） */
+  draft?: string;
+  /** 開いている間に LINE で書き足されたとき true（いまの内容を別に見せる） */
+  conflict?: boolean;
+}
+
+/** 「ナレッジ」節（開いた状態）。★本文はすべて esc を通す（< > " ' & や URL が入る） */
+function knowledgeEditor(v: KnowledgeView): string {
+  const raw = v.current?.raw_text ?? '';
+  const draft = v.draft ?? raw;
+  const snippet = v.current ? ensureContextUrls(v.current.raw_text, v.current.prompt_snippet) : null;
+  const ta = 'style="width:100%;box-sizing:border-box;font-size:.95rem;line-height:1.7;padding:.6rem;border:1px solid #ccc;border-radius:6px"';
+  return `<h2 id="knowledge">ナレッジ（記事の前提メモ）</h2>
+<table>
+ <tr><td>いまの文字数</td><td>${v.current ? `${raw.length.toLocaleString('ja-JP')}字` : 'まだ何も登録されていません'}</td></tr>
+ <tr><td>最終更新</td><td>${v.current ? esc(formatJst(v.current.updated_at)) : '—'}</td></tr>
+</table>
+${v.conflict ? `<div class="note"><b>開いている間に、LINE からナレッジが書き換えられました。</b>まだ保存していません。<br>
+ 下の「いまの内容」を確認し、必要なら編集欄に取り込んでから、もう一度「保存する」を押してください。</div>
+<label for="knowledge_now">いまの内容（読み取り専用）</label>
+<textarea id="knowledge_now" readonly rows="10" ${ta}>${esc(raw)}</textarea>` : ''}
+<form method="post" action="/setup/knowledge/save">
+ <input type="hidden" name="token" value="${esc(v.token)}">
+ <label for="raw_text" style="margin-top:1rem">ナレッジの全文（${KNOWLEDGE_WEB_MAX.toLocaleString('ja-JP')}字まで）</label>
+ <textarea id="raw_text" name="raw_text" rows="18" maxlength="${KNOWLEDGE_WEB_MAX}" ${ta}>${esc(draft)}</textarea>
+ <p class="d" style="margin-left:0">保存すると、<b>次に作る記事から</b>この内容が使われます。前の内容は消さずに控えとして残ります。<br>
+ 全部消したいときは、LINE で「ナレッジ」→「全部消す」を使ってください（空のままでは保存できません）。<br>
+ この画面は${KNOWLEDGE_EDIT_TTL_SEC / 60}分で期限が切れます。長く直すときは、念のため文章を別の場所にも控えてください。</p>
+ <button type="submit">この内容で保存する</button>
+</form>
+${snippet ? `<details style="margin-top:1.2rem"><summary>記事づくりに実際に渡している内容（AI が整理したもの・読み取り専用）</summary>
+<p class="d" style="margin-left:0">原文を保存した直後は、整理が終わるまで原文をそのまま渡します。整理は数分で終わります。</p>
+<textarea readonly rows="14" ${ta}>${esc(snippet)}</textarea>
+</details>` : ''}
+`;
+}
+
+/**
+ * 期限切れなどで保存できなかったとき、送った文章を消さずに見せる（コピーして使えるように）。
+ * ★こちらが発行した形のトークンが付いていたときだけ使う（形が違うときは文章を出さない。下の save を参照）
+ */
+export const KNOWLEDGE_LOST_DRAFT_WARNING = 'この画面が、確認コードの送付や入力先を案内することはありません。';
+function knowledgeLostDraft(draft: string): string {
+  return `<h2 id="knowledge">ナレッジ（記事の前提メモ）</h2>
+<div class="note"><b>${esc(KNOWLEDGE_LOST_DRAFT_WARNING)}</b></div>
+<div class="note">保存していません。下の文章をコピーして控えてから、もう一度「ナレッジを開く」でやり直してください。</div>
+<label for="knowledge_draft">送った内容（保存していません）</label>
+<textarea id="knowledge_draft" readonly rows="14" style="width:100%;box-sizing:border-box">${esc(draft)}</textarea>
+<form method="post" action="/setup/knowledge/open">
+ ${codeField('code_knowledge')}
+ <button type="submit">ナレッジを開く</button>
+</form>
+`;
+}
+
+function page(status: Status, steps: Step[] = [], message = '', knowledgeHtml?: string): string {
   const mark = (ok: boolean) => ok ? '<span class="ok">✓</span>' : '<span class="ng">×</span>';
   const rows = steps.map((s) =>
     `<li>${mark(s.ok)} ${esc(s.label)}${s.detail ? `<div class="d">${esc(s.detail)}</div>` : ''}</li>`).join('');
@@ -314,6 +419,8 @@ LINE で <b>「セットアップ」</b> と送ると、10分間だけ使える�
 ${rateSection(status)}
 
 ${imageRulesSection(status)}
+
+${knowledgeHtml ?? knowledgeSection(status)}
 
 <h2>持ち主を変える</h2>
 <div class="note">
@@ -729,4 +836,135 @@ setupRouter.post('/setup/image-rules/all', async (c) => {
     }
     throw e;
   }
+});
+
+
+// ── ナレッジ（2026-11-01）─────────────────────────────────
+/**
+ * ★ナレッジの表示・保存は、初回（コード無しで通る状態）でも断る。
+ *   セットアップ前は誰でもコード無しで通ってしまい、中身を見られる・書き換えられるため（画像のルールと同じ）
+ */
+export const KNOWLEDGE_NEED_SETUP_FIRST = '先にセットアップを済ませてください（上の「セットアップを実行する」）。ナレッジの確認・修正は、そのあと LINE で受け取るコードを使って行います。';
+
+/** ナレッジ関係の送信の大きさの上限（バイト）。保存は 20000字を URL エンコードしても収まる大きさ */
+export const KNOWLEDGE_BODY_LIMITS = { open: 16 * 1024, save: 256 * 1024 } as const;
+
+/** 合言葉が無い・形が違うときの定型文（送られた文章は出さない） */
+export const KNOWLEDGE_SAVE_DENIED = '保存できませんでした。LINE で「セットアップ」と送ってコードを受け取り、「ナレッジを開く」からやり直してください。';
+
+/** ★ナレッジ（顧客の機密）が入る画面は、ブラウザや途中の経路に残さない */
+function noStore(c: { header: (k: string, v: string) => void }): void {
+  c.header('Cache-Control', 'no-store');
+}
+
+/** 確認コードを使って、ナレッジを開く（表示＋編集欄。保存用の合言葉を発行する） */
+setupRouter.post('/setup/knowledge/open', async (c) => {
+  const status = await readStatus(c);
+  const size = checkBodySize(c.req.header('content-length'), KNOWLEDGE_BODY_LIMITS.open);
+  if (size) return c.html(page(status, [{ label: 'ナレッジ', ok: false, detail: size.detail }]), size.status);
+  const form = await c.req.formData().catch(() => null);
+  const permission = await mayRun(c.env.KV, (form?.get('code') as string | null) ?? null, status.requiresCode);
+  if (!permission.allowed || permission.reason === 'first_run') {
+    log.warn('ナレッジを開くのを断りました', permission.reason);
+    return c.html(page(status, [], permission.allowed ? KNOWLEDGE_NEED_SETUP_FIRST : deniedMessage(permission.reason)), 403);
+  }
+
+  let current: Awaited<ReturnType<Db['getActiveContextDetail']>>;
+  try {
+    current = await new Db(c.env.DB).getActiveContextDetail(DEFAULT_TENANT_ID);
+  } catch (e) {
+    log.warn('ナレッジを読めませんでした', String(e).slice(0, 120));
+    return c.html(page(status, [{ label: 'ナレッジ', ok: false, detail: 'まだ準備が終わっていないようです。先に「セットアップを実行する」をお試しください。' }]), 500);
+  }
+  const token = await issueKnowledgeEditToken(c.env.KV, { issuer: permission.issuer, baseContextId: current?.id ?? null });
+  // ★本文は記録しない（文字数だけ）
+  await auditWeb(c.env, permission, 'knowledge.open', { chars: current?.raw_text.length ?? 0 });
+  noStore(c);
+  return c.html(page(status, [], `ナレッジを開きました。${KNOWLEDGE_EDIT_TTL_SEC / 60}分以内なら、このまま保存できます（コードの入れ直しは不要です）。`,
+    knowledgeEditor({ current, token })));
+});
+
+/** 編集したナレッジを保存する（新しい行として保存し、前の行は控えとして残す） */
+setupRouter.post('/setup/knowledge/save', async (c) => {
+  const status = await readStatus(c);
+  const size = checkBodySize(c.req.header('content-length'), KNOWLEDGE_BODY_LIMITS.save);
+  if (size) return c.html(page(status, [{ label: 'ナレッジ', ok: false, detail: size.detail }]), size.status);
+  const form = await c.req.formData().catch(() => null);
+  const token = (form?.get('token') as string | null) ?? null;
+  const submitted = form?.get('raw_text');
+  const draft = typeof submitted === 'string' ? submitted : '';
+  noStore(c);
+
+  if (!status.requiresCode) {
+    log.warn('ナレッジの保存を断りました', 'first_run');
+    return c.html(page(status, [], KNOWLEDGE_NEED_SETUP_FIRST), 403);
+  }
+  // ★合言葉が無い・形が違う（こちらが出したものではない）ときは、送られた文章を画面に出さない（2026-11-01 源蔵レビュー必須）。
+  //   出すと、よそのページから任意の文章を送らせて、この URL の上に偽の案内を表示させられる
+  if (!isKnowledgeEditTokenShape(token)) {
+    log.warn('ナレッジの保存を断りました', 'token_malformed');
+    return c.html(page(status, [], KNOWLEDGE_SAVE_DENIED), 403);
+  }
+  // ★形は正しいが期限切れ・使用済みのときだけ、送った文章を差し戻す（コピーして控えられるように）
+  const grant = await peekKnowledgeEditToken(c.env.KV, token);
+  if (!grant) {
+    log.warn('ナレッジの保存を断りました', 'token_expired');
+    return c.html(page(status, [],
+      '期限が切れたか、すでに保存済みの画面です。LINE で「セットアップ」と送ってコードを受け取り、もう一度開いてください。',
+      draft.trim() ? knowledgeLostDraft(draft) : undefined), 403);
+  }
+
+  const db = new Db(c.env.DB);
+  const current = await db.getActiveContextDetail(DEFAULT_TENANT_ID);
+
+  // ★検査に落ちたら、合言葉は使わずに編集欄へ戻す（直してそのまま保存できる）
+  const check = checkKnowledgeText(submitted);
+  if (!check.ok) {
+    return c.html(page(status, [{ label: 'ナレッジ', ok: false, detail: KNOWLEDGE_TEXT_NOTE[check.reason] }],
+      '保存していません。直してから、もう一度「保存する」を押してください。',
+      knowledgeEditor({ current, token: token!, draft })), 400);
+  }
+
+  // ★開いている間に LINE で書き換わっていたら保存しない（書き足しを黙って消さない）。
+  //   古い合言葉は使い切り、いまの内容を基準にした新しい合言葉で編集欄を出し直す
+  if ((current?.id ?? null) !== grant.baseContextId) {
+    if (!(await consumeKnowledgeEditToken(c.env.KV, token))) {
+      return c.html(page(status, [], '期限が切れたか、すでに保存済みの画面です。もう一度開いてください。', knowledgeLostDraft(draft)), 403);
+    }
+    const next = await issueKnowledgeEditToken(c.env.KV, { issuer: grant.issuer, baseContextId: current?.id ?? null });
+    return c.html(page(status, [], '開いている間に内容が変わったため、まだ保存していません。',
+      knowledgeEditor({ current, token: next, draft: check.text, conflict: true })), 409);
+  }
+
+  if (current && current.raw_text === check.text) {
+    return c.html(page(status, [{ label: 'ナレッジ', ok: true, detail: '変更がなかったので、保存していません' }], '',
+      knowledgeEditor({ current, token: token! })));
+  }
+
+  // ★ここで合言葉を使い切る（同じ画面からの二重保存・使い回しを断る）
+  if (!(await consumeKnowledgeEditToken(c.env.KV, token))) {
+    return c.html(page(status, [], '期限が切れたか、すでに保存済みの画面です。もう一度開いてください。', knowledgeLostDraft(draft)), 403);
+  }
+  const permission: RunPermission = { allowed: true, reason: 'valid_code', issuer: grant.issuer };
+  let contextId: string;
+  try {
+    contextId = await saveKnowledgeText(db, DEFAULT_TENANT_ID, check.text, webActor(permission));
+  } catch (e) {
+    log.warn('ナレッジを保存できませんでした', String(e).slice(0, 120));
+    return c.html(page(status, [{ label: 'ナレッジ', ok: false, detail: '保存できませんでした。少し待ってからやり直してください。' }], '',
+      knowledgeLostDraft(draft)), 500);
+  }
+  await auditWeb(c.env, permission, 'knowledge.save', { chars: check.text.length, before: current?.raw_text.length ?? 0 });
+
+  // 整理は時間制限の無い Workflow で後から（LINE の書き足しと同じ）。★画面で結果を見せるので LINE には知らせない
+  try {
+    await c.env.GENERATE.create({ params: { kind: 'knowledge', contextId, lineUserId: '', announce: false } });
+  } catch (e) {
+    // 整理を始められなくても、原文はもう記事に使われている
+    log.warn('ナレッジの整理を始められませんでした', String(e).slice(0, 120));
+  }
+
+  return c.html(page(await readStatus(c), [{
+    label: 'ナレッジ', ok: true, detail: `保存しました（${check.text.length.toLocaleString('ja-JP')}字）。前の内容は控えとして残しています`,
+  }], '保存しました。次に作る記事から、この内容が使われます。AI による整理は数分で終わります（終わるまでは原文をそのまま使います）。'));
 });
