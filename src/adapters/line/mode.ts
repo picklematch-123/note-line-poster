@@ -59,6 +59,18 @@ export function parseIndex(text: string): number | null {
 }
 
 /**
+ * 「3番を消す」「３を削除して」のような、ナレッジ1件の削除の依頼から番号を取り出す。
+ * ★ナレッジの修正（書き足し待ち）の最中にだけ使う。それ以外の文はふつうの書き足しとして扱う。
+ */
+export function parseDeleteRequest(text: string): number | null {
+  const normalized = text.normalize('NFKC').replace(/\s+/g, '');
+  const m = /^(\d{1,2})(番|番目)?(を)?(消す|消して|消してください|削除|削除する|削除して|削除してください)$/.exec(normalized);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return n >= 1 ? n : null;
+}
+
+/**
  * コマンド判定用に文字列をならす。
  *
  * リッチメニューは LINE公式アカウントマネージャー（GUI）でも作れる。
