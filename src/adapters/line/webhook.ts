@@ -36,6 +36,7 @@ import { loadNoteSession, disconnectNoteSession } from '../../core/session/store
 import { buildConnectGuide, buildConnectStatus } from './messages/connect';
 import { dispatchPublish, withdrawJobs } from '../../core/agent/dispatch';
 import { reconcilePublished } from '../../core/article/reconcile';
+import { retagPublishedArticles, retagSummaryText } from '../../core/article/retag';
 import { isAgentOnline, hasDevice, revokeDevices } from '../../core/agent/jobs';
 import {
   buildSettings, buildDailyLimitChoices, buildIntervalChoices, buildModeChoices,
@@ -298,6 +299,35 @@ function me(d: ServiceDeps, userId: string) {
  */
 async function busyWithOther(d: ServiceDeps, userId: string, articleId: string) {
   return otherWorkInProgress(await d.db.findArticleAwaitingDecision(DEFAULT_TENANT_ID, me(d, userId)), articleId);
+}
+
+/** 付け直しの同時実行を防ぐ印（KV・60秒で自然に消える） */
+const RETAG_LOCK_KEY = `retag:lock:${DEFAULT_TENANT_ID}`;
+
+/**
+ * 「ハッシュタグを付け直す」。★Cookie を顧客の環境の外に出さないため、Worker の中で行う（core/article/retag.ts）。
+ * LINE の裏処理は約30秒で打ち切られるので、1回で送るのは数本まで。残りは「もう一度送る」で続きから進む。
+ */
+async function runRetagHashtags(
+  env: Env, line: LineClient, d: ServiceDeps, replyToken: string, userId: string,
+): Promise<void> {
+  if (await env.KV.get(RETAG_LOCK_KEY)) {
+    await line.reply(replyToken, [text('いまハッシュタグを付け直しています。1分ほど待ってから、もう一度送ってください。')]);
+    return;
+  }
+  await env.KV.put(RETAG_LOCK_KEY, '1', { expirationTtl: 60 });
+  try {
+    const result = await retagPublishedArticles({
+      db: d.db,
+      noteSession: d.noteSession,
+      tenantId: DEFAULT_TENANT_ID,
+      actor: `line:${userId}`,
+      onCookieRefresh: d.onCookieRefresh,
+    });
+    await line.reply(replyToken, [text(retagSummaryText(result))]);
+  } finally {
+    await env.KV.delete(RETAG_LOCK_KEY).catch(() => undefined);
+  }
 }
 
 /** 投稿者が、持ち主だけの操作をしようとしたとき */
@@ -594,6 +624,11 @@ async function handleText(
   if (COMMANDS.memberAdd.test(cmd)) {
     if (!power(d, userId)) return ownerOnly(line, replyToken);
     return startMemberInvite(env, line, d, replyToken, userId);
+  }
+  // ★公開済み記事のハッシュタグを付け直す（持ち主・管理者だけ。note に送り直すので投稿者には渡さない）
+  if (COMMANDS.retagHashtags.test(cmd)) {
+    if (!power(d, userId)) return ownerOnly(line, replyToken);
+    return runRetagHashtags(env, line, d, replyToken, userId);
   }
   if (COMMANDS.memberList.test(cmd)) {
     if (!power(d, userId)) return ownerOnly(line, replyToken);

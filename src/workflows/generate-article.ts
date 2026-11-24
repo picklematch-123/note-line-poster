@@ -127,7 +127,7 @@ export class GenerateArticleWorkflow extends WorkflowEntrypoint<Env, GeneratePar
       timeout: '10 minutes',
     }, async () => {
       try {
-        const { article, charCount } = await generateArticle({
+        const { article, charCount, similarNotice } = await generateArticle({
           db,
           llm: llmConfigFromEnv(this.env),
           noteSession: (await resolveNoteSession(this.env)).session,
@@ -142,6 +142,7 @@ export class GenerateArticleWorkflow extends WorkflowEntrypoint<Env, GeneratePar
           metaDescription: article.meta_description ?? '',
           hashtags: article.hashtags_json ? JSON.parse(article.hashtags_json) : [],
           charCount,
+          similarNotice: similarNotice ?? null,
           hasEyecatch: Boolean(await db.getEyecatch(articleId)),
           research: toResearchView(
             parseResearch(article.research_json),
@@ -219,6 +220,7 @@ export class GenerateArticleWorkflow extends WorkflowEntrypoint<Env, GeneratePar
         thumbnailGenerated: thumb.status === 'created',
         canRegenerateThumbnail: thumb.status !== 'skipped' || thumb.reason !== 'no_key',
         research: result.research ?? undefined,
+        similarNote: result.similarNotice,
         inlineImages: current
           ? await loadInlineView(db, current, { hasKey: hasImageKey(this.env.OPENAI_API_KEY), reasons: inlineReasons })
           : undefined,

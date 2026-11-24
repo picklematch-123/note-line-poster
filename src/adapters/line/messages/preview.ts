@@ -36,6 +36,8 @@ export interface PreviewInput {
   research?: ResearchView;
   /** AI が作った文中画像（P3）の枚数と状態。無ければ表示しない */
   inlineImages?: InlineImagesView;
+  /** 過去の記事と強く似ているときの注意（core/generation/history の similarityNotice）。無ければ表示しない */
+  similarNote?: string | null;
 }
 
 /** 文中画像の件数と状態。★別のメッセージにせず、プレビューの中に載せる（LINE の通数を増やさない） */
@@ -164,6 +166,9 @@ export function buildPreview(input: PreviewInput): LineMessage {
           },
           ...(input.thumbnailNote
             ? [{ type: 'text', text: input.thumbnailNote, size: 'xs', color: COLOR.image, wrap: true }]
+            : []),
+          ...(input.similarNote
+            ? [{ type: 'text', text: input.similarNote, size: 'xs', color: COLOR.image, wrap: true }]
             : []),
           ...researchBox(input.research),
           ...inlineBox(input.inlineImages),

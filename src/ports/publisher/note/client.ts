@@ -6,6 +6,7 @@
  * ★壊れたときに触るファイルをここ1枚に閉じ込めること。
  */
 import { log, mask } from '../../../lib/mask';
+import { toNoteHashtags } from './hashtags';
 
 export const NOTE_API = 'https://note.com/api';
 
@@ -139,6 +140,17 @@ export class NoteClient {
     return this.request('currentUser', '/v2/current_user', { headers: this.headers(false) });
   }
 
+  /**
+   * このアカウントが記事のコメント欄を閉じられるか（note のプレミアム機能）。分からなければ null。
+   * ★2026-11-24 実測: 閉じられないアカウント（turnoff_comment_available:false）では、
+   *   公開時に disable_comment:true を送っても無視され、読み戻すと false のまま。
+   *   エディタも同じ値で「コメントの受けつけ」をプレミアム限定にしている
+   */
+  async canTurnOffComments(): Promise<boolean | null> {
+    const d = await this.request<any>('currentUser', '/v2/current_user', { headers: this.headers(false) });
+    return typeof d?.turnoff_comment_available === 'boolean' ? d.turnoff_comment_available : null;
+  }
+
   /** 記事の器を作る。以降の操作に使う id と key を得る。 */
   async createNote(): Promise<CreatedNote> {
     const d = await this.request<any>('createNote', '/v1/text_notes', {
@@ -177,14 +189,25 @@ export class NoteClient {
    * ★本文フィールドは `free_body`。`body` を送ると 422「本文を入力してください」になる。
    * ★exclude_ai_learning_reward=true で、note の AI 学習提供をオプトアウトする
    *   （クライアントの記事が第三者の学習データに回らないようにするため既定で有効）。
+   * ★hashtags は「#」を付けた形で送る（hashtags.ts）。「#」なしは note が黙って捨てる（2026-11-24 実測）。
+   * ★index / disableComment / excludeFromCreatorTop は、既存記事のタグだけ付け直すときに
+   *   note 上のいまの設定を変えないために渡せるようにしてある（省略時は従来どおり false）。
    */
   async publish(noteId: number, noteKey: string, opts: {
     title: string;
     html: string;
     bodyLength: number;
     hashtags?: string[];
+    /**
+     * ★付け直し用。指定したら整えずに**このまま**送る（note に付いている既存タグを1字も変えないため）。
+     *   hashtags より優先する
+     */
+    hashtagsVerbatim?: string[];
     notifyFollowers?: boolean;
     excludeAiLearning?: boolean;
+    index?: boolean;
+    disableComment?: boolean;
+    excludeFromCreatorTop?: boolean;
   }): Promise<{ url: string }> {
     await this.request('publish', `/v1/text_notes/${encodeURIComponent(noteId)}`, {
       method: 'PUT',
@@ -199,13 +222,13 @@ export class NoteClient {
         price: 0,
         limited: false,
         is_refund: false,
-        index: false,
-        disable_comment: false,
-        exclude_from_creator_top: false,
+        index: opts.index ?? false,
+        disable_comment: opts.disableComment ?? false,
+        exclude_from_creator_top: opts.excludeFromCreatorTop ?? false,
         exclude_ai_learning_reward: opts.excludeAiLearning ?? true,
         send_notifications_flag: opts.notifyFollowers ?? true,
         author_ids: [],
-        hashtags: opts.hashtags ?? [],
+        hashtags: opts.hashtagsVerbatim ?? toNoteHashtags(opts.hashtags ?? []),
         image_keys: [],
         magazine_ids: [],
         magazine_keys: [],
@@ -218,6 +241,14 @@ export class NoteClient {
       }),
     });
     return { url: `https://note.com/${this.session.urlname}/n/${noteKey}` };
+  }
+
+  /**
+   * 記事を1本読む（ログインして読む。本文・設定・タグ）。生の data を返す（読み方は public.ts の parseNoteDetail）。
+   * ★2026-11-24 実測: エディタの `?draft=true` も本文は同じ。`draft_reedit=true` は本文が空で返るので使わない
+   */
+  async getNote(noteKey: string): Promise<unknown> {
+    return this.request('getNote', `/v3/notes/${encodeURIComponent(noteKey)}`, { headers: this.headers(false) });
   }
 
   /**

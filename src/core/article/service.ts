@@ -7,10 +7,12 @@
 import { Db, type ArticleRow, DEFAULT_TENANT_ID } from '../../ports/storage/db';
 import { NoteClient, NoteApiError, type NoteSession } from '../../ports/publisher/note/client';
 import { toNoteHtml, plainLength } from '../../ports/publisher/note/html';
+import { parseHashtagsJson } from '../../ports/publisher/note/hashtags';
 import { LlmError } from '../../ports/llm/types';
 import { createLlm, type LlmConfig } from '../../ports/llm';
 import { generate } from '../generation/pipeline';
 import { ensureContextUrls } from '../generation/context';
+import { toPastArticles, allowsOverlap, similarityNotice, MAX_PAST_ARTICLES } from '../generation/history';
 import { parseResearch, researchForGeneration } from '../research/run';
 import { finalizeArticle } from '../research/finalize';
 import { findUnverifiedTerms, findMiscitedTerms, mergeVerifyResults } from '../research/verify';
@@ -45,6 +47,8 @@ export interface ServiceDeps {
 export interface GenerateResult {
   article: ArticleRow;
   charCount: number;
+  /** 過去記事と強く似ているときにプレビューへ出す注意（似ていなければ null） */
+  similarNotice?: string | null;
 }
 
 /** ネタを受け付けて記事レコードを作る。 */
@@ -88,6 +92,17 @@ export async function generateArticle(deps: ServiceDeps, articleId: string): Pro
   const research = parseResearch(article.research_json);
   const contextPrompt = ensureContextUrls(context?.raw_text ?? null, context?.prompt_snippet ?? null);
 
+  // ★同じ環境の過去記事（公開済み・下書き・確認待ちなど。取りやめ・失敗・note から消えたもの・自分自身は除く）。
+  //   キーワードと構成が毎回同じ型になるのを避けるために渡す（core/generation/history）。
+  //   読めなくても記事は作る（過去記事なし＝今までどおり）
+  const pastArticles = toPastArticles(
+    await deps.db.listRecentArticles(article.tenant_id, MAX_PAST_ARTICLES + 1).catch((e) => {
+      log.error('過去記事を読めなかったため、過去記事なしで生成します', String(e));
+      return [];
+    }),
+    articleId,
+  );
+
   const out = await generate(llm, {
     sourceText,
     hintKeywords,
@@ -98,6 +113,9 @@ export async function generateArticle(deps: ServiceDeps, articleId: string): Pro
     // ★以前に登録されたプロフィールでも URL が落ちないよう、読み出すたびに補う
     contextPrompt,
     research: researchForGeneration(research),
+    pastArticles,
+    // ネタ・修正指示が重複を明示的に求めていれば、重複回避より指示を優先する
+    overlapAllowed: allowsOverlap(article.source_text, article.revision_instruction),
   });
 
   // ★仕上げ（調査の有無に関わらず必ず通す）: 〔n〕の目印を出典の一覧に変え、
@@ -151,7 +169,11 @@ export async function generateArticle(deps: ServiceDeps, articleId: string): Pro
   });
 
   const updated = (await deps.db.getArticle(articleId))!;
-  return { article: updated, charCount: bodyMd.replace(/\[(?:AI)?画像\d+\]/g, '').length };
+  return {
+    article: updated,
+    charCount: bodyMd.replace(/\[(?:AI)?画像\d+\]/g, '').length,
+    similarNotice: similarityNotice(out.similarPast),
+  };
 }
 
 /**
@@ -441,7 +463,8 @@ export async function publishArticle(deps: ServiceDeps, articleId: string): Prom
       imageUrls: [...Object.values(urls), ...Object.values(generated).map((g) => g.url)], stage: 'final',
     });
     const length = plainLength(html);
-    const hashtags: string[] = a.hashtags_json ? JSON.parse(a.hashtags_json) : [];
+    // ★壊れた JSON でも公開は止めない。「#」付けは NoteClient.publish が行う
+    const hashtags = parseHashtagsJson(a.hashtags_json);
 
     await client.saveDraft(created.id, { title: a.title ?? '無題', html, bodyLength: length });
     const { url } = await client.publish(created.id, created.key, {

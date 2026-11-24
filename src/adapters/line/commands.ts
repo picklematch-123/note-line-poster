@@ -88,6 +88,12 @@ export const COMMANDS = {
   adminAdd: /^(管理者を追加|管理者追加|管理者を増やす)$/,
   /** 確認待ちの管理者を文字で承認する（持ち主だけ）。断るのは memberReject と共通 */
   adminApprove: /^(管理者にする)$/,
+
+  /**
+   * 公開済み記事のハッシュタグを付け直す（持ち主・管理者だけ。2026-11-24）。
+   * ★以前はタグが note に1つも付いていなかったため、その穴埋め。本文・URL は変えない
+   */
+  retagHashtags: /^(ハッシュタグを付け直す|ハッシュタグを付けなおす|ハッシュタグの付け直し|ハッシュタグ付け直し|タグを付け直す)$/,
 } as const;
 
 export type CommandName = keyof typeof COMMANDS;

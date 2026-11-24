@@ -9,6 +9,7 @@
 import type { Db, ArticleRow } from '../../ports/storage/db';
 import type { ImageStore } from '../../ports/storage/images';
 import { toNoteHtml, plainLength } from '../../ports/publisher/note/html';
+import { toNoteHashtags, parseHashtagsJson } from '../../ports/publisher/note/hashtags';
 import { composeArticleMarkdown, type GeneratedFill } from '../article/compose';
 import {
   assertArticleHtmlLinks, imageUrlPlaceholder, generatedImageUrlPlaceholder, listPlacedGeneratedImages, GENERATED_SLOT_OFFSET,
@@ -164,7 +165,8 @@ export async function buildPlan(
 
   // 6. 公開。★本文フィールドは `free_body`。`body` だと 422 になる
   if (kind === 'publish') {
-    const hashtags: string[] = article.hashtags_json ? JSON.parse(article.hashtags_json) : [];
+    // ★note は「#」付きでないタグを黙って捨てる（2026-11-24 実測）。壊れた JSON でも公開は止めない
+    const hashtags = toNoteHashtags(parseHashtagsJson(article.hashtags_json));
     steps.push({
       id: 'publish',
       method: 'PUT',

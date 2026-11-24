@@ -80,9 +80,9 @@ const COMMON = `あなたは日本語のSEO記事を書くプロの編集者兼�
 
 export const analyzeKeywords = {
   system: COMMON,
-  user: (sourceText: string, hintKeywords: string[], style?: string | null, context?: string | null, research?: ResearchPromptInput | null) => `
+  user: (sourceText: string, hintKeywords: string[], style?: string | null, context?: string | null, research?: ResearchPromptInput | null, history?: string | null) => `
 次のネタから、SEO記事にするためのキーワード設計をしてください。
-${contextBlock(context)}${styleBlock(style)}${researchBlock(research)}
+${contextBlock(context)}${styleBlock(style)}${researchBlock(research)}${history ?? ''}
 【ネタ】
 ${sourceText}
 
@@ -93,15 +93,15 @@ ${hintKeywords.length ? `【指定キーワード】\n${hintKeywords.join(', ')}
   "secondaryKeywords": ["関連キーワード", "..."],
   "searchIntent": "読者がこのキーワードで検索するとき、本当に知りたいこと",
   "targetReader": "想定読者像（状況・悩み・知識レベル）",
-  "competitorAngle": "既存記事にありがちな型と、この記事でどう差をつけるか"
+  "competitorAngle": "既存記事にありがちな型と、この記事でどう差をつけるか${history ? '（この書き手の過去記事との違いも書く）' : ''}"
 }`.trim(),
 };
 
 export const buildOutline = {
   system: COMMON,
-  user: (sourceText: string, kw: KeywordAnalysis, imageCount: number, style?: string | null, context?: string | null, research?: ResearchPromptInput | null) => `
+  user: (sourceText: string, kw: KeywordAnalysis, imageCount: number, style?: string | null, context?: string | null, research?: ResearchPromptInput | null, history?: string | null) => `
 以下の設計に基づいて、記事の構成を作ってください。
-${contextBlock(context)}${styleBlock(style)}${researchBlock(research)}
+${contextBlock(context)}${styleBlock(style)}${researchBlock(research)}${history ?? ''}
 【ネタ】
 ${sourceText}
 
@@ -117,6 +117,10 @@ ${sourceText}
   ? `画像を置くとよい見出しを ${imageCount} 個選び、その見出しの wantsImage を true にしてください。`
   : '画像はないので wantsImage はすべて false にしてください。'}
 
+【構成の作り方】
+- 1記事1テーマ。ネタの中心から外れる一般的な説明（費用の内訳・仕組みの全体像など）で見出しを埋めない
+- 見出しをすべて疑問形にしない。ネタに合う型（手順・体験談・事例・比較・失敗談・チェックリストなど）を選ぶ
+
 次のJSONで出力してください:
 {
   "workingTitle": "仮タイトル",
@@ -130,9 +134,9 @@ ${sourceText}
 
 export const writeBody = {
   system: COMMON,
-  user: (sourceText: string, kw: KeywordAnalysis, outline: Outline, imageCount: number, style?: string | null, context?: string | null, research?: ResearchPromptInput | null) => `
+  user: (sourceText: string, kw: KeywordAnalysis, outline: Outline, imageCount: number, style?: string | null, context?: string | null, research?: ResearchPromptInput | null, history?: string | null) => `
 以下の構成で本文を書いてください。
-${contextBlock(context)}${styleBlock(style)}${researchBlock(research)}
+${contextBlock(context)}${styleBlock(style)}${researchBlock(research)}${history ?? ''}
 【ネタ】
 ${sourceText}
 
@@ -148,8 +152,9 @@ ${outline.sections.map((s, i) =>
 【出力形式】
 - Markdown で書く
 - 見出しは ## と ### のみ使う（# は使わない。note ではタイトルが h1 になる）
-- 見出しは「読者の疑問」の形にする。単語だけの見出しにしない
+- 見出しは、読むと中身が分かる形にする。単語だけの見出しにしない
   （悪い例「材料」／良い例「材料は3つだけ。家にあるもので足りる」）
+  構成の見出しの形（疑問形かどうか）はそのまま使ってよいが、すべてを疑問形に書き換えない
 - 使ってよい記法: 見出し、段落、箇条書き(-)、番号リスト(1.)、引用(>)、**太字**、[リンク](URL)
 - ★URLを書くときは [何のページか分かる表示テキスト](URL) の形式にする
   （URLをそのまま並べない。ただしURL自体は一字一句そのまま使い、変更・創作をしない）
@@ -165,9 +170,9 @@ ${imageCount > 0
 
 export const polishSeo = {
   system: COMMON,
-  user: (markdown: string, kw: KeywordAnalysis, imageCount: number, style?: string | null, context?: string | null, research?: ResearchPromptInput | null) => `
+  user: (markdown: string, kw: KeywordAnalysis, imageCount: number, style?: string | null, context?: string | null, research?: ResearchPromptInput | null, history?: string | null) => `
 以下の本文を、SEOと読みやすさの観点で仕上げてください。
-${contextBlock(context)}${styleBlock(style)}${researchBlock(research)}
+${contextBlock(context)}${styleBlock(style)}${researchBlock(research)}${history ?? ''}
 【主キーワード】${kw.primaryKeyword}
 【関連キーワード】${kw.secondaryKeywords.join(', ')}
 【検索意図】${kw.searchIntent}
@@ -178,6 +183,7 @@ ${markdown}
 【やること】
 1. タイトル案を3つ。主キーワードを含め、32文字以内を目安にする
    （検索結果でタイトルは約30字で切られるため、大事な語を前半に置く）
+   検索語を「｜」や「・」で並べて詰め込まない。具体的な数字か、読者の悩み・場面を前に出す
 
 2. ★最重要：リード文（本文の1段落目）を書き直す
    **note は本文の冒頭をそのまま検索結果の説明文（メタディスクリプション）に使います。**

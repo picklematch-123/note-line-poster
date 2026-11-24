@@ -467,6 +467,39 @@ export class Db {
   }
 
   /**
+   * ハッシュタグを付け直す対象（公開済み・note から消えていない・タグを持っている記事）。新しい順。
+   * ★修正中などの記事は含めない（作業中の記事を横から送り直さない）。
+   */
+  async listPublishedForRetag(tenantId: string): Promise<Array<{
+    id: string; note_id: string; note_key: string; hashtags_json: string;
+    updated_at: string | null; published_at: string | null;
+  }>> {
+    const r = await this.d1
+      .prepare(`SELECT id, note_id, note_key, hashtags_json, updated_at, published_at FROM articles
+                 WHERE tenant_id = ? AND state = 'published'
+                   AND note_id IS NOT NULL AND note_key IS NOT NULL
+                   AND hashtags_json IS NOT NULL AND removed_at IS NULL
+                 ORDER BY published_at DESC, created_at DESC`)
+      .bind(tenantId)
+      .all<{ id: string; note_id: string; note_key: string; hashtags_json: string; updated_at: string | null; published_at: string | null }>();
+    return r.results ?? [];
+  }
+
+  /**
+   * ハッシュタグの付け直しで、確かめ終えた記事（付け直した・もう付いていた・対象外）。
+   * ★'error' は含めない（次の実行でやり直す）。core/article/retag.ts の監査ログの約束と対
+   */
+  async listRetagDoneIds(tenantId: string): Promise<string[]> {
+    const r = await this.d1
+      .prepare(`SELECT DISTINCT target FROM audit_logs
+                 WHERE tenant_id = ? AND action = 'retag.hashtags'
+                   AND result IN ('ok', 'already', 'skipped') AND target IS NOT NULL`)
+      .bind(tenantId)
+      .all<{ target: string }>();
+    return (r.results ?? []).map((x) => x.target);
+  }
+
+  /**
    * note 上から消えた記事に印を付ける。
    * ★state は変えない。「公開した」という履歴は事実として残す。
    */
